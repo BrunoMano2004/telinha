@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Telinha</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden;
+    font: 13px/1.4 system-ui, sans-serif; color: #e6e6e6; }
+  video { width: 100vw; height: 100vh; object-fit: contain; display: block; background: #000; }
+  #status { position: fixed; inset: 0; display: grid; place-items: center; pointer-events: none;
+    font-size: 15px; color: #9a9a9a; }
+  #status:empty { display: none; }
+  #bar { position: fixed; top: 12px; right: 12px; display: flex; gap: 6px; opacity: 0;
+    transition: opacity .2s; }
+  body:hover #bar, body.idle-off #bar { opacity: 1; }
+  button { background: rgba(30,30,30,.85); color: #e6e6e6; border: 1px solid #3a3a3a;
+    border-radius: 6px; padding: 6px 10px; font: inherit; cursor: pointer; }
+  button:hover { background: rgba(60,60,60,.9); }
+  #stats { position: fixed; top: 12px; left: 12px; background: rgba(0,0,0,.7);
+    border: 1px solid #333; border-radius: 6px; padding: 8px 10px; white-space: pre;
+    font: 12px/1.5 ui-monospace, monospace; display: none; }
+  #stats.on { display: block; }
+</style>
+</head>
+<body>
+<video id="video" autoplay playsinline muted></video>
+<div id="status">Conectando…</div>
+<pre id="stats"></pre>
+<div id="bar">
+  <button id="btn-stats" title="Estatísticas (S)">Estatísticas</button>
+  <button id="btn-full" title="Tela cheia (F ou duplo clique)">Tela cheia</button>
+</div>
+<script>
+const video = document.getElementById('video');
+const statusEl = document.getElementById('status');
+const statsEl = document.getElementById('stats');
+let pc, ws, statsTimer, last;
+
+function setStatus(text) { statusEl.textContent = text; }
+
+function connect() {
+  setStatus('Conectando…');
+  ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`);
+  pc = new RTCPeerConnection({ bundlePolicy: 'max-bundle' });
+
+  pc.ontrack = (e) => {
+    // Pede ao navegador o menor buffer de reprodução possível.
+    try { e.receiver.jitterBufferTarget = 0; } catch {}
+    try { e.receiver.playoutDelayHint = 0; } catch {}
+    video.srcObject = e.streams[0] || new MediaStream([e.track]);
+  };
+  pc.onicecandidate = (e) => {
+    if (e.candidate && ws.readyState === 1) {
+      ws.send(JSON.stringify({ type: 'ice', candidate: e.candidate.candidate,
+                               sdpMLineIndex: e.candidate.sdpMLineIndex ?? 0 }));
+    }
+  };
+  pc.onconnectionstatechange = () => {
+    if (pc.connectionState === 'connected') setStatus('');
+    if (pc.connectionState === 'failed') setStatus('Falha na conexão de vídeo (verifique o Tailscale)');
+  };
+
+  ws.onmessage = async (e) => {
+    const msg = JSON.parse(e.data);
+    if (msg.type === 'offer') {
+      await pc.setRemoteDescription({ type: 'offer', sdp: msg.sdp });
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      ws.send(JSON.stringify({ type: 'answer', sdp: answer.sdp }));
+    } else if (msg.type === 'ice') {
+      try { await pc.addIceCandidate({ candidate: msg.candidate, sdpMLineIndex: msg.sdpMLineIndex }); } catch {}
+    } else if (msg.type === 'full') {
+      setStatus('A transmissão está cheia. Tentando de novo em instantes…');
+    }
+  };
+  ws.onclose = () => {
+    pc.close();
+    if (!statusEl.textContent) setStatus('Transmissão encerrada. Reconectando…');
+    setTimeout(connect, 2000);
+  };
+}
+
+async function updateStats() {
+  if (!pc || pc.connectionState !== 'connected') return;
+  const report = await pc.getStats();
+  let v, pair;
+  report.forEach((s) => {
+    if (s.type === 'inbound-rtp' && s.kind === 'video') v = s;
+    if (s.type === 'candidate-pair' && s.nominated && s.state === 'succeeded') pair = s;
+  });
+  if (!v) return;
+  const now = performance.now();
+  const kbps = last ? ((v.bytesReceived - last.bytes) * 8 / (now - last.t)).toFixed(0) : '–';
+  const jb = v.jitterBufferEmittedCount ? (1000 * v.jitterBufferDelay / v.jitterBufferEmittedCount).toFixed(0) : '–';
+  const dec = v.framesDecoded ? (1000 * v.totalDecodeTime / v.framesDecoded).toFixed(1) : '–';
+  const rtt = pair?.currentRoundTripTime != null ? (pair.currentRoundTripTime * 1000).toFixed(0) : '–';
+  last = { bytes: v.bytesReceived, t: now };
+  statsEl.textContent =
+    `resolução   ${v.frameWidth ?? '–'}x${v.frameHeight ?? '–'} @ ${v.framesPerSecond ?? 0} fps\n` +
+    `bitrate     ${kbps} kbps\n` +
+    `rede (RTT)  ${rtt} ms\n` +
+    `buffer      ${jb} ms\n` +
+    `decodific.  ${dec} ms  ${v.decoderImplementation ?? ''}${v.powerEfficientDecoder ? ' (hardware)' : ''}\n` +
+    `perdidos    ${v.packetsLost ?? 0} pacotes · ${v.framesDropped ?? 0} quadros`;
+}
+
+function toggleStats() {
+  statsEl.classList.toggle('on');
+  clearInterval(statsTimer);
+  if (statsEl.classList.contains('on')) { last = null; updateStats(); statsTimer = setInterval(updateStats, 1000); }
+}
+function toggleFull() {
+  document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen();
+}
+
+document.getElementById('btn-stats').onclick = toggleStats;
+document.getElementById('btn-full').onclick = toggleFull;
+video.ondblclick = toggleFull;
+document.onkeydown = (e) => {
+  if (e.key === 's' || e.key === 'S') toggleStats();
+  if (e.key === 'f' || e.key === 'F') toggleFull();
+};
+
+connect();
+</script>
+</body>
+</html>

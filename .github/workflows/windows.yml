@@ -1,0 +1,46 @@
+name: Instalador Windows
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'src/**'
+      - 'web/**'
+      - 'windows/**'
+      - 'Cargo.*'
+      - '.github/workflows/windows.yml'
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'web/**'
+      - 'windows/**'
+      - 'Cargo.*'
+      - '.github/workflows/windows.yml'
+permissions:
+  contents: read
+jobs:
+  installer:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Instalar Rust estavel
+        shell: pwsh
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+          rustup target add x86_64-pc-windows-msvc
+      - name: Compilar e testar pacote
+        shell: pwsh
+        run: |
+          if (!(Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) {
+            choco install innosetup --yes --no-progress
+            if ($LASTEXITCODE -ne 0) { throw 'Falha ao instalar Inno Setup' }
+          }
+          ./windows/build.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Telinha-Windows-x64
+          path: |
+            dist/*.exe
+            dist/*.sha256
+          if-no-files-found: error

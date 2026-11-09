@@ -1,5 +1,9 @@
 #[cfg(target_os = "linux")]
 mod audio;
+#[cfg(any(target_os = "windows", test))]
+mod audio_policy;
+#[cfg(target_os = "windows")]
+mod windows_audio;
 mod capture;
 mod stream;
 
@@ -35,6 +39,10 @@ struct Args {
     #[arg(long)]
     bind: Option<IpAddr>,
 
+    /// Recusa iniciar sem Tailscale quando nenhum --bind foi informado.
+    #[arg(long)]
+    require_tailscale: bool,
+
     /// Porta HTTP do viewer.
     #[arg(short, long, default_value_t = 8080)]
     port: u16,
@@ -64,6 +72,10 @@ struct Args {
     #[arg(short, long, default_value_t = 0)]
     monitor: u32,
 
+    /// Windows: identificador nativo do monitor (usado pelo aplicativo).
+    #[arg(long)]
+    monitor_handle: Option<u64>,
+
     /// Linux: ignora a tela salva e abre o seletor de novo.
     #[arg(long)]
     choose: bool,
@@ -78,12 +90,12 @@ struct Args {
     #[arg(long)]
     tunnel: bool,
 
-    /// Transmite também o som dos apps. No Linux, chamadas de voz (Discord,
-    /// Zoom, Teams, ...) e microfones ficam de fora, para não dar eco.
+    /// Transmite também o som dos apps, excluindo clientes conhecidos de
+    /// chamada (Discord, Zoom, Teams, ...) e sem abrir o microfone.
     #[arg(short, long)]
     audio: bool,
 
-    /// Linux: outros apps cujo som não deve ir para a transmissão (trecho do
+    /// Outros apps cujo som não deve ir para a transmissão (trecho do
     /// nome, separados por vírgula). Ex.: --audio-exclude spotify,steam
     #[arg(long, value_delimiter = ',')]
     audio_exclude: Vec<String>,
@@ -95,6 +107,7 @@ struct App {
     next_id: AtomicU64,
     /// Chave exigida em `?k=` no modo túnel (o link *.trycloudflare.com é público).
     key: Option<String>,
+    shutdown: tokio::sync::watch::Sender<bool>,
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
@@ -114,6 +127,7 @@ async fn main() -> Result<()> {
         profile: args.profile.clone(),
         encoder: args.encoder.clone(),
         monitor: args.monitor,
+        monitor_handle: args.monitor_handle,
     };
     let encoder = capture::pick_encoder(settings.encoder.as_deref())?;
 
@@ -121,7 +135,7 @@ async fn main() -> Result<()> {
     // No túnel o cloudflared faz o proxy para 127.0.0.1; não precisa escutar fora.
     let (bind, host) = match (args.tunnel, args.bind) {
         (true, bind) => (bind.unwrap_or(Ipv4Addr::LOCALHOST.into()), String::new()),
-        (false, bind) => resolve_bind(bind).await,
+        (false, bind) => resolve_bind(bind, args.require_tailscale).await?,
     };
     let addr = SocketAddr::new(bind, args.port);
     let listener = tokio::net::TcpListener::bind(addr)
@@ -159,22 +173,31 @@ async fn main() -> Result<()> {
     // No Linux o som passa pela saída virtual do telinha, sem chamadas de voz
     // nem microfone; ela existe enquanto `_audio` viver.
     #[cfg(target_os = "linux")]
-    let _audio = if args.audio { Some(audio::start(&args.audio_exclude)?) } else { None };
+    let _audio = if args.audio && !args.test { Some(audio::start(&args.audio_exclude)?) } else { None };
     #[cfg(target_os = "linux")]
-    let audio_source = _audio.as_ref().map(|a| a.source_description());
+    let audio_source = if args.audio && args.test {
+        Some("audiotestsrc is-live=true wave=ticks".into())
+    } else { _audio.as_ref().map(|a| a.source_description()) };
     #[cfg(target_os = "windows")]
-    let audio_source = args.audio.then(|| capture::windows_audio_source(args.test));
+    let audio_source = args.audio.then(|| {
+        if args.test { "audiotestsrc is-live=true wave=ticks".into() }
+        else { windows_audio::source_description() }
+    });
     let description = match audio_source {
         Some(source) => format!("{description} {}", capture::audio_description(&source)),
         None => description,
     };
     let streamer = Streamer::new(&description, args.tunnel.then(|| STUN_SERVER.to_string()))?;
+    #[cfg(target_os = "windows")]
+    let _audio = if args.audio && !args.test {
+        Some(windows_audio::start(&streamer.pipeline, &args.audio_exclude)?)
+    } else { None };
     capture::configure_encoder(&streamer.encoder, &settings);
     watch_bus(&streamer.pipeline);
 
     // Liga uma vez para validar captura e encoder; sem espectadores, desliga sozinho.
     let generation = streamer.start()?;
-    let app = Arc::new(App { streamer, max_viewers: args.max_viewers, next_id: AtomicU64::new(1), key });
+    let app = Arc::new(App { streamer, max_viewers: args.max_viewers, next_id: AtomicU64::new(1), key, shutdown: tokio::sync::watch::channel(false).0 });
     schedule_idle_stop(app.clone(), generation);
 
     println!(
@@ -194,33 +217,42 @@ async fn main() -> Result<()> {
         .route("/ws", get(ws_handler))
         .with_state(app.clone());
 
+    let shutdown_app = app.clone();
+    let mut shutdown_rx = app.shutdown.subscribe();
     axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>())
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(async move {
+            tokio::select! {
+                _ = shutdown_signal() => {},
+                _ = shutdown_rx.wait_for(|stopping| *stopping) => {},
+            }
+            shutdown_app.shutdown.send_replace(true);
+        })
         .await?;
 
-    let _ = app.streamer.pipeline.set_state(gst::State::Null);
+    app.streamer.shutdown();
     println!("\nEncerrado.");
     Ok(())
 }
 
 /// Por padrão escuta só no Tailscale, para a tela não ficar exposta na LAN/internet.
-async fn resolve_bind(explicit: Option<IpAddr>) -> (IpAddr, String) {
+async fn resolve_bind(explicit: Option<IpAddr>, require_tailscale: bool) -> Result<(IpAddr, String)> {
     if let Some(ip) = explicit {
-        return (ip, ip.to_string());
+        return Ok((ip, ip.to_string()));
     }
     let run = |args: &'static [&'static str]| async move {
         let out = tokio::process::Command::new("tailscale").args(args).output().await.ok()?;
         out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
     };
     let Some(ip) = run(&["ip", "-4"]).await.and_then(|s| s.lines().next()?.trim().parse().ok()) else {
+        anyhow::ensure!(!require_tailscale, "Tailscale não encontrado ou desconectado. Conecte o Tailscale ou use a opção de link público.");
         eprintln!("aviso: Tailscale não encontrado, escutando em todas as interfaces");
-        return (IpAddr::V4(Ipv4Addr::UNSPECIFIED), "SEU-IP".into());
+        return Ok((IpAddr::V4(Ipv4Addr::UNSPECIFIED), "SEU-IP".into()));
     };
     let name = run(&["status", "--json"]).await.and_then(|s| {
         let v: serde_json::Value = serde_json::from_str(&s).ok()?;
         Some(v["Self"]["DNSName"].as_str()?.trim_end_matches('.').to_string())
     });
-    (ip, name.filter(|n| !n.is_empty()).unwrap_or_else(|| ip.to_string()))
+    Ok((ip, name.filter(|n| !n.is_empty()).unwrap_or_else(|| ip.to_string())))
 }
 
 /// Abre um Quick Tunnel da Cloudflare para a porta local. O link é aleatório,
@@ -244,7 +276,7 @@ async fn start_tunnel(port: u16) -> Result<(tokio::process::Child, String)> {
     }
     let mut child = cmd
         .spawn()
-        .context("não foi possível rodar o cloudflared (sudo pacman -S cloudflared)")?;
+        .context("não foi possível rodar o cloudflared; reinstale o telinha ou instale o cloudflared")?;
 
     // O cloudflared escreve tudo no stderr: primeiro o link, depois
     // "Registered tunnel connection" quando o túnel passa a aceitar acessos.
@@ -329,6 +361,8 @@ fn watch_bus(pipeline: &gst::Pipeline) {
         for msg in bus.iter_timed(gst::ClockTime::NONE) {
             match msg.view() {
                 gst::MessageView::Error(err) => {
+                    #[cfg(target_os = "windows")]
+                    if windows_audio::handle_error(err.src()) { continue; }
                     eprintln!("erro no pipeline: {} ({:?})", err.error(), err.debug());
                     std::process::exit(1);
                 }
@@ -344,12 +378,13 @@ fn watch_bus(pipeline: &gst::Pipeline) {
 
 /// Comandos no terminal: `b 8000` muda o bitrate, `k` força keyframe.
 fn spawn_console(app: Arc<App>, bitrate: u32, fps: u32) {
-    println!("Comandos: b <kbps> (bitrate) · k (keyframe) · Ctrl+C (sair)");
+    println!("Comandos: b <kbps> (bitrate) · k (keyframe) · q (sair) · Ctrl+C (sair)");
     std::thread::spawn(move || {
         let mut current = bitrate;
         for line in std::io::stdin().lines().map_while(Result::ok) {
             let mut parts = line.split_whitespace();
             match (parts.next(), parts.next().and_then(|v| v.parse::<u32>().ok())) {
+                (Some("q"), _) => { app.shutdown.send_replace(true); break; }
                 (Some("b"), Some(kbps)) if kbps >= 500 => {
                     current = kbps;
                     capture::set_bitrate(&app.streamer.encoder, kbps, fps);
@@ -414,7 +449,15 @@ async fn handle_viewer(socket: WebSocket, peer: SocketAddr, app: Arc<App>) {
     });
 
     // Sem nada (nem pong) por tempo demais = conexão morta pela metade; libera a vaga.
-    while let Ok(Some(Ok(msg))) = tokio::time::timeout(WS_DEAD_AFTER, incoming.next()).await {
+    let mut shutdown = app.shutdown.subscribe();
+    loop {
+        let msg = tokio::select! {
+            _ = shutdown.wait_for(|stopping| *stopping) => break,
+            msg = tokio::time::timeout(WS_DEAD_AFTER, incoming.next()) => match msg {
+                Ok(Some(Ok(msg))) => msg,
+                _ => break,
+            },
+        };
         match msg {
             Message::Text(text) => {
                 if let Err(e) = app.streamer.handle_message(id, &text) {

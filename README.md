@@ -29,6 +29,64 @@ utilidades e reinicia o shell. Para pular essa parte, use `./install.sh --no-she
 
 Rode `./install.sh` de novo depois de um `git pull` ou de atualizar o `caelestia-shell`.
 
+## Instalação no Windows
+
+O pacote Windows requer **Windows 11 de 64 bits**. O instalador inclui GStreamer,
+encoders e Cloudflared; o usuário não precisa instalar Rust, Visual Studio ou
+configurar o `PATH`. A instalação é por usuário, sem pedir administrador.
+
+**Prévia de teste:** a captura real de monitor, os drivers de GPU e a exclusão de
+chamadas ainda precisam de validação em uma máquina Windows 11.
+
+1. Baixe e abra o [instalador Windows](https://github.com/BrunoMano2004/telinha/releases/download/v0.1.0-windows-preview.1/Telinha-Setup-0.1.0-windows-x64.exe).
+2. Abra **Telinha** pelo menu Iniciar. Se quiser, fixe o aplicativo na barra de tarefas.
+3. Escolha o monitor e clique em **Iniciar**. O link é copiado automaticamente.
+4. Para parar, abra o ícone perto do relógio e clique em **Parar**.
+
+Fechar a janela a recolhe para o ícone perto do relógio; a transmissão continua.
+O menu desse ícone também tem Iniciar, Parar, Copiar link e Sair. A opção do
+instalador para iniciar com o Windows abre somente o ícone, **sem transmitir**.
+Sair encerra a transmissão e o túnel, inclusive se o servidor travar.
+
+O **link público** vem selecionado e não precisa de Tailscale. Quem receber o
+link completo pode assistir; a conexão direta de vídeo tem as mesmas limitações
+de NAT descritas abaixo. Para usar somente sua tailnet, desmarque a opção e
+instale/conecte o Tailscale. Nesse modo o aplicativo recusa iniciar sem Tailscale.
+Se o Windows perguntar sobre acesso à rede, permita o Telinha para conectar o vídeo.
+
+O áudio usa WASAPI por aplicativo: clientes conhecidos de chamada e seus processos
+filhos ficam de fora, e **nenhum microfone é aberto**. Outros apps podem ser
+excluídos pelo campo da janela ou por `--audio-exclude spotify,steam`. A seleção
+acompanha os aplicativos durante a transmissão. Chamadas no navegador e áudio de
+loopback que outro aplicativo já esteja reproduzindo não podem ser separados do
+restante do som desse aplicativo. Não abra o próprio link com som no computador
+que está transmitindo.
+
+### Gerar o instalador
+
+O workflow **Instalador Windows**, em GitHub Actions, compila o servidor, a interface
+nativa e o instalador e testa os plugins, o servidor com vídeo/áudio sintéticos e
+o encerramento. Ao terminar, o artefato **Telinha-Windows-x64** contém o `.exe` e
+seu SHA-256. O workflow roda quando os arquivos relevantes são enviados ao GitHub
+e também pode ser iniciado manualmente. Ele não publica uma release automaticamente.
+
+Para compilar em um Windows de desenvolvimento, instale Rust estável (MSVC),
+Visual Studio Build Tools com **Desktop development with C++** e Inno Setup 6:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\windows\build.ps1
+```
+
+O script baixa SDK/runtime do GStreamer e Cloudflared com versões e hashes fixos,
+monta as dependências privadas e gera `dist\Telinha-Setup-0.1.0-windows-x64.exe`.
+O GStreamer 1.26.11 foi escolhido para evitar uma regressão de captura de áudio por
+processo da série 1.28.0–1.28.8. Para usar um SDK MSVC x64 já extraído, passe
+`-GStreamerRoot C:\caminho\msvc_x86_64`.
+
+**Validação em hardware:** o build automatizado não valida captura real de monitor,
+drivers NVIDIA/Intel/AMD, áudio por aplicativo ou conexão entre duas redes. Antes
+de distribuir, teste em Windows 11 conforme [windows/TESTING.md](windows/TESTING.md).
+
 ## Uso
 
 Clique em **Start** no card *Screen share* do Caelestia. O link é copiado
@@ -109,8 +167,8 @@ No painel do Tailscale, em **Machines**, abra o menu da sua máquina, escolha
 **Linux (Wayland):** GStreamer ≥ 1.22 com `gst-plugins-bad` (webrtcbin e nvcodec),
 `gst-plugin-pipewire` e o `xdg-desktop-portal` do seu compositor.
 
-**Windows:** instale o GStreamer (MSVC, *runtime* e *development*) pelo
-gstreamer.freedesktop.org, adicione o `bin` dele ao `PATH` e rode
+**Windows 11:** use o instalador acima. Para desenvolvimento, use o GStreamer
+MSVC x64 (*runtime* e *development*), com o `bin` no `PATH`, e rode
 `cargo build --release`. A captura usa `d3d11screencapturesrc` e o encoder
 `nvd3d11h264enc`, `qsvh264enc`, `amfh264enc` ou `mfh264enc`.
 

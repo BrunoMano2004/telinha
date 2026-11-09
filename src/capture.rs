@@ -27,6 +27,8 @@ pub struct Settings {
     pub encoder: Option<String>,
     #[cfg_attr(target_os = "linux", allow(dead_code))]
     pub monitor: u32,
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
+    pub monitor_handle: Option<u64>,
 }
 
 pub fn pick_encoder(forced: Option<&str>) -> Result<String> {
@@ -38,9 +40,37 @@ pub fn pick_encoder(forced: Option<&str>) -> Result<String> {
     }
     ENCODERS
         .iter()
-        .find(|name| gst::ElementFactory::find(name).is_some())
+        .find(|name| {
+            if gst::ElementFactory::find(name).is_none() { return false; }
+            #[cfg(target_os = "windows")]
+            if let Err(err) = probe_windows_encoder(name) {
+                eprintln!("encoder {name} indisponível: {err:#}; tentando o próximo");
+                return false;
+            }
+            true
+        })
         .map(|s| s.to_string())
         .ok_or_else(|| anyhow::anyhow!("nenhum encoder H.264 encontrado (instale os plugins do GStreamer)"))
+}
+
+#[cfg(target_os = "windows")]
+fn probe_windows_encoder(name: &str) -> Result<()> {
+    let settings = Settings { bitrate_kbps: 12000, fps: 30, profile: "constrained-baseline".into(),
+        encoder: None, monitor: 0, monitor_handle: None };
+    let pipeline = gst::parse::launch(&format!(
+        "videotestsrc num-buffers=3 ! video/x-raw,format=BGRx,width=320,height=240,framerate=30/1 \
+         ! {} ! {name} name=probe ! video/x-h264,profile=constrained-baseline ! fakesink", windows_convert(name, false)))?
+        .downcast::<gst::Pipeline>().map_err(|_| anyhow::anyhow!("pipeline inválido"))?;
+    configure_encoder(&pipeline.by_name("probe").unwrap(), &settings);
+    let result = (|| -> Result<()> {
+        pipeline.set_state(gst::State::Playing)?;
+        let message = pipeline.bus().unwrap().timed_pop_filtered(3 * gst::ClockTime::SECOND,
+            &[gst::MessageType::Eos, gst::MessageType::Error]).ok_or_else(|| anyhow::anyhow!("encoder não respondeu"))?;
+        if let gst::MessageView::Error(error) = message.view() { bail!("{}", error.error()); }
+        Ok(())
+    })();
+    let _ = pipeline.set_state(gst::State::Null);
+    result
 }
 
 /// Parte comum: encoder → RTP → tee (cada espectador pendura um ramo no tee).
@@ -63,10 +93,14 @@ const GATE: &str = "valve name=valve drop=true ! queue max-size-buffers=1 max-si
 
 /// Fonte sintética, para testar rede e navegador sem capturar a tela.
 pub fn test_description(encoder: &str, s: &Settings) -> String {
+    #[cfg(target_os = "linux")]
+    let convert = "videoconvert".to_string();
+    #[cfg(target_os = "windows")]
+    let convert = windows_convert(encoder, false);
     format!(
         "videotestsrc is-live=true pattern=ball \
          ! video/x-raw,format=BGRx,width=1920,height=1080,framerate={fps}/1 \
-         ! {GATE} ! videoconvert ! {tail}",
+         ! {GATE} ! {convert} ! {tail}",
         fps = s.fps,
         tail = tail(encoder, s),
     )
@@ -92,26 +126,33 @@ pub fn pipeline_description(fd: i32, node: u32, encoder: &str, s: &Settings) -> 
 
 #[cfg(target_os = "windows")]
 pub fn pipeline_description(encoder: &str, s: &Settings) -> String {
-    let convert = if encoder == "x264enc" {
-        "d3d11download ! videoconvert"
-    } else {
-        "d3d11convert"
-    };
+    let convert = windows_convert(encoder, true);
+    let monitor = s.monitor_handle.map(|handle| format!("monitor-handle={handle}"))
+        .unwrap_or_else(|| format!("monitor-index={}", s.monitor));
     format!(
-        "d3d11screencapturesrc monitor-index={monitor} show-cursor=true \
+        "d3d11screencapturesrc {monitor} show-cursor=true \
          ! video/x-raw(memory:D3D11Memory),framerate={fps}/1 \
          ! {GATE} ! {convert} ! {tail}",
-        monitor = s.monitor,
         fps = s.fps,
         tail = tail(encoder, s),
     )
 }
 
-/// Fonte de áudio no Windows: tudo o que sai na saída padrão (ou um tique de teste).
-/// No Linux a fonte vem de `audio::AudioRoute`, que deixa chamadas e microfone de fora.
 #[cfg(target_os = "windows")]
-pub fn windows_audio_source(test: bool) -> String {
-    if test { "audiotestsrc is-live=true wave=ticks" } else { "wasapi2src loopback=true low-latency=true provide-clock=false" }.into()
+fn windows_convert(encoder: &str, gpu_input: bool) -> String {
+    // Nem todo encoder do Windows aceita memória D3D11 (Media Foundation,
+    // por exemplo). Use as caps anunciadas pelo plugin, inclusive no --test.
+    let gpu = gst::ElementFactory::find(encoder).is_some_and(|factory| {
+        factory.static_pad_templates().iter().any(|pad| {
+            pad.direction() == gst::PadDirection::Sink && pad.caps().to_string().contains("memory:D3D11Memory")
+        })
+    });
+    match (gpu_input, gpu) {
+        (true, true) => "d3d11convert ! video/x-raw(memory:D3D11Memory),format=NV12",
+        (false, true) => "d3d11upload ! d3d11convert ! video/x-raw(memory:D3D11Memory),format=NV12",
+        (true, false) => "d3d11download ! videoconvert ! video/x-raw,format=NV12",
+        (false, false) => "videoconvert ! video/x-raw,format=NV12",
+    }.into()
 }
 
 /// Ramo de áudio (`source` → Opus → RTP → `atee`), montado no mesmo pipeline do

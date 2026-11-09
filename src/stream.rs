@@ -54,6 +54,7 @@ pub struct Streamer {
     /// Servidor STUN para quem está fora da tailnet descobrir nosso IP público.
     stun: Option<String>,
     state: Mutex<State>,
+    teardown: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
 }
 
 impl Streamer {
@@ -85,12 +86,20 @@ impl Streamer {
             encoder: get("enc"),
             stun,
             state: Mutex::new(State::default()),
+            teardown: Arc::new(Mutex::new(Vec::new())),
             pipeline,
         })
     }
 
     pub fn viewer_count(&self) -> usize {
         self.state.lock().unwrap().viewers.len()
+    }
+
+    /// Aguarda a remoção dos ramos antes de encerrar o processo.
+    pub fn shutdown(&self) {
+        let _ = self.pipeline.set_state(gst::State::Null);
+        let workers: Vec<_> = self.teardown.lock().unwrap().drain(..).collect();
+        for worker in workers { let _ = worker.join(); }
     }
 
     /// Liga captura + encoder. Retorna a geração atual, usada por `stop_if_idle`.
@@ -247,24 +256,27 @@ impl Streamer {
         drop(state);
 
         let Viewer { bin, tee_pads, .. } = viewer;
+        bin.set_locked_state(true);
         // Desconecta cada ramo só quando o tee não estiver empurrando dados nele;
         // o bin sai do pipeline depois que o último pad for desligado.
         let remaining = Arc::new(AtomicUsize::new(tee_pads.len()));
         for (tee, tee_pad) in tee_pads {
             let (bin, pipeline, remaining) = (bin.clone(), self.pipeline.clone(), remaining.clone());
+            let teardown = self.teardown.clone();
             tee_pad.add_probe(gst::PadProbeType::IDLE, move |pad, _| {
                 if let Some(peer) = pad.peer() {
                     let _ = pad.unlink(&peer);
                 }
                 let last = remaining.fetch_sub(1, Ordering::SeqCst) == 1;
                 let (pad, tee, bin, pipeline) = (pad.clone(), tee.clone(), bin.clone(), pipeline.clone());
-                std::thread::spawn(move || {
+                let worker = std::thread::spawn(move || {
                     tee.release_request_pad(&pad);
                     if last {
                         let _ = bin.set_state(gst::State::Null);
                         let _ = pipeline.remove(&bin);
                     }
                 });
+                teardown.lock().unwrap().push(worker);
                 gst::PadProbeReturn::Remove
             });
         }

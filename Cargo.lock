@@ -1324,6 +1324,7 @@ dependencies = [
  "gstreamer-video",
  "gstreamer-webrtc",
  "libc",
+ "rand",
  "serde",
  "serde_json",
  "tokio",

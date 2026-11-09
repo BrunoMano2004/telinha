@@ -20,6 +20,7 @@ fi
 # Binário em um caminho fixo, que o card chama.
 install -Dm755 "$here/../target/release/telinha" "$HOME/.local/bin/telinha"
 
+mkdir -p "$(dirname "$user")"
 tmp=$(mktemp -d "${user}.XXXX")
 cp -a "$system/." "$tmp/"
 cp "$here/services/Telinha.qml" "$tmp/services/"

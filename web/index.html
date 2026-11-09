@@ -14,7 +14,7 @@
   #status:empty { display: none; }
   #bar { position: fixed; top: 12px; right: 12px; display: flex; gap: 6px; opacity: 0;
     transition: opacity .2s; }
-  body:hover #bar, body.idle-off #bar { opacity: 1; }
+  body:hover #bar, body.idle-off #bar, body.needs-unmute #bar { opacity: 1; }
   button { background: rgba(30,30,30,.85); color: #e6e6e6; border: 1px solid #3a3a3a;
     border-radius: 6px; padding: 6px 10px; font: inherit; cursor: pointer; }
   button:hover { background: rgba(60,60,60,.9); }
@@ -29,6 +29,7 @@
 <div id="status">Conectando…</div>
 <pre id="stats"></pre>
 <div id="bar">
+  <button id="btn-sound" title="Som (M)" hidden>Ativar som</button>
   <button id="btn-stats" title="Estatísticas (S)">Estatísticas</button>
   <button id="btn-full" title="Tela cheia (F ou duplo clique)">Tela cheia</button>
 </div>
@@ -36,20 +37,55 @@
 const video = document.getElementById('video');
 const statusEl = document.getElementById('status');
 const statsEl = document.getElementById('stats');
-let pc, ws, statsTimer, last;
+const soundBtn = document.getElementById('btn-sound');
+// Conexão que está mostrando vídeo agora (a nova só a substitui ao conectar).
+let activePc, statsTimer, last;
 
 function setStatus(text) { statusEl.textContent = text; }
 
+// Tempo máximo para uma tentativa chegar ao vídeo; depois disso, recomeça do zero.
+const CONNECT_TIMEOUT_MS = 20000;
+
 function connect() {
-  setStatus('Conectando…');
-  ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`);
-  pc = new RTCPeerConnection({ bundlePolicy: 'max-bundle' });
+  // Variáveis locais: handlers de uma tentativa antiga nunca mexem na nova.
+  const prevPc = activePc;
+  let done = false;
+  // HTTPS = aberto pelo túnel da Cloudflare, de fora da tailnet: precisa de STUN
+  // para o vídeo achar um caminho até a máquina que transmite.
+  const remote = location.protocol === 'https:';
+  const ws = new WebSocket(`${remote ? 'wss' : 'ws'}://${location.host}/ws${location.search}`);
+  const pc = new RTCPeerConnection({
+    bundlePolicy: 'max-bundle',
+    iceServers: remote ? [{ urls: 'stun:stun.l.google.com:19302' }] : [],
+  });
+  if (!prevPc) setStatus('Conectando…');
+  // Diagnóstico: o que acontece no navegador aparece no terminal de quem transmite.
+  const log = (text) => {
+    if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'log', text: String(text).slice(0, 500) }));
+  };
+
+  // Encerra esta tentativa (uma vez só) e agenda a próxima.
+  const retry = (text, delay = 2000) => {
+    if (done) return;
+    done = true;
+    clearTimeout(timer);
+    ws.onclose = null;
+    try { ws.close(); } catch {}
+    // A conexão em uso fica aberta: mantém a última imagem até a próxima conectar.
+    if (pc !== activePc) pc.close();
+    setStatus(text);
+    setTimeout(connect, delay);
+  };
+  const timer = setTimeout(() => retry('Reconectando…', 0), CONNECT_TIMEOUT_MS);
 
   pc.ontrack = (e) => {
     // Pede ao navegador o menor buffer de reprodução possível.
     try { e.receiver.jitterBufferTarget = 0; } catch {}
     try { e.receiver.playoutDelayHint = 0; } catch {}
-    video.srcObject = e.streams[0] || new MediaStream([e.track]);
+    if (e.track.kind === 'audio') {
+      soundBtn.hidden = false;
+      updateSound();
+    }
   };
   pc.onicecandidate = (e) => {
     if (e.candidate && ws.readyState === 1) {
@@ -57,32 +93,59 @@ function connect() {
                                sdpMLineIndex: e.candidate.sdpMLineIndex ?? 0 }));
     }
   };
+  pc.oniceconnectionstatechange = () => log(`ICE ${pc.iceConnectionState}`);
+  pc.onicegatheringstatechange = () => log(`coleta ICE ${pc.iceGatheringState}`);
   pc.onconnectionstatechange = () => {
-    if (pc.connectionState === 'connected') setStatus('');
-    if (pc.connectionState === 'failed') setStatus('Falha na conexão de vídeo (verifique o Tailscale)');
+    log(`conexão ${pc.connectionState}`);
+    if (pc.connectionState === 'connected') {
+      clearTimeout(timer);
+      // Só agora larga a conexão anterior: a última imagem fica na tela até aqui.
+      // Vídeo e áudio chegam em eventos separados; o elemento recebe as duas trilhas.
+      video.srcObject = new MediaStream(pc.getReceivers().map((r) => r.track));
+      video.onplaying = () => log(`reproduzindo ${video.videoWidth}x${video.videoHeight}`);
+      // Confirma que as trilhas recebem dados (ajuda a diagnosticar "sem som").
+      setTimeout(async () => {
+        const got = [];
+        (await pc.getStats()).forEach((r) => {
+          if (r.type === 'inbound-rtp') got.push(`${r.kind} ${r.packetsReceived} pacotes`);
+        });
+        log(`recebendo: ${got.join(' · ') || 'nada'}`);
+      }, 3000);
+      activePc = pc;
+      if (prevPc) prevPc.close();
+      setStatus('');
+    }
+    if (pc.connectionState === 'failed') retry(remote
+      ? 'Falha na conexão de vídeo (a rede de alguma das pontas bloqueia conexões diretas). Tentando de novo…'
+      : 'Falha na conexão de vídeo (verifique o Tailscale). Tentando de novo…', 3000);
   };
 
   ws.onmessage = async (e) => {
     const msg = JSON.parse(e.data);
     if (msg.type === 'offer') {
-      await pc.setRemoteDescription({ type: 'offer', sdp: msg.sdp });
-      const answer = await pc.createAnswer();
-      await pc.setLocalDescription(answer);
-      ws.send(JSON.stringify({ type: 'answer', sdp: answer.sdp }));
+      try {
+        await pc.setRemoteDescription({ type: 'offer', sdp: msg.sdp });
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        ws.send(JSON.stringify({ type: 'answer', sdp: answer.sdp }));
+        // Porta 0 numa linha m= = o navegador recusou aquela trilha (ex.: codec).
+        const media = answer.sdp.split(/\r?\n/).filter((l) => l.startsWith('m='));
+        log(`${navigator.userAgent} · resposta: ${media.join(' | ')}`);
+      } catch (err) {
+        log(`erro na negociação: ${err.name}: ${err.message}`);
+        setStatus(`Erro na negociação do vídeo: ${err.message}`);
+      }
     } else if (msg.type === 'ice') {
       try { await pc.addIceCandidate({ candidate: msg.candidate, sdpMLineIndex: msg.sdpMLineIndex }); } catch {}
     } else if (msg.type === 'full') {
-      setStatus('A transmissão está cheia. Tentando de novo em instantes…');
+      retry('A transmissão está cheia. Tentando de novo em instantes…', 5000);
     }
   };
-  ws.onclose = () => {
-    pc.close();
-    if (!statusEl.textContent) setStatus('Transmissão encerrada. Reconectando…');
-    setTimeout(connect, 2000);
-  };
+  ws.onclose = () => retry('Conexão perdida. Reconectando…');
 }
 
 async function updateStats() {
+  const pc = activePc;
   if (!pc || pc.connectionState !== 'connected') return;
   const report = await pc.getStats();
   let v, pair;
@@ -106,6 +169,17 @@ async function updateStats() {
     `perdidos    ${v.packetsLost ?? 0} pacotes · ${v.framesDropped ?? 0} quadros`;
 }
 
+// O navegador só toca áudio depois de um clique, então o vídeo começa mudo.
+function updateSound() {
+  soundBtn.textContent = video.muted ? 'Ativar som' : 'Silenciar';
+  document.body.classList.toggle('needs-unmute', !soundBtn.hidden && video.muted);
+}
+function toggleSound() {
+  if (soundBtn.hidden) return;
+  video.muted = !video.muted;
+  updateSound();
+}
+
 function toggleStats() {
   statsEl.classList.toggle('on');
   clearInterval(statsTimer);
@@ -115,12 +189,14 @@ function toggleFull() {
   document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen();
 }
 
+soundBtn.onclick = toggleSound;
 document.getElementById('btn-stats').onclick = toggleStats;
 document.getElementById('btn-full').onclick = toggleFull;
 video.ondblclick = toggleFull;
 document.onkeydown = (e) => {
   if (e.key === 's' || e.key === 'S') toggleStats();
   if (e.key === 'f' || e.key === 'F') toggleFull();
+  if (e.key === 'm' || e.key === 'M') toggleSound();
 };
 
 connect();

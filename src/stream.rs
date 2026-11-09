@@ -1,5 +1,6 @@
-//! Lado WebRTC: um único pipeline codifica a tela uma vez e cada espectador
-//! recebe um ramo `queue ! webrtcbin` pendurado no `tee`.
+//! Lado WebRTC: um único pipeline codifica a tela (e o áudio, se ligado) uma
+//! vez e cada espectador recebe um webrtcbin com um `queue` pendurado em cada
+//! `tee` (vídeo e áudio).
 
 use anyhow::{Context, Result, bail};
 use gstreamer as gst;
@@ -10,6 +11,8 @@ use gstreamer_webrtc as gst_webrtc;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedSender;
 
 #[derive(Serialize, Deserialize)]
@@ -22,12 +25,15 @@ pub enum Signal {
         #[serde(rename = "sdpMLineIndex")]
         sdp_mline_index: u32,
     },
+    /// Diagnóstico enviado pela página; só é impresso.
+    Log { text: String },
 }
 
 struct Viewer {
     bin: gst::Bin,
     webrtc: gst::Element,
-    tee_pad: gst::Pad,
+    /// Um pad de cada tee (vídeo, áudio) ligado a este espectador.
+    tee_pads: Vec<(gst::Element, gst::Pad)>,
 }
 
 #[derive(Default)]
@@ -41,34 +47,43 @@ struct State {
 
 pub struct Streamer {
     pub pipeline: gst::Pipeline,
-    tee: gst::Element,
-    valve: gst::Element,
+    /// `tee` do vídeo e, com áudio ligado, `atee`.
+    tees: Vec<gst::Element>,
+    valves: Vec<gst::Element>,
     pub encoder: gst::Element,
+    /// Servidor STUN para quem está fora da tailnet descobrir nosso IP público.
+    stun: Option<String>,
     state: Mutex<State>,
 }
 
 impl Streamer {
-    pub fn new(description: &str) -> Result<Self> {
+    pub fn new(description: &str, stun: Option<String>) -> Result<Self> {
         let pipeline = gst::parse::launch(description)
             .context("falha ao montar o pipeline")?
             .downcast::<gst::Pipeline>()
             .unwrap();
         let get = |name: &str| pipeline.by_name(name).expect("elemento nomeado no pipeline");
+        let audio = pipeline.by_name("atee").is_some();
+        let tees: Vec<_> = if audio { vec![get("tee"), get("atee")] } else { vec![get("tee")] };
+        let valves: Vec<_> = if audio { vec![get("valve"), get("avalve")] } else { vec![get("valve")] };
 
         // Cada webrtcbin novo manda RECONFIGURE rio acima. Se isso chega ao
         // pipewiresrc, ele renegocia o formato com o portal em loop e a captura
         // trava. O formato do encoder nunca muda por causa de um espectador.
-        get("valve").static_pad("sink").unwrap().add_probe(gst::PadProbeType::EVENT_UPSTREAM, |_, info| {
-            match info.event() {
-                Some(e) if e.type_() == gst::EventType::Reconfigure => gst::PadProbeReturn::Drop,
-                _ => gst::PadProbeReturn::Ok,
-            }
-        });
+        for valve in &valves {
+            valve.static_pad("sink").unwrap().add_probe(gst::PadProbeType::EVENT_UPSTREAM, |_, info| {
+                match info.event() {
+                    Some(e) if e.type_() == gst::EventType::Reconfigure => gst::PadProbeReturn::Drop,
+                    _ => gst::PadProbeReturn::Ok,
+                }
+            });
+        }
 
         Ok(Self {
-            tee: get("tee"),
-            valve: get("valve"),
+            tees,
+            valves,
             encoder: get("enc"),
+            stun,
             state: Mutex::new(State::default()),
             pipeline,
         })
@@ -110,23 +125,39 @@ impl Streamer {
         self.start()?;
 
         let bin = gst::Bin::with_name(&format!("viewer-{id}"));
-        let queue = gst::ElementFactory::make("queue")
-            .property_from_str("leaky", "downstream")
-            .property("max-size-buffers", 0u32)
-            .property("max-size-bytes", 0u32)
-            .property("max-size-time", 200 * gst::ClockTime::MSECOND)
-            .build()?;
         let webrtc = gst::ElementFactory::make("webrtcbin")
             .property_from_str("bundle-policy", "max-bundle")
             .build()?;
-        bin.add_many([&queue, &webrtc])?;
+        if let Some(stun) = &self.stun {
+            webrtc.set_property("stun-server", stun);
+        }
+        bin.add(&webrtc)?;
 
-        let sink = webrtc.request_pad_simple("sink_%u").context("webrtcbin sem pad")?;
-        queue.static_pad("src").unwrap().link(&sink)?;
-        let transceiver = sink.property::<gst_webrtc::WebRTCRTPTransceiver>("transceiver");
-        transceiver.set_property("direction", gst_webrtc::WebRTCRTPTransceiverDirection::Sendonly);
-        transceiver.set_property("do-nack", true);
-        bin.add_pad(&gst::GhostPad::with_target(&queue.static_pad("sink").unwrap())?)?;
+        let mut ghosts = Vec::new();
+        for (i, tee) in self.tees.iter().enumerate() {
+            let queue = gst::ElementFactory::make("queue")
+                .property_from_str("leaky", "downstream")
+                .property("max-size-buffers", 0u32)
+                .property("max-size-bytes", 0u32)
+                .property("max-size-time", 200 * gst::ClockTime::MSECOND)
+                .build()?;
+            bin.add(&queue)?;
+            let sink = webrtc.request_pad_simple("sink_%u").context("webrtcbin sem pad")?;
+            queue.static_pad("src").unwrap().link(&sink)?;
+            // Mesmo msid nas duas trilhas: o navegador as trata como um stream só
+            // e sincroniza áudio com vídeo.
+            if sink.find_property("msid").is_some() {
+                sink.set_property("msid", "telinha");
+            }
+            let transceiver = sink.property::<gst_webrtc::WebRTCRTPTransceiver>("transceiver");
+            transceiver.set_property("direction", gst_webrtc::WebRTCRTPTransceiverDirection::Sendonly);
+            transceiver.set_property("do-nack", i == 0);
+            let ghost = gst::GhostPad::builder_with_target(&queue.static_pad("sink").unwrap())?
+                .name(format!("sink_{i}"))
+                .build();
+            bin.add_pad(&ghost)?;
+            ghosts.push((tee.clone(), ghost));
+        }
 
         let offer_tx = tx.clone();
         webrtc.connect("on-negotiation-needed", false, move |values| {
@@ -158,12 +189,18 @@ impl Streamer {
         // primeiro push devolve FLUSHING e a fonte de vídeo para de vez.
         self.pipeline.add(&bin)?;
         bin.sync_state_with_parent()?;
-        let tee_pad = self.tee.request_pad_simple("src_%u").unwrap();
-        tee_pad.link(&bin.static_pad("sink").unwrap())?;
+        let mut tee_pads = Vec::new();
+        for (tee, ghost) in ghosts {
+            let tee_pad = tee.request_pad_simple("src_%u").unwrap();
+            tee_pad.link(&ghost)?;
+            tee_pads.push((tee, tee_pad));
+        }
 
         let mut state = self.state.lock().unwrap();
-        state.viewers.insert(id, Viewer { bin, webrtc, tee_pad });
-        self.valve.set_property("drop", false);
+        state.viewers.insert(id, Viewer { bin, webrtc, tee_pads });
+        for valve in &self.valves {
+            valve.set_property("drop", false);
+        }
         drop(state);
 
         self.request_keyframe();
@@ -183,11 +220,13 @@ impl Streamer {
             }
             Signal::Ice { candidate, sdp_mline_index } => {
                 // Candidatos mDNS (.local) do navegador não resolvem aqui; o ICE
-                // ainda conecta porque o navegador alcança nosso IP do Tailscale.
+                // ainda conecta porque o navegador alcança nosso IP do Tailscale
+                // (ou, pelo túnel, nosso IP público descoberto via STUN).
                 if !candidate.is_empty() && !candidate.contains(".local") {
                     webrtc.emit_by_name::<()>("add-ice-candidate", &[&sdp_mline_index, &candidate]);
                 }
             }
+            Signal::Log { text } => println!("  #{id} {text}"),
             Signal::Offer { .. } => bail!("o servidor é quem envia a oferta"),
         }
         Ok(())
@@ -201,25 +240,34 @@ impl Streamer {
         state.generation += 1;
         let idle = state.viewers.is_empty().then_some(state.generation);
         if idle.is_some() {
-            self.valve.set_property("drop", true);
+            for valve in &self.valves {
+                valve.set_property("drop", true);
+            }
         }
         drop(state);
 
-        let (tee, pipeline) = (self.tee.clone(), self.pipeline.clone());
-        let Viewer { bin, tee_pad, .. } = viewer;
-        // Desconecta o ramo só quando o tee não estiver empurrando dados nele.
-        tee_pad.add_probe(gst::PadProbeType::IDLE, move |pad, _| {
-            if let Some(peer) = pad.peer() {
-                let _ = pad.unlink(&peer);
-            }
-            let (pad, tee, bin, pipeline) = (pad.clone(), tee.clone(), bin.clone(), pipeline.clone());
-            std::thread::spawn(move || {
-                tee.release_request_pad(&pad);
-                let _ = bin.set_state(gst::State::Null);
-                let _ = pipeline.remove(&bin);
+        let Viewer { bin, tee_pads, .. } = viewer;
+        // Desconecta cada ramo só quando o tee não estiver empurrando dados nele;
+        // o bin sai do pipeline depois que o último pad for desligado.
+        let remaining = Arc::new(AtomicUsize::new(tee_pads.len()));
+        for (tee, tee_pad) in tee_pads {
+            let (bin, pipeline, remaining) = (bin.clone(), self.pipeline.clone(), remaining.clone());
+            tee_pad.add_probe(gst::PadProbeType::IDLE, move |pad, _| {
+                if let Some(peer) = pad.peer() {
+                    let _ = pad.unlink(&peer);
+                }
+                let last = remaining.fetch_sub(1, Ordering::SeqCst) == 1;
+                let (pad, tee, bin, pipeline) = (pad.clone(), tee.clone(), bin.clone(), pipeline.clone());
+                std::thread::spawn(move || {
+                    tee.release_request_pad(&pad);
+                    if last {
+                        let _ = bin.set_state(gst::State::Null);
+                        let _ = pipeline.remove(&bin);
+                    }
+                });
+                gst::PadProbeReturn::Remove
             });
-            gst::PadProbeReturn::Remove
-        });
+        }
         idle
     }
 

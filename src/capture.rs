@@ -107,6 +107,28 @@ pub fn pipeline_description(encoder: &str, s: &Settings) -> String {
     )
 }
 
+/// Fonte de áudio no Windows: tudo o que sai na saída padrão (ou um tique de teste).
+/// No Linux a fonte vem de `audio::AudioRoute`, que deixa chamadas e microfone de fora.
+#[cfg(target_os = "windows")]
+pub fn windows_audio_source(test: bool) -> String {
+    if test { "audiotestsrc is-live=true wave=ticks" } else { "wasapi2src loopback=true low-latency=true provide-clock=false" }.into()
+}
+
+/// Ramo de áudio (`source` → Opus → RTP → `atee`), montado no mesmo pipeline do
+/// vídeo. Tem sua própria `valve`, também fechada sem espectadores. A fonte usa
+/// `provide-clock=false` para manter o relógio do sistema no pipeline, o mesmo
+/// que o vídeo usa para os timestamps.
+pub fn audio_description(source: &str) -> String {
+    format!(
+        "{source} ! audioconvert ! audioresample ! audio/x-raw,rate=48000,channels=2 \
+         ! valve name=avalve drop=true \
+         ! opusenc bitrate=128000 frame-size=10 audio-type=generic \
+         ! rtpopuspay pt=97 \
+         ! application/x-rtp,media=audio,encoding-name=OPUS,payload=97,clock-rate=48000 \
+         ! tee name=atee allow-not-linked=true"
+    )
+}
+
 /// Ajusta o encoder para latência mínima: sem B-frames, CBR com buffer de
 /// ~2 frames e GOP infinito (keyframes só quando um espectador entra ou pede).
 pub fn configure_encoder(enc: &gst::Element, s: &Settings) {

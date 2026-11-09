@@ -81,6 +81,19 @@ StyledRect {
                 }
             }
 
+            IconButton {
+                // Som do sistema junto com a tela; só muda com a transmissão parada.
+                icon: Telinha.audio ? "volume_up" : "volume_off"
+                isToggle: true
+                checked: Telinha.audio
+                disabled: Telinha.running
+                type: IconButton.Tonal
+                onClicked: {
+                    Telinha.setAudio(!Telinha.audio);
+                    internalChecked = Telinha.audio;
+                }
+            }
+
             IconTextButton {
                 icon: Telinha.running ? "stop" : "play_arrow"
                 text: Telinha.running ? Tr.tr("Stop") : Tr.tr("Start")

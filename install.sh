@@ -18,7 +18,7 @@ command -v pacman >/dev/null || die "este instalador é para Arch Linux (pacman)
 packages=(
     base-devel pkgconf
     gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad gst-plugin-pipewire
-    xdg-desktop-portal
+    xdg-desktop-portal pipewire
 )
 # Encoder H.264: NVENC vem no gst-plugins-bad; Intel/AMD usam VA-API; x264 é o fallback.
 packages+=(gst-plugins-ugly)
@@ -43,6 +43,7 @@ fi
 export PATH="$HOME/.cargo/bin:$PATH"
 
 command -v tailscale >/dev/null || say "Aviso: Tailscale não encontrado (sudo pacman -S tailscale). Sem ele o telinha escuta em todas as interfaces."
+command -v cloudflared >/dev/null || say "Aviso: cloudflared não encontrado (sudo pacman -S cloudflared). Sem ele o link público (--tunnel) não funciona."
 
 # --- Compilação -----------------------------------------------------------
 say "Compilando"

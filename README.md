@@ -46,16 +46,58 @@ tela cheia, e **S** mostra as estatísticas (fps, bitrate, RTT, buffer e decodif
 |---|---|---|
 | `-b, --bitrate <kbps>` | 12000 | Cada espectador consome isso de **upload** |
 | `-f, --fps <n>` | 60 | |
-| `--profile <p>` | `main` | `high` não é aceito por todo navegador |
+| `--profile <p>` | `constrained-baseline` | `main`/`high` comprimem um pouco melhor, mas o Firefox recusa o vídeo |
 | `--encoder <nome>` | auto | `nvh264enc`, `x264enc`, … |
 | `--max-viewers <n>` | 4 | |
 | `--choose` | | Linux: ignora a tela salva e abre o seletor de novo |
 | `-m, --monitor <n>` | 0 | Windows: índice do monitor |
 | `--bind <ip>` / `-p, --port` | IP do Tailscale / 8080 | |
 | `--test` | | Transmite um padrão de teste em vez da tela |
+| `--tunnel` | | Link público pela Cloudflare (veja abaixo) |
+| `-a, --audio` | | Transmite também o som do sistema (veja abaixo) |
 
 Comandos no terminal enquanto roda: `b 8000` (muda o bitrate ao vivo), `k` (força
 keyframe) e `s` (status).
+
+### Link público (qualquer pessoa, sem Tailscale)
+
+```bash
+telinha --tunnel
+```
+
+Abre um *Quick Tunnel* da Cloudflare (precisa do `cloudflared`; não precisa de conta)
+e mostra um link `https://….trycloudflare.com/?k=…`. O card do Caelestia
+sempre usa esse modo. O túnel só existe enquanto a transmissão
+estiver rodando, e a chave `k` impede que alguém assista sem o link completo.
+
+O túnel leva só a página e a sinalização; o vídeo continua indo direto por WebRTC
+(o IP público é descoberto via STUN). Em redes que bloqueiam conexões diretas
+(algumas corporativas ou com NAT simétrico) o vídeo pode não conectar.
+
+### Som
+
+Com `--audio` (no card do Caelestia, o botão 🔊 ao lado do Start, ligado por
+padrão), vai junto o som dos apps, em Opus a 128 kbps. O navegador só toca som
+depois de um clique, então o vídeo abre mudo com um botão **Ativar som** (ou tecla **M**).
+
+**Sem eco e sem microfone (Linux):** o telinha não captura a saída de áudio inteira.
+Ele cria uma saída virtual própria, *telinha (transmissão)*, e liga a ela uma cópia
+do som de cada app; você continua ouvindo tudo normalmente. Ficam de fora:
+
+- apps de chamada de voz (Discord e clientes alternativos, TeamSpeak, Mumble, Zoom,
+  Slack, Teams, Skype, Telegram, Signal, WhatsApp, Element, Jitsi) e qualquer fluxo
+  marcado como comunicação. Assim a voz de quem está na call com você não volta
+  para a pessoa;
+- microfones, loopbacks e cancelamento de eco. Se algo ligar uma dessas fontes à
+  saída virtual ou à captura do telinha, a ligação é desfeita na hora.
+
+O terminal mostra o que entra e o que fica de fora (`som: + Firefox`,
+`som: ignorando Discord (chamada de voz)`). Para excluir outros apps:
+`--audio-exclude spotify,steam`. A saída virtual some quando a transmissão para.
+
+Limitações: chamadas feitas *no navegador* (Meet, Discord web) saem pelo mesmo app
+que o resto do navegador e não dá para separá-las. E não abra o seu próprio link
+no mesmo computador com som ligado, porque o áudio da página voltaria para a transmissão.
 
 ### Compartilhar com um amigo pelo Tailscale
 

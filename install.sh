@@ -18,7 +18,7 @@ command -v pacman >/dev/null || die "este instalador é para Arch Linux (pacman)
 packages=(
     base-devel pkgconf
     gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad gst-plugin-pipewire
-    xdg-desktop-portal pipewire
+    libnice xdg-desktop-portal pipewire
 )
 # Encoder H.264: NVENC vem no gst-plugins-bad; Intel/AMD usam VA-API; x264 é o fallback.
 packages+=(gst-plugins-ugly)
@@ -55,12 +55,6 @@ say "Binário instalado em ~/.local/bin/telinha"
 if ((with_shell)) && [[ -d /etc/xdg/quickshell/caelestia ]]; then
     say "Instalando o card 'Screen share' no Caelestia"
     "$here/caelestia/install.sh"
-    if pgrep -f 'qs -c caelestia' >/dev/null; then
-        say "Reiniciando o shell"
-        pkill -f 'qs -c caelestia' || true
-        sleep 1
-        setsid caelestia shell -d >/dev/null 2>&1 < /dev/null &
-    fi
 fi
 
 say "Pronto! Rode 'telinha' ou use o botão Start no painel de utilidades."

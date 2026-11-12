@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Instala o card "Screen share" no Caelestia.
+# Instala o card "Screen share" no Caelestia (no pacote do AUR: telinha-caelestia).
 #
 # O Caelestia vem do pacote em /etc/xdg/quickshell/caelestia e não tem pontos
 # de extensão, então este script cria uma cópia em ~/.config/quickshell/caelestia
@@ -8,7 +8,8 @@
 # Para desfazer: rm -rf ~/.config/quickshell/caelestia
 set -euo pipefail
 
-here=$(cd "$(dirname "$0")" && pwd)
+# readlink: no pacote, este script é chamado pelo link /usr/bin/telinha-caelestia.
+here=$(dirname "$(readlink -f "$0")")
 system=/etc/xdg/quickshell/caelestia
 user=${XDG_CONFIG_HOME:-$HOME/.config}/quickshell/caelestia
 
@@ -16,9 +17,6 @@ if [[ -e $user && ! -e $user/.telinha ]]; then
     echo "$user já existe e não foi criado por este script; não vou sobrescrever." >&2
     exit 1
 fi
-
-# Binário em um caminho fixo, que o card chama.
-install -Dm755 "$here/../target/release/telinha" "$HOME/.local/bin/telinha"
 
 mkdir -p "$(dirname "$user")"
 tmp=$(mktemp -d "${user}.XXXX")
@@ -57,4 +55,12 @@ EOF
 touch "$tmp/.telinha"
 rm -rf "$user"
 mv "$tmp" "$user"
-echo "Card instalado em $user. Reinicie o shell: caelestia shell -d (ou relogue)."
+echo "Card instalado em $user."
+if pgrep -f 'qs -c caelestia' >/dev/null; then
+    echo "Reiniciando o shell do Caelestia"
+    pkill -f 'qs -c caelestia' || true
+    sleep 1
+    setsid caelestia shell -d >/dev/null 2>&1 < /dev/null &
+else
+    echo "Inicie o shell: caelestia shell -d (ou relogue)."
+fi

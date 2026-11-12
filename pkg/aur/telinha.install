@@ -1,0 +1,15 @@
+_caelestia_hint() {
+    if [[ -d /etc/xdg/quickshell/caelestia ]]; then
+        echo ">> Para adicionar o card 'Screen share' ao Caelestia, rode (como seu usuário):"
+        echo ">>     telinha-caelestia"
+        echo ">> Rode de novo depois de atualizar o caelestia-shell."
+    fi
+}
+
+post_install() {
+    _caelestia_hint
+}
+
+post_upgrade() {
+    echo ">> telinha atualizado. Se o card do Caelestia mudou, rode telinha-caelestia de novo."
+}

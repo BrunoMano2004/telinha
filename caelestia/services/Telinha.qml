@@ -50,7 +50,9 @@ Singleton {
         id: proc
 
         // --tunnel: link público pela Cloudflare, que abre para qualquer pessoa.
-        command: [Quickshell.env("HOME") + "/.local/bin/telinha", "--tunnel"].concat(root.audio ? ["--audio"] : [])
+        // Usa o telinha do PATH (pacote do AUR) ou o de ~/.local/bin (./install.sh).
+        // O exec mantém o PID, então parar o processo ainda manda o SIGTERM ao telinha.
+        command: ["sh", "-c", 'exec "$(command -v telinha || echo "$HOME/.local/bin/telinha")" "$@"', "telinha", "--tunnel"].concat(root.audio ? ["--audio"] : [])
 
         stdout: SplitParser {
             onRead: line => {

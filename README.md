@@ -16,6 +16,17 @@ Tela ─► PipeWire/DXGI ─► NVENC (H.264) ─► RTP ─► tee ─┬─�
 
 ## Instalação (Arch Linux)
 
+Pelo AUR (atualiza junto com o sistema, sempre a partir deste repositório):
+
+```bash
+paru -S telinha-git     # ou yay -S telinha-git
+telinha-caelestia       # adiciona o card ao Caelestia (rode como seu usuário)
+```
+
+Rode `telinha-caelestia` de novo depois de atualizar o `caelestia-shell`.
+
+Ou a partir do código:
+
 ```bash
 git clone git@github.com:BrunoMano2004/telinha.git
 cd telinha

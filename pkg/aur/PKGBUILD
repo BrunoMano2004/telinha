@@ -1,0 +1,62 @@
+# Maintainer: BrunoMano2004 <https://github.com/BrunoMano2004>
+pkgname=telinha-git
+_pkgname=telinha
+pkgver=r0
+pkgrel=1
+pkgdesc="Compartilhamento de tela leve e de baixa latência pelo navegador (WebRTC + encoder de hardware), com card para o Caelestia"
+arch=('x86_64')
+url="https://github.com/BrunoMano2004/telinha"
+license=('MIT')
+depends=(
+    'glib2' 'gstreamer' 'gst-plugins-base' 'gst-plugins-base-libs'
+    'gst-plugins-good' 'gst-plugins-bad' 'gst-plugins-bad-libs'
+    'gst-plugin-pipewire' 'libnice' 'pipewire' 'pipewire-pulse'
+    'xdg-desktop-portal' 'cloudflared'
+)
+makedepends=('cargo' 'git')
+optdepends=(
+    'caelestia-shell: card "Screen share" no painel de utilidades (rode telinha-caelestia)'
+    'gst-plugin-va: encoder H.264 por hardware em GPUs Intel/AMD'
+    'gst-plugins-ugly: encoder x264 (fallback sem encoder de hardware)'
+    'tailscale: link privado dentro da tailnet (telinha sem --tunnel)'
+)
+provides=("$_pkgname")
+conflicts=("$_pkgname")
+install=telinha.install
+source=("$_pkgname::git+$url.git")
+sha256sums=('SKIP')
+
+pkgver() {
+    cd "$_pkgname"
+    printf "r%s.%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short=7 HEAD)"
+}
+
+prepare() {
+    cd "$_pkgname"
+    export RUSTUP_TOOLCHAIN=stable
+    cargo fetch --locked --target "$(rustc --print host-tuple)"
+}
+
+build() {
+    cd "$_pkgname"
+    export RUSTUP_TOOLCHAIN=stable
+    export CARGO_TARGET_DIR=target
+    cargo build --frozen --release
+}
+
+package() {
+    cd "$_pkgname"
+    install -Dm755 target/release/telinha "$pkgdir/usr/bin/telinha"
+
+    # Card do Caelestia: os arquivos ficam no sistema e o telinha-caelestia
+    # aplica numa cópia do shell em ~/.config (pacotes não mexem na home).
+    local share="$pkgdir/usr/share/telinha/caelestia"
+    install -Dm755 caelestia/install.sh "$share/install.sh"
+    install -Dm644 caelestia/services/Telinha.qml "$share/services/Telinha.qml"
+    install -Dm644 caelestia/modules/utilities/cards/Stream.qml "$share/modules/utilities/cards/Stream.qml"
+    install -dm755 "$pkgdir/usr/bin"
+    ln -s /usr/share/telinha/caelestia/install.sh "$pkgdir/usr/bin/telinha-caelestia"
+
+    install -Dm644 README.md "$pkgdir/usr/share/doc/telinha/README.md"
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

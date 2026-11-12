@@ -46,13 +46,15 @@ O pacote Windows requer **Windows 11 de 64 bits**. O instalador inclui GStreamer
 encoders e Cloudflared; o usuário não precisa instalar Rust, Visual Studio ou
 configurar o `PATH`. A instalação é por usuário, sem pedir administrador.
 
-**Prévia de teste:** a captura real de monitor, os drivers de GPU e a exclusão de
-chamadas ainda precisam de validação em uma máquina Windows 11.
-
-1. Baixe e abra o [instalador Windows](https://github.com/BrunoMano2004/telinha/releases/download/v0.1.0-windows-preview.1/Telinha-Setup-0.1.0-windows-x64.exe).
+1. Baixe e abra o [instalador Windows](https://github.com/BrunoMano2004/telinha/releases/latest/download/Telinha-Setup-windows-x64.exe)
+   (sempre a versão mais recente; todas ficam em [Releases](https://github.com/BrunoMano2004/telinha/releases)).
 2. Abra **Telinha** pelo menu Iniciar. Se quiser, fixe o aplicativo na barra de tarefas.
-3. Escolha o monitor e clique em **Iniciar**. O link é copiado automaticamente.
-4. Para parar, abra o ícone perto do relógio e clique em **Parar**.
+3. Escolha o monitor e clique em **Iniciar transmissão**. O link é copiado automaticamente.
+4. Para parar, clique em **Parar** (ou use o ícone perto do relógio).
+
+O app avisa quando sai uma versão nova e se atualiza com um clique (o instalador
+baixado é conferido pelo SHA-256 publicado na Release). Quem está na prévia 0.1.0
+precisa instalar a 0.2.0 manualmente uma vez, por cima da instalação atual.
 
 Fechar a janela a recolhe para o ícone perto do relógio; a transmissão continua.
 O menu desse ícone também tem Iniciar, Parar, Copiar link e Sair. A opção do
@@ -89,7 +91,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\windows\build.ps1
 ```
 
 O script baixa SDK/runtime do GStreamer e Cloudflared com versões e hashes fixos,
-monta as dependências privadas e gera `dist\Telinha-Setup-0.1.0-windows-x64.exe`.
+monta as dependências privadas e gera `dist\Telinha-Setup-<versão>-windows-x64.exe`.
+Para publicar uma versão, suba uma tag igual à versão do `Cargo.toml` (ex.: `v0.2.0`):
+o CI gera o instalador e cria a Release.
 O GStreamer 1.26.11 foi escolhido para evitar uma regressão de captura de áudio por
 processo da série 1.28.0–1.28.8. Para usar um SDK MSVC x64 já extraído, passe
 `-GStreamerRoot C:\caminho\msvc_x86_64`.

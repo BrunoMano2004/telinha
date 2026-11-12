@@ -75,6 +75,4 @@ jobs:
           esac
           flags=""
           case "$TAG" in *-*) flags="--prerelease" ;; esac
-          # Cópia com nome fixo: o link releases/latest/download/... do README nunca envelhece.
-          cp dist/Telinha-Setup-"$version"-windows-x64.exe dist/Telinha-Setup-windows-x64.exe
           gh release create "$TAG" dist/*.exe dist/*.sha256 --title "Telinha $version" --generate-notes $flags

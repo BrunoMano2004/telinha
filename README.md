@@ -46,8 +46,8 @@ O pacote Windows requer **Windows 11 de 64 bits**. O instalador inclui GStreamer
 encoders e Cloudflared; o usuário não precisa instalar Rust, Visual Studio ou
 configurar o `PATH`. A instalação é por usuário, sem pedir administrador.
 
-1. Baixe e abra o [instalador Windows](https://github.com/BrunoMano2004/telinha/releases/latest/download/Telinha-Setup-windows-x64.exe)
-   (sempre a versão mais recente; todas ficam em [Releases](https://github.com/BrunoMano2004/telinha/releases)).
+1. Em [Releases](https://github.com/BrunoMano2004/telinha/releases) (também no lado direito da
+   página do repositório), abra a versão mais recente e baixe o `Telinha-Setup-…-windows-x64.exe`.
 2. Abra **Telinha** pelo menu Iniciar. Se quiser, fixe o aplicativo na barra de tarefas.
 3. Escolha o monitor e clique em **Iniciar transmissão**. O link é copiado automaticamente.
 4. Para parar, clique em **Parar** (ou use o ícone perto do relógio).

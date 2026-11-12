@@ -4,6 +4,8 @@ on:
   push:
     # Tag v1.2.3 publica uma Release com o instalador (o app avisa quem tem
     # uma versão anterior). Filtros de caminho não valem para tags.
+    # Só com tags, pushes de branch deixariam de disparar: as duas listas são necessárias.
+    branches: ['**']
     tags: ['v*']
     paths:
       - 'src/**'

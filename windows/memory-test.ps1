@@ -11,7 +11,7 @@ $env:GST_PLUGIN_SYSTEM_PATH_1_0 = $env:GST_PLUGIN_PATH_1_0
 $env:GST_PLUGIN_SCANNER_1_0 = "$Package\gstreamer\libexec\gstreamer-1.0\gst-plugin-scanner.exe"
 $env:GST_REGISTRY_1_0 = Join-Path $env:TEMP "telinha-mem-$PID.bin"
 
-function Measure([Diagnostics.Process]$process, [string]$label) {
+function Show-Memory([Diagnostics.Process]$process, [string]$label) {
     $process.Refresh()
     '{0,-34} working set {1,5} MB · privada {2,5} MB · threads {3}' -f $label,
         [math]::Round($process.WorkingSet64 / 1MB), [math]::Round($process.PrivateMemorySize64 / 1MB), $process.Threads.Count
@@ -44,18 +44,18 @@ foreach ($scenario in $Scenarios) {
             } catch { Start-Sleep -Milliseconds 250 }
         }
         if (!$ready) { "  não iniciou (código $(if ($server.HasExited) { $server.ExitCode } else { '?' }))"; continue }
-        Measure $server 'iniciado'
+        Show-Memory $server 'iniciado'
         Start-Sleep 12
-        Measure $server 'ocioso (pipeline pausado)'
+        Show-Memory $server 'ocioso (pipeline pausado)'
         $socket.ConnectAsync([uri]'ws://127.0.0.1:18090/ws', [Threading.CancellationToken]::None).GetAwaiter().GetResult()
         $hello = [Text.Encoding]::UTF8.GetBytes('{"type":"hello","name":"Memoria","device":"CI","client":"mem"}')
         $socket.SendAsync((New-Object 'ArraySegment[byte]' -ArgumentList @(,$hello)), 'Text', $true, [Threading.CancellationToken]::None).GetAwaiter().GetResult()
-        Start-Sleep 5; Measure $server 'com espectador, 5 s'
-        Start-Sleep 10; Measure $server 'com espectador, 15 s'
-        Start-Sleep 15; Measure $server 'com espectador, 30 s'
+        Start-Sleep 5; Show-Memory $server 'com espectador, 5 s'
+        Start-Sleep 10; Show-Memory $server 'com espectador, 15 s'
+        Start-Sleep 15; Show-Memory $server 'com espectador, 30 s'
         $socket.Dispose(); $socket = $null
         Start-Sleep 14
-        Measure $server 'espectador saiu + pausa'
+        Show-Memory $server 'espectador saiu + pausa'
         $server.StandardInput.WriteLine('q')
         [void]$server.WaitForExit(8000)
     } finally {

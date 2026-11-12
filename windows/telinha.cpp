@@ -47,6 +47,13 @@ static ComPtr<ICoreWebView2> webview;
 static HBRUSH background;
 // Últimos eventos do telinha, reenviados se a interface recarregar.
 static std::wstring lastViewers = L"[]", lastBlocked = L"[]", lastApps = L"[]";
+// Log da transmissão atual, reenviado quando a interface é recriada.
+static std::vector<std::wstring> logLines;
+// A interface (WebView2) só existe com a janela aberta: fechada perto do
+// relógio, os processos do WebView2 terminam e a memória volta ao sistema.
+static bool webviewStarting = false;
+static void CreateWebView();
+static void ReleaseWebView();
 // Escolhas de som por app (nome em minúsculas -> entra?), salvas no .ini.
 static std::map<std::wstring, bool> appChoices;
 // Última qualidade escolhida (para o "Iniciar" pela bandeja).
@@ -184,6 +191,7 @@ static void PostInit() {
     Post(L"{\"type\":\"viewers\",\"data\":" + lastViewers + L"}");
     Post(L"{\"type\":\"blocked\",\"data\":" + lastBlocked + L"}");
     Post(L"{\"type\":\"apps\",\"data\":" + lastApps + L"}");
+    for (const auto& line : logLines) Post(L"{\"type\":\"log\",\"text\":" + JsonText(line) + L"}");
     std::lock_guard<std::mutex> lock(updateMutex);
     if (!available.version.empty())
         Post(L"{\"type\":\"update\",\"version\":" + JsonText(available.version) + L",\"page\":" + JsonText(available.page) + L"}");
@@ -211,6 +219,12 @@ static void CopyLink() {
 static void Show() {
     ShowWindow(window, IsIconic(window) ? SW_RESTORE : SW_SHOW);
     SetForegroundWindow(window);
+    if (!controller && !webviewStarting) CreateWebView();
+}
+// Fechar a janela só a esconde (o app continua perto do relógio) e libera a interface.
+static void Hide() {
+    ShowWindow(window, SW_HIDE);
+    ReleaseWebView();
 }
 // Comando para o telinha.exe (uma linha no stdin dele).
 static void Send(const std::wstring& command) {
@@ -294,6 +308,7 @@ static void Start(int monitor, int kbps, int fps, bool audio, bool isPublic) {
         return;
     }
     child = process.hProcess;
+    logLines.clear();
     PostState();
     Status(L"Telinha - preparando transmissão...");
     reader = std::thread([outputRead]() {
@@ -336,6 +351,8 @@ static void HandleLine(const std::wstring& line) {
     if (event(L"blocked", data)) { lastBlocked = data; Post(L"{\"type\":\"blocked\",\"data\":" + data + L"}"); return; }
     if (event(L"apps", data)) { lastApps = data; Post(L"{\"type\":\"apps\",\"data\":" + data + L"}"); return; }
     if (event(L"screen", data)) { Post(L"{\"type\":\"screen\",\"state\":" + JsonText(data) + L"}"); return; }
+    logLines.push_back(line);
+    if (logLines.size() > 300) logLines.erase(logLines.begin());
     Post(L"{\"type\":\"log\",\"text\":" + JsonText(line) + L"}");
     const std::wstring prefix = L"Assista em: ";
     if (child && line.compare(0, prefix.size(), prefix) == 0) {
@@ -601,7 +618,13 @@ static std::wstring LoadUi() {
     if (!data) return L"<p>Interface ausente. Reinstale o Telinha.</p>";
     return Utf8(std::string((const char*)LockResource(data), SizeofResource(NULL, resource)));
 }
+static void ReleaseWebView() {
+    if (controller) controller->Close();
+    controller = nullptr;
+    webview = nullptr;
+}
 static void WebViewFailed(HRESULT result) {
+    webviewStarting = false;
     wchar_t text[400];
     swprintf_s(text, L"A interface do Telinha precisa do Microsoft Edge WebView2 Runtime (erro 0x%08lX).\n\n"
         L"Abrir a página de download agora?", (unsigned long)result);
@@ -614,7 +637,11 @@ static bool LocalUri(ICoreWebView2* sender, LPWSTR uri) {
     return value == L"about:blank" || value.rfind(L"data:", 0) == 0;
 }
 static void CreateWebView() {
+    webviewStarting = true;
     std::wstring dataDir = KnownDir(L"LOCALAPPDATA") + L"\\WebView2";
+    // A interface é simples e não precisa de GPU: sem o processo de GPU do
+    // WebView2 (que numa máquina sem placa emula uma em software) sobra memória.
+    SetEnvironmentVariableW(L"WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", L"--disable-gpu --disable-gpu-compositing");
     HRESULT started = CreateCoreWebView2EnvironmentWithOptions(NULL, dataDir.c_str(), NULL,
         Callback<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler>(
             [](HRESULT result, ICoreWebView2Environment* environment) -> HRESULT {
@@ -623,6 +650,9 @@ static void CreateWebView() {
                     Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
                         [](HRESULT result, ICoreWebView2Controller* created) -> HRESULT {
                             if (FAILED(result) || !created) { WebViewFailed(result); return S_OK; }
+                            webviewStarting = false;
+                            // Fechada enquanto a interface carregava: libera na hora.
+                            if (!IsWindowVisible(window)) { created->Close(); return S_OK; }
                             controller = created;
                             controller->get_CoreWebView2(&webview);
                             ApplyTheme();
@@ -765,7 +795,7 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp
         if (lp && wcscmp((const wchar_t*)lp, L"ImmersiveColorSet") == 0) ApplyTheme();
         return 0;
     case WM_CLOSE:
-        if (!quitting) { ShowWindow(hwnd, SW_HIDE); return 0; }
+        if (!quitting) { Hide(); return 0; }
         break;
     case WM_QUERYENDSESSION: Stop(); return TRUE;
     case WM_DESTROY:
@@ -815,7 +845,6 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command, int) {
     // Tamanho inicial em pixels lógicos, convertido para a escala do monitor.
     SetWindowPos(window, NULL, 0, 0, Scale(1000, window), Scale(760, window), SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
     ApplyTheme();
-    CreateWebView();
 
     tray.cbSize = sizeof(tray); tray.hWnd = window; tray.uID = 1;
     tray.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP; tray.uCallbackMessage = WM_TRAY;

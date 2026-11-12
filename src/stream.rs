@@ -333,7 +333,10 @@ impl Streamer {
                         let _ = pipeline.remove(&bin);
                     }
                 });
-                teardown.lock().unwrap().push(worker);
+                let mut workers = teardown.lock().unwrap();
+                // Threads já terminadas não precisam esperar o fim do programa.
+                workers.retain(|w| !w.is_finished());
+                workers.push(worker);
                 gst::PadProbeReturn::Remove
             });
         }

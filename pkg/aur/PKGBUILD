@@ -1,7 +1,7 @@
 # Maintainer: BrunoMano2004 <https://github.com/BrunoMano2004>
 pkgname=telinha-git
 _pkgname=telinha
-pkgver=r0
+pkgver=r3.25653d0
 pkgrel=1
 pkgdesc="Compartilhamento de tela leve e de baixa latência pelo navegador (WebRTC + encoder de hardware), com card para o Caelestia"
 arch=('x86_64')

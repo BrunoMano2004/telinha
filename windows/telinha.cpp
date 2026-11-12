@@ -59,6 +59,7 @@ static std::mutex updateMutex;
 static Release available;
 static bool downloading = false;
 static std::wstring installerPath;
+static void DownloadUpdate(); // definida na seção de atualização, mais abaixo
 
 // --- Texto
 static std::wstring Utf8(const std::string& text) {

@@ -48,6 +48,21 @@ def main():
             if header == b"\r\n":
                 break
 
+        def send_text(text):
+            # Quadros do cliente precisam de mascara (RFC 6455).
+            payload = text.encode()
+            mask = os.urandom(4)
+            size = len(payload)
+            if size < 126:
+                header = bytes([0x81, 0x80 | size])
+            else:
+                header = bytes([0x81, 0x80 | 126]) + struct.pack("!H", size)
+            masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+            connection.sendall(header + mask + masked)
+
+        # A pagina se apresenta (nome, aparelho, id do navegador) antes do video.
+        send_text(json.dumps({"type": "hello", "name": "Teste", "device": "CI", "client": "test-server"}))
+
         def exact(size):
             data = stream.read(size)
             assert len(data) == size, "websocket encerrado antes da oferta"

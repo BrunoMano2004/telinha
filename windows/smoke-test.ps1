@@ -40,6 +40,10 @@ try {
         # Um espectador conectado exercita WebRTC e garante que Parar funciona
         # mesmo enquanto o websocket continua aberto.
         $socket.ConnectAsync([uri]'ws://127.0.0.1:18080/ws', $cancel.Token).GetAwaiter().GetResult()
+        # A pagina se apresenta (nome, aparelho, id do navegador) antes de receber video.
+        $hello = [Text.Encoding]::UTF8.GetBytes('{"type":"hello","name":"Smoke test","device":"CI","client":"smoke-test"}')
+        $helloSegment = New-Object 'ArraySegment[byte]' -ArgumentList @(,$hello)
+        $socket.SendAsync($helloSegment, [Net.WebSockets.WebSocketMessageType]::Text, $true, $cancel.Token).GetAwaiter().GetResult()
         $buffer = New-Object byte[] 65536
         $segment = New-Object 'ArraySegment[byte]' -ArgumentList @(,$buffer)
         $sdp = ''

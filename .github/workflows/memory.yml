@@ -1,0 +1,31 @@
+name: Memória (Windows)
+# Mede a memória do telinha.exe num executor sem GPU (como uma VM).
+on:
+  workflow_dispatch:
+  push:
+    branches: ['perf/**']
+permissions:
+  contents: read
+jobs:
+  memory:
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Instalar Rust estavel
+        shell: pwsh
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+          rustup target add x86_64-pc-windows-msvc
+      - name: Compilar pacote
+        shell: pwsh
+        run: |
+          if (!(Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) {
+            choco install innosetup --yes --no-progress
+            if ($LASTEXITCODE -ne 0) { throw 'Falha ao instalar Inno Setup' }
+          }
+          ./windows/build.ps1
+      - name: Medir memória
+        shell: pwsh
+        run: ./windows/memory-test.ps1 -Package target/windows-package

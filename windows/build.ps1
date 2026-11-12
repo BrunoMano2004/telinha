@@ -58,6 +58,7 @@ try {
     Copy-Item 'target\x86_64-pc-windows-msvc\release\telinha.exe' "$payload\telinha.exe" -Force
     Run-Checked "$PSScriptRoot\build-ui.cmd" @("$payload\Telinha Desktop.exe")
     Remove-Item "$payload\Telinha Desktop.exe.obj" -Force -ErrorAction SilentlyContinue
+    Remove-Item "$payload\Telinha Desktop.exe.res" -Force -ErrorAction SilentlyContinue
     # Copie apenas runtime, plugins, scanner e licencas, sem SDK ou compiladores.
     foreach ($directory in @('bin', 'lib\gstreamer-1.0', 'libexec\gstreamer-1.0')) {
         $source = Join-Path $GStreamerRoot $directory

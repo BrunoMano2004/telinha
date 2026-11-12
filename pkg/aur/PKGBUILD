@@ -54,6 +54,8 @@ package() {
     install -Dm755 caelestia/install.sh "$share/install.sh"
     install -Dm644 caelestia/services/Telinha.qml "$share/services/Telinha.qml"
     install -Dm644 caelestia/modules/utilities/cards/Stream.qml "$share/modules/utilities/cards/Stream.qml"
+    install -Dm644 caelestia/modules/nexus/TelinhaWindow.qml "$share/modules/nexus/TelinhaWindow.qml"
+    install -Dm644 caelestia/modules/nexus/pages/TelinhaPage.qml "$share/modules/nexus/pages/TelinhaPage.qml"
     install -dm755 "$pkgdir/usr/bin"
     ln -s /usr/share/telinha/caelestia/install.sh "$pkgdir/usr/bin/telinha-caelestia"
 

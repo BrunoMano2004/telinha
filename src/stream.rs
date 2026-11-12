@@ -11,7 +11,7 @@ use gstreamer_webrtc as gst_webrtc;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -27,6 +27,9 @@ pub enum Signal {
     },
     /// Diagnóstico enviado pela página; só é impresso.
     Log { text: String },
+    /// Outras mensagens da página (ex.: um "hello" repetido) são ignoradas.
+    #[serde(other)]
+    Other,
 }
 
 struct Viewer {
@@ -55,10 +58,12 @@ pub struct Streamer {
     stun: Option<String>,
     state: Mutex<State>,
     teardown: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
+    /// Limite de quadros por segundo antes do encoder, ajustável ao vivo.
+    max_fps: Arc<AtomicU32>,
 }
 
 impl Streamer {
-    pub fn new(description: &str, stun: Option<String>) -> Result<Self> {
+    pub fn new(description: &str, stun: Option<String>, fps: u32) -> Result<Self> {
         let pipeline = gst::parse::launch(description)
             .context("falha ao montar o pipeline")?
             .downcast::<gst::Pipeline>()
@@ -80,6 +85,28 @@ impl Streamer {
             });
         }
 
+        // Limite de fps por timestamp: a captura roda no máximo dela e aqui só
+        // descartamos quadros. Mudar o limite não renegocia formato nenhum
+        // (renegociar com o PipeWire já travou a captura antes).
+        let max_fps = Arc::new(AtomicU32::new(fps.max(1)));
+        let limit = max_fps.clone();
+        let last = Mutex::new(None::<gst::ClockTime>);
+        valves[0].static_pad("sink").unwrap().add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+            let Some(pts) = info.buffer().and_then(|b| b.pts()) else { return gst::PadProbeReturn::Ok };
+            // 10% de folga para o jitter de quem entrega a ~60 Hz.
+            let min_gap = gst::ClockTime::SECOND.nseconds() * 9 / 10 / u64::from(limit.load(Ordering::Relaxed).max(1));
+            let mut last = last.lock().unwrap();
+            // Timestamp voltando = captura reiniciada ou trocada: recomeça a conta.
+            if let Some(prev) = *last
+                && pts > prev
+                && (pts - prev).nseconds() < min_gap
+            {
+                return gst::PadProbeReturn::Drop;
+            }
+            *last = Some(pts);
+            gst::PadProbeReturn::Ok
+        });
+
         Ok(Self {
             tees,
             valves,
@@ -87,8 +114,37 @@ impl Streamer {
             stun,
             state: Mutex::new(State::default()),
             teardown: Arc::new(Mutex::new(Vec::new())),
+            max_fps,
             pipeline,
         })
+    }
+
+    pub fn max_fps(&self) -> u32 {
+        self.max_fps.load(Ordering::Relaxed)
+    }
+
+    /// Qualidade ao vivo: bitrate no encoder e limite de fps antes dele.
+    pub fn set_quality(&self, kbps: u32, fps: u32) {
+        self.max_fps.store(fps.max(1), Ordering::Relaxed);
+        crate::capture::set_bitrate(&self.encoder, kbps, fps.max(1));
+    }
+
+    /// Troca o que está sendo capturado (outra tela/janela/monitor) sem
+    /// derrubar quem assiste: só o elemento `screen` reinicia, com as novas
+    /// propriedades aplicadas por `apply`.
+    pub fn replace_screen(&self, apply: impl FnOnce(&gst::Element)) -> Result<()> {
+        let screen = self.pipeline.by_name("screen").context("esta captura não pode ser trocada (modo de teste?)")?;
+        let state = self.state.lock().unwrap();
+        if state.running {
+            screen.set_state(gst::State::Null).context("falha ao parar a captura")?;
+            apply(&screen);
+            screen.sync_state_with_parent().context("falha ao religar a captura")?;
+        } else {
+            apply(&screen);
+        }
+        drop(state);
+        self.request_keyframe();
+        Ok(())
     }
 
     pub fn viewer_count(&self) -> usize {
@@ -236,6 +292,7 @@ impl Streamer {
                 }
             }
             Signal::Log { text } => println!("  #{id} {text}"),
+            Signal::Other => {}
             Signal::Offer { .. } => bail!("o servidor é quem envia a oferta"),
         }
         Ok(())
@@ -287,5 +344,73 @@ impl Streamer {
     pub fn request_keyframe(&self) {
         let event = gst_video::UpstreamForceKeyUnitEvent::builder().all_headers(true).build();
         self.encoder.static_pad("src").unwrap().send_event(event);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Fonte a 60 fps e limite em 30: passam ~30 quadros por segundo, e
+    /// subir o limite ao vivo volta a deixar passar tudo.
+    #[test]
+    fn fps_limit_drops_frames_live() {
+        gst::init().unwrap();
+        let streamer = Streamer::new(
+            "videotestsrc is-live=true ! video/x-raw,width=64,height=48,framerate=60/1 \
+             ! valve name=valve drop=false ! identity name=enc ! tee name=tee ! fakesink name=out sync=false",
+            None,
+            30,
+        )
+        .unwrap();
+        let count = Arc::new(AtomicUsize::new(0));
+        let c = count.clone();
+        streamer.pipeline.by_name("out").unwrap().static_pad("sink").unwrap().add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+            c.fetch_add(1, Ordering::Relaxed);
+            gst::PadProbeReturn::Ok
+        });
+        let measure = || {
+            count.store(0, Ordering::Relaxed);
+            std::thread::sleep(std::time::Duration::from_millis(1000));
+            count.load(Ordering::Relaxed)
+        };
+        streamer.pipeline.set_state(gst::State::Playing).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let at30 = measure();
+        streamer.set_quality(1000, 60);
+        let at60 = measure();
+        streamer.pipeline.set_state(gst::State::Null).unwrap();
+        assert!((26..=34).contains(&at30), "limite 30 fps deixou passar {at30}");
+        assert!((54..=66).contains(&at60), "limite 60 fps deixou passar {at60}");
+    }
+
+    /// Trocar a captura com o pipeline rodando: o elemento `screen` reinicia
+    /// com as novas propriedades e os quadros continuam chegando.
+    #[test]
+    fn replace_screen_keeps_frames_flowing() {
+        gst::init().unwrap();
+        let streamer = Streamer::new(
+            "videotestsrc name=screen is-live=true pattern=snow ! video/x-raw,width=64,height=48,framerate=30/1 \
+             ! valve name=valve drop=false ! identity name=enc ! tee name=tee ! fakesink name=out sync=false",
+            None,
+            60,
+        )
+        .unwrap();
+        let count = Arc::new(AtomicUsize::new(0));
+        let c = count.clone();
+        streamer.pipeline.by_name("out").unwrap().static_pad("sink").unwrap().add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+            c.fetch_add(1, Ordering::Relaxed);
+            gst::PadProbeReturn::Ok
+        });
+        streamer.start().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        streamer.replace_screen(|s| s.set_property_from_str("pattern", "ball")).unwrap();
+        count.store(0, Ordering::Relaxed);
+        std::thread::sleep(std::time::Duration::from_millis(1000));
+        let after = count.load(Ordering::Relaxed);
+        let pattern = streamer.pipeline.by_name("screen").unwrap().property_value("pattern");
+        streamer.pipeline.set_state(gst::State::Null).unwrap();
+        assert!(after >= 20, "depois da troca passaram só {after} quadros");
+        assert_eq!(format!("{pattern:?}").contains("ball") || format!("{pattern:?}").contains("Ball"), true);
     }
 }

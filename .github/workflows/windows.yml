@@ -5,6 +5,7 @@ on:
     paths:
       - 'src/**'
       - 'web/**'
+      - 'assets/**'
       - 'windows/**'
       - 'Cargo.*'
       - '.github/workflows/windows.yml'
@@ -12,6 +13,7 @@ on:
     paths:
       - 'src/**'
       - 'web/**'
+      - 'assets/**'
       - 'windows/**'
       - 'Cargo.*'
       - '.github/workflows/windows.yml'

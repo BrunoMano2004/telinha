@@ -73,6 +73,13 @@ fn probe_windows_encoder(name: &str) -> Result<()> {
     result
 }
 
+/// A captura roda no máximo do que a qualidade permite (≥ 60 fps); o limite
+/// escolhido é aplicado depois, por `Streamer::set_quality`, e pode subir ou
+/// descer ao vivo sem reabrir a captura.
+fn capture_fps(s: &Settings) -> u32 {
+    s.fps.max(60)
+}
+
 /// Parte comum: encoder → RTP → tee (cada espectador pendura um ramo no tee).
 fn tail(encoder: &str, s: &Settings) -> String {
     format!(
@@ -101,7 +108,7 @@ pub fn test_description(encoder: &str, s: &Settings) -> String {
         "videotestsrc is-live=true pattern=ball \
          ! video/x-raw,format=BGRx,width=1920,height=1080,framerate={fps}/1 \
          ! {GATE} ! {convert} ! {tail}",
-        fps = s.fps,
+        fps = capture_fps(s),
         tail = tail(encoder, s),
     )
 }
@@ -115,11 +122,11 @@ pub fn pipeline_description(fd: i32, node: u32, encoder: &str, s: &Settings) -> 
     // O pipewiresrc duplica o fd a cada partida, então o original serve para
     // religar a captura depois de uma pausa por ociosidade.
     format!(
-        "pipewiresrc fd={fd} path={node} do-timestamp=true always-copy=true keepalive-time=1000 \
+        "pipewiresrc name=screen fd={fd} path={node} do-timestamp=true always-copy=true keepalive-time=1000 \
          ! video/x-raw,max-framerate={fps}/1 \
          ! videorate drop-only=true max-rate={fps} \
          ! {GATE} ! videoconvert ! {tail}",
-        fps = s.fps,
+        fps = capture_fps(s),
         tail = tail(encoder, s),
     )
 }
@@ -130,10 +137,10 @@ pub fn pipeline_description(encoder: &str, s: &Settings) -> String {
     let monitor = s.monitor_handle.map(|handle| format!("monitor-handle={handle}"))
         .unwrap_or_else(|| format!("monitor-index={}", s.monitor));
     format!(
-        "d3d11screencapturesrc {monitor} show-cursor=true \
+        "d3d11screencapturesrc name=screen {monitor} show-cursor=true \
          ! video/x-raw(memory:D3D11Memory),framerate={fps}/1 \
          ! {GATE} ! {convert} ! {tail}",
-        fps = s.fps,
+        fps = capture_fps(s),
         tail = tail(encoder, s),
     )
 }
@@ -306,5 +313,15 @@ pub mod portal {
             _proxy: proxy,
             _session: session,
         })
+    }
+
+    impl Drop for Capture {
+        // Ao trocar de tela a captura antiga sai de cena; o pipewiresrc já
+        // duplicou o fd que usou, então o original pode ser fechado.
+        fn drop(&mut self) {
+            unsafe {
+                libc::close(self.fd);
+            }
+        }
     }
 }

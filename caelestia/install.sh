@@ -23,17 +23,29 @@ tmp=$(mktemp -d "${user}.XXXX")
 cp -a "$system/." "$tmp/"
 cp "$here/services/Telinha.qml" "$tmp/services/"
 cp "$here/modules/utilities/cards/Stream.qml" "$tmp/modules/utilities/cards/"
+cp "$here/modules/nexus/TelinhaWindow.qml" "$tmp/modules/nexus/"
+cp "$here/modules/nexus/pages/TelinhaPage.qml" "$tmp/modules/nexus/pages/"
 
-python3 - "$tmp/modules/utilities/Content.qml" <<'EOF'
+python3 - "$tmp" <<'EOF'
 import sys
-path = sys.argv[1]
-s = open(path).read()
+root = sys.argv[1]
+path = s = None
+
+def patch(rel):
+    global path, s
+    if path:
+        open(path, "w").write(s)
+    path = f"{root}/{rel}"
+    s = open(path).read()
 
 def replace(old, new):
     global s
     if old not in s:
-        sys.exit(f"Content.qml mudou e o patch não se aplica mais: {old[:60]!r}")
+        sys.exit(f"{path.split('/caelestia')[-1]} mudou e o patch não se aplica mais: {old[:60]!r}")
     s = s.replace(old, new, 1)
+
+# Card "Screen share" no painel de utilidades.
+patch("modules/utilities/Content.qml")
 
 replace("(idleInhibit.active ? 1 : 0) + ", "(idleInhibit.active ? 1 : 0) + 1 + ")
 replace("((idleInhibit.item as IdleInhibit)?.nonAnimHeight ?? 0) + ",
@@ -44,11 +56,42 @@ replace("""        Loader {
             id: stream
 
             Layout.fillWidth: true
+            screenState: root.screenState
         }
 
         Loader {
             id: record
 """)
+
+# Página "Screen share" no Nexus (configurações), antes de "About". As duas
+# listas são paralelas: a posição da entrada é a posição do componente.
+patch("modules/nexus/PageRegistry.qml")
+replace("""        // About
+        {""", """        // Telinha (compartilhamento de tela)
+        {
+            label: Tr.tr("Screen share"),
+            icon: "cast",
+            description: Tr.tr("Viewers, quality, shared audio"),
+            category: "telinha",
+            telinha: true
+        },
+
+        // About
+        {""")
+
+patch("modules/nexus/PageCompRegistry.qml")
+replace("""        // About
+        Component {""", """        // Telinha (compartilhamento de tela)
+        Component {
+            StackPage {
+                Component {
+                    TelinhaPage {}
+                }
+            }
+        },
+
+        // About
+        Component {""")
 open(path, "w").write(s)
 EOF
 

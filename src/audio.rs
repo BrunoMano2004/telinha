@@ -18,15 +18,10 @@ use std::collections::{HashMap, HashSet};
 use std::io::{BufReader, Write};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::mpsc;
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
-/// Apps de chamada de voz (comparado sem maiúsculas, por trecho do nome).
-/// "webrtc" pega o "WEBRTC VoiceEngine", nome do fluxo de voz do Discord.
-const VOICE_APPS: &[&str] = &[
-    "discord", "vesktop", "webcord", "legcord", "armcord", "equibop", "webrtc", "teamspeak", "ts3client",
-    "mumble", "zoom", "slack", "teams", "skype", "telegram", "signal", "whatsapp", "element", "jitsi",
-];
+use crate::audio_rules;
 
 /// Saída virtual + roteador. Ao ser descartado, os dois processos auxiliares
 /// terminam e o PipeWire remove a saída virtual (e as ligações dela).
@@ -70,7 +65,8 @@ fn child(program: &str) -> Command {
     cmd
 }
 
-pub fn start(extra_exclude: &[String]) -> Result<AudioRoute> {
+/// Quais apps entram vem de `audio_rules` (chamadas de fora por padrão).
+pub fn start() -> Result<AudioRoute> {
     let sink_name = format!("telinha-{}", std::process::id());
 
     // O pw-cli fica vivo segurando a saída virtual: sem object.linger, o
@@ -98,22 +94,22 @@ pub fn start(extra_exclude: &[String]) -> Result<AudioRoute> {
         .context("não foi possível rodar o pw-dump (pacote pipewire)")?;
     let out = monitor.stdout.take().unwrap();
 
-    let mut exclude: Vec<String> = VOICE_APPS.iter().map(|s| s.to_string()).collect();
-    exclude.extend(extra_exclude.iter().map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty()));
-
     let (ready_tx, ready_rx) = mpsc::channel();
-    let mut router = Router {
+    let router = Arc::new(Mutex::new(Router {
         sink_name: sink_name.clone(),
         pid: std::process::id().to_string(),
-        exclude,
         objects: HashMap::new(),
         pending: HashSet::new(),
         announced: HashSet::new(),
         ready: Some(ready_tx),
-    };
+    }));
+    // Um app ligado/desligado nas configurações vale na hora.
+    let resync = router.clone();
+    audio_rules::on_change(move || resync.lock().unwrap().sync());
     std::thread::spawn(move || {
         let batches = serde_json::Deserializer::from_reader(BufReader::new(out)).into_iter::<Vec<Value>>();
         for batch in batches.map_while(Result::ok) {
+            let mut router = router.lock().unwrap();
             router.apply(batch);
             router.sync();
         }
@@ -130,7 +126,6 @@ pub fn start(extra_exclude: &[String]) -> Result<AudioRoute> {
 struct Router {
     sink_name: String,
     pid: String,
-    exclude: Vec<String>,
     /// Nós, portas e ligações do PipeWire, por id.
     objects: HashMap<u32, Value>,
     /// Ligações pedidas ao pw-link que ainda não apareceram (evita repetir).
@@ -182,9 +177,9 @@ impl Router {
         self.objects.iter().filter(move |(_, o)| o["type"].as_str().is_some_and(|t| t.ends_with(suffix))).map(|(&id, o)| (id, o))
     }
 
-    /// Fluxo de reprodução de um app que pode ir para a transmissão?
-    /// `None` = nem é fluxo de app; `Some(false)` = app excluído.
-    fn allowed(&self, node: &Value) -> Option<bool> {
+    /// Fluxo de reprodução de um app: (entra?, é chamada?).
+    /// `None` = nem é fluxo de app (microfone, monitor, loopback...).
+    fn allowed(&self, node: &Value) -> Option<(bool, bool)> {
         if prop(node, "media.class") != "Stream/Output/Audio" {
             return None;
         }
@@ -194,16 +189,13 @@ impl Router {
             return None;
         }
         let role = prop(node, "media.role").to_lowercase();
-        if role == "communication" || role == "phone" {
-            return Some(false);
-        }
         let names = ["application.name", "application.process.binary", "application.id"]
             .iter()
-            .map(|k| prop(node, k).to_lowercase())
+            .map(|k| prop(node, k))
             .chain([node_name])
             .collect::<Vec<_>>();
-        let excluded = names.iter().any(|n| !n.is_empty() && self.exclude.iter().any(|e| n.contains(e.as_str())));
-        Some(!excluded)
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        Some(audio_rules::verdict(&names, role == "communication" || role == "phone"))
     }
 
     fn sync(&mut self) {
@@ -237,12 +229,12 @@ impl Router {
         let mut desired = HashSet::new();
         let mut verdicts = Vec::new();
         for (id, node) in self.of_type(":Node") {
-            let Some(ok) = self.allowed(node) else { continue };
+            let Some((ok, voice)) = self.allowed(node) else { continue };
             let name = [prop(node, "application.name"), prop(node, "node.name")]
                 .into_iter()
                 .find(|n| !n.is_empty())
                 .unwrap_or_else(|| format!("fluxo {id}"));
-            verdicts.push((id, ok, name));
+            verdicts.push((ok, voice, name));
             if !ok {
                 continue;
             }
@@ -275,15 +267,16 @@ impl Router {
             }
         }
 
-        for (_, ok, name) in verdicts {
-            if self.announced.insert((name.clone(), ok)) {
-                if ok {
-                    println!("som: + {name}");
-                } else {
-                    println!("som: ignorando {name} (chamada de voz)");
+        for (ok, voice, name) in &verdicts {
+            if self.announced.insert((name.clone(), *ok)) {
+                match (ok, voice) {
+                    (true, _) => println!("som: + {name}"),
+                    (false, true) => println!("som: - {name} (chamada de voz)"),
+                    (false, false) => println!("som: - {name} (desligado)"),
                 }
             }
         }
+        audio_rules::report(verdicts.into_iter().map(|(ok, voice, name)| (name, ok, voice)));
         for link in unwanted {
             let _ = Command::new("pw-link").args(["-d", &link.to_string()]).stderr(Stdio::null()).status();
         }
@@ -297,5 +290,48 @@ impl Router {
                     .status();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Links do app de teste para a saída virtual, segundo o pw-link.
+    fn linked(sink: &str) -> bool {
+        let out = Command::new("pw-link").arg("-l").output().unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        let mut current = "";
+        text.lines().any(|line| {
+            if !line.starts_with(' ') {
+                current = line;
+                false
+            } else {
+                current.starts_with("telinha-test-app:") && line.contains(sink)
+            }
+        })
+    }
+
+    /// Precisa do PipeWire da máquina: `cargo test -- --ignored live_app_toggle`.
+    #[test]
+    #[ignore]
+    fn live_app_toggle() {
+        crate::audio_rules::init(&[], &[]);
+        let route = start().unwrap();
+        let mut app = Command::new("gst-launch-1.0")
+            .args(["-q", "audiotestsrc", "volume=0.05", "!", "pulsesink",
+                   "stream-properties=props,application.name=TelinhaTestApp,node.name=telinha-test-app"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let wait = |want: bool| (0..30).any(|_| { std::thread::sleep(Duration::from_millis(100)); linked(&route.sink_name) == want });
+        let on = wait(true);
+        crate::audio_rules::set("TelinhaTestApp", false);
+        let off = wait(false);
+        crate::audio_rules::set("TelinhaTestApp", true);
+        let back = wait(true);
+        let _ = app.kill();
+        assert!(on && off && back, "entrou: {on}, saiu ao desligar: {off}, voltou: {back}");
     }
 }

@@ -1,6 +1,18 @@
 //! Loopback somente das árvores de apps permitidos. Nunca abre um endpoint de
 //! captura/microfone e nunca cai para loopback global se a seleção falhar.
 use crate::audio_policy::{self, Process};
+use crate::audio_rules;
+
+/// Nome mostrado nas interfaces: "firefox.exe" → "firefox".
+fn display_name(process: &str) -> &str {
+    let lower = process.to_ascii_lowercase();
+    if lower.ends_with(".exe") { &process[..process.len() - 4] } else { process }
+}
+
+/// (entra?, é chamada?) para um processo, pelo nome com e sem ".exe".
+fn verdict(process: &str) -> (bool, bool) {
+    audio_rules::verdict(&[process, display_name(process)], false)
+}
 use anyhow::{Context, Result, bail};
 use gstreamer as gst;
 use gstreamer::prelude::*;
@@ -63,7 +75,9 @@ struct Branch {
     name: String,
 }
 
-pub fn start(pipeline: &gst::Pipeline, extra_exclude: &[String]) -> Result<AudioRoute> {
+/// Quais apps entram vem de `audio_rules` (chamadas de fora por padrão) e é
+/// reavaliado a cada volta do laço, então mudanças ao vivo valem em < 1 s.
+pub fn start(pipeline: &gst::Pipeline) -> Result<AudioRoute> {
     let factory = gst::ElementFactory::make("wasapi2src").build()?;
     if factory.find_property("loopback-target-pid").is_none() {
         bail!("o áudio por aplicativo requer GStreamer 1.22 ou superior e Windows 11");
@@ -78,16 +92,6 @@ pub fn start(pipeline: &gst::Pipeline, extra_exclude: &[String]) -> Result<Audio
     pipeline.add(&silence)?;
     silence.link(&mixer)?;
     let pipeline = pipeline.clone();
-    let mut exclude: Vec<String> = audio_policy::VOICE_APPS
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-    exclude.extend(
-        extra_exclude
-            .iter()
-            .map(|s| s.trim().to_lowercase())
-            .filter(|s| !s.is_empty()),
-    );
     let (stop, rx) = mpsc::channel();
     let (ready, ready_rx) = mpsc::channel();
     let worker = std::thread::spawn(move || {
@@ -112,12 +116,20 @@ pub fn start(pipeline: &gst::Pipeline, extra_exclude: &[String]) -> Result<Audio
                         let snapshot = processes().and_then(|processes| {
                             let sessions = unsafe { playback_sessions(&enumerator) }?;
                             Ok((
-                                audio_policy::select(
-                                    &sessions,
-                                    &processes,
-                                    &exclude,
-                                    std::process::id(),
-                                ),
+                                {
+                                    // Apps tocando som agora, para as interfaces.
+                                    audio_rules::report(sessions.iter().filter_map(|pid| {
+                                        let name = &processes.get(pid)?.name;
+                                        let (on, voice) = verdict(name);
+                                        Some((display_name(name).to_string(), on, voice))
+                                    }));
+                                    audio_policy::select(
+                                        &sessions,
+                                        &processes,
+                                        |name| !verdict(name).0,
+                                        std::process::id(),
+                                    )
+                                },
                                 processes,
                             ))
                         });

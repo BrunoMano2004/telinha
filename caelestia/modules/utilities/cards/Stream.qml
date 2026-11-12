@@ -5,9 +5,13 @@ import Caelestia.I18n
 import qs.components
 import qs.components.controls
 import qs.services
+import qs.modules.nexus
 
 StyledRect {
     id: root
+
+    // Para fechar o painel ao abrir as configurações.
+    property ScreenState screenState
 
     readonly property bool live: Telinha.url !== ""
     readonly property real nonAnimHeight: btnLayout.implicitHeight + (live ? linkRow.implicitHeight + layout.spacing : 0) + Tokens.padding.large * 2
@@ -70,9 +74,14 @@ StyledRect {
                             return Tr.tr("Choose a screen...");
                         if (!root.live)
                             return Tr.tr("Ready");
-                        if (Telinha.viewers === 0)
+                        const n = Telinha.viewers.length;
+                        if (Telinha.switchingScreen)
+                            return Tr.tr("Live · choosing a new screen...");
+                        if (n === 0)
                             return Tr.tr("Live · waiting for viewers");
-                        return Telinha.viewers === 1 ? Tr.tr("Live · 1 viewer") : Tr.tr("Live · %1 viewers").arg(Telinha.viewers);
+                        if (n === 1)
+                            return Tr.tr("Live · %1 watching").arg(Telinha.viewers[0].name);
+                        return Tr.tr("Live · %1 viewers").arg(n);
                     }
                     color: Colours.palette.m3onSurfaceVariant
                     font: Tokens.font.body.small
@@ -82,15 +91,13 @@ StyledRect {
             }
 
             IconButton {
-                // Som do sistema junto com a tela; só muda com a transmissão parada.
-                icon: Telinha.audio ? "volume_up" : "volume_off"
-                isToggle: true
-                checked: Telinha.audio
-                disabled: Telinha.running
-                type: IconButton.Tonal
+                // Espectadores, qualidade, som e troca de tela ficam no Nexus.
+                icon: "settings"
+                type: IconButton.Text
                 onClicked: {
-                    Telinha.setAudio(!Telinha.audio);
-                    internalChecked = Telinha.audio;
+                    if (root.screenState)
+                        root.screenState.utilities = false;
+                    TelinhaWindow.open();
                 }
             }
 

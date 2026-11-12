@@ -1,28 +1,7 @@
 //! Política de captura por árvore de processos, sem dependência de Windows.
+//! Quais nomes ficam de fora vem de `audio_rules` (passado como `blocked_name`).
 use std::collections::{HashMap, HashSet};
 
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-pub const VOICE_APPS: &[&str] = &[
-    "discord",
-    "vesktop",
-    "webcord",
-    "legcord",
-    "armcord",
-    "equibop",
-    "webrtc",
-    "teamspeak",
-    "ts3client",
-    "mumble",
-    "zoom",
-    "slack",
-    "teams",
-    "skype",
-    "telegram",
-    "signal",
-    "whatsapp",
-    "element",
-    "jitsi",
-];
 
 #[derive(Clone)]
 pub struct Process {
@@ -43,15 +22,12 @@ fn ancestors(pid: u32, processes: &HashMap<u32, Process>) -> HashSet<u32> {
 pub fn select(
     sessions: &HashSet<u32>,
     processes: &HashMap<u32, Process>,
-    exclude: &[String],
+    blocked_name: impl Fn(&str) -> bool,
     own_pid: u32,
 ) -> HashSet<u32> {
     let blocked: HashSet<_> = processes
         .iter()
-        .filter_map(|(&pid, p)| {
-            let name = p.name.to_lowercase();
-            (pid == own_pid || exclude.iter().any(|s| name.contains(s))).then_some(pid)
-        })
+        .filter_map(|(&pid, p)| (pid == own_pid || blocked_name(&p.name)).then_some(pid))
         .collect();
     let trees: HashMap<_, _> = processes
         .keys()
@@ -115,7 +91,7 @@ mod tests {
             select(
                 &sessions,
                 &processes,
-                &["discord".into(), "spotify".into()],
+                |name| ["discord", "spotify"].iter().any(|s| name.to_lowercase().contains(s)),
                 7
             ),
             HashSet::from([4])
@@ -148,7 +124,7 @@ mod tests {
             ),
         ]);
         assert_eq!(
-            select(&HashSet::from([1, 2, 3]), &processes, &[], 42),
+            select(&HashSet::from([1, 2, 3]), &processes, |_| false, 42),
             HashSet::from([3])
         );
     }

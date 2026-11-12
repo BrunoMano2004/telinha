@@ -101,7 +101,20 @@ de distribuir, teste em Windows 11 conforme [windows/TESTING.md](windows/TESTING
 ## Uso
 
 Clique em **Start** no card *Screen share* do Caelestia. O link é copiado
-automaticamente. Pelo terminal, o equivalente é:
+automaticamente. A engrenagem no canto do card abre a página **Screen share** nas
+configurações do Caelestia (Nexus), com tudo o que dá para mudar, quase tudo ao vivo:
+
+- **Espectadores**: nome e aparelho de quem assiste, com **expulsar** (pode voltar
+  pelo link) e **bloquear** (aquele navegador e IP não entram mais). O navegador não
+  revela o nome do computador, então quem abre o link digita um nome, que fica salvo.
+- **Trocar tela**: abre o seletor de novo sem derrubar ninguém.
+- **Qualidade**: Leve (3 Mbps/30 fps), Equilibrada, Alta e Máxima (20 Mbps).
+- **Som**: quais apps entram na transmissão.
+
+No Windows, as mesmas opções ficam na janela do app (o monitor pode ser trocado
+com a transmissão rodando).
+
+Pelo terminal, o equivalente é:
 
 ```bash
 telinha            # abre o seletor de tela do sistema
@@ -123,10 +136,22 @@ tela cheia, e **S** mostra as estatísticas (fps, bitrate, RTT, buffer e decodif
 | `--bind <ip>` / `-p, --port` | IP do Tailscale / 8080 | |
 | `--test` | | Transmite um padrão de teste em vez da tela |
 | `--tunnel` | | Link público pela Cloudflare (veja abaixo) |
-| `-a, --audio` | | Transmite também o som do sistema (veja abaixo) |
+| `-a, --audio` | | Transmite também o som dos apps (veja abaixo) |
+| `--audio-include` / `--audio-exclude` | | Apps a incluir/excluir do som, por nome |
 
-Comandos no terminal enquanto roda: `b 8000` (muda o bitrate ao vivo), `k` (força
-keyframe) e `s` (status).
+Comandos pelo stdin enquanto roda (é assim que o Caelestia e o app do Windows
+controlam o telinha):
+
+| Comando | |
+|---|---|
+| `quality <kbps> <fps>` | Muda a qualidade ao vivo (`b <kbps>` só o bitrate) |
+| `kick <id>` · `block <id>` · `unblock <chave>` | Expulsa, bloqueia ou desbloqueia |
+| `screen` | Linux: abre o seletor e troca a tela; Windows: `screen <monitor-handle>` |
+| `app on\|off <nome>` | Liga ou desliga o som de um app |
+| `k` · `s` · `q` | Keyframe, status, sair |
+
+Eventos na saída, uma linha JSON cada: `@viewers [...]`, `@blocked [...]`,
+`@apps [...]` e `@screen switched|cancelled`.
 
 ### Link público (qualquer pessoa, sem Tailscale)
 

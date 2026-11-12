@@ -24,6 +24,7 @@ OutputBaseFilename=Telinha-Setup-{#AppVersion}-windows-x64
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
+SetupIconFile=..\assets\telinha.ico
 UninstallDisplayIcon={app}\Telinha Desktop.exe
 CloseApplications=yes
 RestartApplications=no

@@ -10,5 +10,11 @@ if not defined TELINHA_VS (
 )
 call "%TELINHA_VS%\VC\Auxiliary\Build\vcvars64.bat" >nul
 if errorlevel 1 exit /b 1
-cl /nologo /std:c++17 /EHsc /O2 /MT /utf-8 "%TELINHA_UI_SOURCE%" /Fe:"%TELINHA_UI_OUTPUT%" /Fo:"%TELINHA_UI_OUTPUT%.obj" /link /SUBSYSTEM:WINDOWS user32.lib shell32.lib gdi32.lib comctl32.lib
+rem O .rc referencia ..\assets\telinha.ico relativo a esta pasta.
+pushd "%~dp0"
+rc /nologo /fo "%TELINHA_UI_OUTPUT%.res" telinha.rc
+set "TELINHA_RC=%errorlevel%"
+popd
+if not "%TELINHA_RC%"=="0" exit /b %TELINHA_RC%
+cl /nologo /std:c++17 /EHsc /O2 /MT /utf-8 "%TELINHA_UI_SOURCE%" "%TELINHA_UI_OUTPUT%.res" /Fe:"%TELINHA_UI_OUTPUT%" /Fo:"%TELINHA_UI_OUTPUT%.obj" /link /SUBSYSTEM:WINDOWS user32.lib shell32.lib gdi32.lib comctl32.lib
 exit /b %errorlevel%

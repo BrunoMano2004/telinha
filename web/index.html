@@ -4,6 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Telinha</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="icon" href="/favicon.ico" sizes="any">
 <style>
   :root { color-scheme: dark; }
   html, body { margin: 0; height: 100%; background: #000; overflow: hidden;
@@ -22,12 +24,41 @@
     border: 1px solid #333; border-radius: 6px; padding: 8px 10px; white-space: pre;
     font: 12px/1.5 ui-monospace, monospace; display: none; }
   #stats.on { display: block; }
+  .overlay { position: fixed; inset: 0; display: grid; place-items: center; padding: 16px;
+    background: rgba(0,0,0,.82); }
+  .overlay[hidden] { display: none; }
+  .card { width: min(360px, 100%); box-sizing: border-box; background: #161616; border: 1px solid #2c2c2c;
+    border-radius: 14px; padding: 22px; display: grid; gap: 12px; text-align: center; }
+  .card img { width: 56px; height: 56px; margin: 0 auto; }
+  .card h1 { margin: 0; font-size: 18px; font-weight: 600; }
+  .card p { margin: 0; color: #a8a8a8; font-size: 14px; }
+  .card input { box-sizing: border-box; width: 100%; padding: 10px 12px; border-radius: 8px;
+    border: 1px solid #3a3a3a; background: #0d0d0d; color: #eee; font: 15px system-ui, sans-serif; }
+  .card input:focus { outline: 2px solid #6d5dfc; border-color: transparent; }
+  .card button { padding: 10px; font-size: 15px; background: #6d5dfc; border: 0; color: #fff; }
+  .card button:hover { background: #5a4ae6; }
 </style>
 </head>
 <body>
 <video id="video" autoplay playsinline muted></video>
-<div id="status">Conectando…</div>
+<div id="status"></div>
 <pre id="stats"></pre>
+<form id="join" class="overlay">
+  <div class="card">
+    <img src="/favicon.svg" alt="">
+    <h1>Telinha</h1>
+    <p>Como você quer aparecer para quem está transmitindo?</p>
+    <input id="name" maxlength="40" placeholder="Seu nome" autocomplete="nickname" autofocus>
+    <button type="submit">Assistir</button>
+  </div>
+</form>
+<div id="ended" class="overlay" hidden>
+  <div class="card">
+    <img src="/favicon.svg" alt="">
+    <p id="ended-text"></p>
+    <button id="rejoin" type="button">Entrar de novo</button>
+  </div>
+</div>
 <div id="bar">
   <button id="btn-sound" title="Som (M)" hidden>Ativar som</button>
   <button id="btn-stats" title="Estatísticas (S)">Estatísticas</button>
@@ -42,6 +73,43 @@ const soundBtn = document.getElementById('btn-sound');
 let activePc, statsTimer, last;
 
 function setStatus(text) { statusEl.textContent = text; }
+
+// localStorage pode não existir (janela anônima, armazenamento bloqueado).
+function stored(key, fallback) {
+  try { return localStorage.getItem(key) ?? fallback; } catch { return fallback; }
+}
+function store(key, value) {
+  try { localStorage.setItem(key, value); } catch {}
+}
+// Id aleatório deste navegador: permite que quem transmite bloqueie alguém.
+const clientId = (() => {
+  let id = stored('telinha-client', '');
+  if (!id) {
+    id = (crypto.randomUUID?.() ?? Math.random().toString(36).slice(2) + Date.now().toString(36));
+    store('telinha-client', id);
+  }
+  return id;
+})();
+// O navegador não revela o nome do computador; mostramos navegador · sistema.
+function deviceName() {
+  const ua = navigator.userAgent;
+  const browser = /Edg\//.test(ua) ? 'Edge' : /OPR\//.test(ua) ? 'Opera' : /Firefox\//.test(ua) ? 'Firefox'
+    : /Chrome\//.test(ua) ? 'Chrome' : /Safari\//.test(ua) ? 'Safari' : 'Navegador';
+  const os = /Android/.test(ua) ? 'Android' : /iPhone|iPad/.test(ua) ? 'iOS' : /Windows/.test(ua) ? 'Windows'
+    : /Mac OS X/.test(ua) ? 'macOS' : /CrOS/.test(ua) ? 'ChromeOS' : /Linux/.test(ua) ? 'Linux' : '';
+  return os ? `${browser} · ${os}` : browser;
+}
+let viewerName = '';
+
+// Expulso ou bloqueado: para de reconectar e mostra o aviso.
+function ended(text, canRejoin) {
+  if (activePc) { activePc.close(); activePc = null; }
+  video.srcObject = null;
+  setStatus('');
+  document.getElementById('ended-text').textContent = text;
+  document.getElementById('rejoin').hidden = !canRejoin;
+  document.getElementById('ended').hidden = false;
+}
 
 // Tempo máximo para uma tentativa chegar ao vídeo; depois disso, recomeça do zero.
 const CONNECT_TIMEOUT_MS = 20000;
@@ -59,6 +127,16 @@ function connect() {
     iceServers: remote ? [{ urls: 'stun:stun.l.google.com:19302' }] : [],
   });
   if (!prevPc) setStatus('Conectando…');
+  ws.onopen = () => ws.send(JSON.stringify({ type: 'hello', name: viewerName, device: deviceName(), client: clientId }));
+  // Fim definitivo (sem nova tentativa).
+  const stop = (text, canRejoin) => {
+    done = true;
+    clearTimeout(timer);
+    ws.onclose = null;
+    try { ws.close(); } catch {}
+    pc.close();
+    ended(text, canRejoin);
+  };
   // Diagnóstico: o que acontece no navegador aparece no terminal de quem transmite.
   const log = (text) => {
     if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'log', text: String(text).slice(0, 500) }));
@@ -102,6 +180,8 @@ function connect() {
       // Só agora larga a conexão anterior: a última imagem fica na tela até aqui.
       // Vídeo e áudio chegam em eventos separados; o elemento recebe as duas trilhas.
       video.srcObject = new MediaStream(pc.getReceivers().map((r) => r.track));
+      // Com som, se o navegador deixar (o clique em "Assistir" costuma bastar).
+      video.play().catch(() => { video.muted = true; video.play().catch(() => {}); updateSound(); });
       video.onplaying = () => log(`reproduzindo ${video.videoWidth}x${video.videoHeight}`);
       // Confirma que as trilhas recebem dados (ajuda a diagnosticar "sem som").
       setTimeout(async () => {
@@ -139,6 +219,10 @@ function connect() {
       try { await pc.addIceCandidate({ candidate: msg.candidate, sdpMLineIndex: msg.sdpMLineIndex }); } catch {}
     } else if (msg.type === 'full') {
       retry('A transmissão está cheia. Tentando de novo em instantes…', 5000);
+    } else if (msg.type === 'kicked') {
+      stop('Você foi removido da transmissão.', true);
+    } else if (msg.type === 'blocked') {
+      stop('Quem está transmitindo bloqueou você.', false);
     }
   };
   ws.onclose = () => retry('Conexão perdida. Reconectando…');
@@ -169,7 +253,7 @@ async function updateStats() {
     `perdidos    ${v.packetsLost ?? 0} pacotes · ${v.framesDropped ?? 0} quadros`;
 }
 
-// O navegador só toca áudio depois de um clique, então o vídeo começa mudo.
+// O navegador só toca áudio depois de um clique; o "Assistir" já conta como um.
 function updateSound() {
   soundBtn.textContent = video.muted ? 'Ativar som' : 'Silenciar';
   document.body.classList.toggle('needs-unmute', !soundBtn.hidden && video.muted);
@@ -194,12 +278,27 @@ document.getElementById('btn-stats').onclick = toggleStats;
 document.getElementById('btn-full').onclick = toggleFull;
 video.ondblclick = toggleFull;
 document.onkeydown = (e) => {
+  if (e.target instanceof HTMLInputElement) return;
   if (e.key === 's' || e.key === 'S') toggleStats();
   if (e.key === 'f' || e.key === 'F') toggleFull();
   if (e.key === 'm' || e.key === 'M') toggleSound();
 };
 
-connect();
+const nameInput = document.getElementById('name');
+nameInput.value = stored('telinha-name', '');
+document.getElementById('join').onsubmit = (e) => {
+  e.preventDefault();
+  viewerName = nameInput.value.trim();
+  store('telinha-name', viewerName);
+  document.getElementById('join').hidden = true;
+  video.muted = false;
+  connect();
+};
+document.getElementById('rejoin').onclick = () => {
+  document.getElementById('ended').hidden = true;
+  video.muted = false;
+  connect();
+};
 </script>
 </body>
 </html>

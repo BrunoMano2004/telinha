@@ -1,6 +1,6 @@
 pkgbase = telinha-git
 	pkgdesc = Compartilhamento de tela leve e de baixa latência pelo navegador (WebRTC + encoder de hardware), com card para o Caelestia
-	pkgver = r3.25653d0
+	pkgver = r5.7b402ac
 	pkgrel = 1
 	url = https://github.com/BrunoMano2004/telinha
 	install = telinha.install

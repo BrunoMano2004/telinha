@@ -2,6 +2,9 @@ name: Instalador Windows
 on:
   workflow_dispatch:
   push:
+    # Tag v1.2.3 publica uma Release com o instalador (o app avisa quem tem
+    # uma versão anterior). Filtros de caminho não valem para tags.
+    tags: ['v*']
     paths:
       - 'src/**'
       - 'web/**'
@@ -46,3 +49,28 @@ jobs:
             dist/*.exe
             dist/*.sha256
           if-no-files-found: error
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: installer
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: Telinha-Windows-x64
+          path: dist
+      - name: Publicar Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          case "$TAG" in
+            "v$version"|"v$version"-*) ;;
+            *) echo "A tag $TAG não corresponde à versão $version do Cargo.toml"; exit 1 ;;
+          esac
+          flags=""
+          case "$TAG" in *-*) flags="--prerelease" ;; esac
+          gh release create "$TAG" dist/*.exe dist/*.sha256 --title "Telinha $version" --generate-notes $flags

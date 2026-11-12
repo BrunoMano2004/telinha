@@ -47,3 +47,5 @@ Name: "{userstartup}\Telinha"; Filename: "{app}\Telinha Desktop.exe"; Parameters
 
 [Run]
 Filename: "{app}\Telinha Desktop.exe"; Description: "Abrir Telinha"; Flags: nowait postinstall skipifsilent
+; Atualização pelo próprio app: o instalador roda em /SILENT e reabre o Telinha.
+Filename: "{app}\Telinha Desktop.exe"; Flags: nowait; Check: WizardSilent

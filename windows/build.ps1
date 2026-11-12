@@ -56,7 +56,14 @@ try {
         Run-Checked 'cargo' @('build', '--locked', '--release', '--target', 'x86_64-pc-windows-msvc')
     }
     Copy-Item 'target\x86_64-pc-windows-msvc\release\telinha.exe' "$payload\telinha.exe" -Force
-    Run-Checked "$PSScriptRoot\build-ui.cmd" @("$payload\Telinha Desktop.exe")
+    # SDK do WebView2 (headers + loader estatico) para a interface do app.
+    $webview2Version = '1.0.4258.31'
+    $webview2Package = Join-Path $work "webview2-$webview2Version.zip"
+    Get-VerifiedFile "https://api.nuget.org/v3-flatcontainer/microsoft.web.webview2/$webview2Version/microsoft.web.webview2.$webview2Version.nupkg" $webview2Package '56f7f4b8bf9aee4b8efefbbdd4f67d5f74ebd1b100ed0806da71bf76af481aa9'
+    $webview2 = Join-Path $work "webview2-$webview2Version"
+    if (!(Test-Path "$webview2\build\native\include\WebView2.h")) { Expand-Archive $webview2Package $webview2 -Force }
+    $appVersion = (Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"').Matches[0].Groups[1].Value
+    Run-Checked "$PSScriptRoot\build-ui.cmd" @("$payload\Telinha Desktop.exe", $appVersion, "$webview2\build\native")
     Remove-Item "$payload\Telinha Desktop.exe.obj" -Force -ErrorAction SilentlyContinue
     Remove-Item "$payload\Telinha Desktop.exe.res" -Force -ErrorAction SilentlyContinue
     # Copie apenas runtime, plugins, scanner e licencas, sem SDK ou compiladores.
@@ -89,7 +96,6 @@ try {
         $Iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
         if (!(Test-Path $Iscc)) { $Iscc = (Get-Command ISCC.exe -ErrorAction Stop).Source }
     }
-    $appVersion = (Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"').Matches[0].Groups[1].Value
     Run-Checked $Iscc @("/DPayloadDir=$payload", "/DOutputDir=$dist", "/DAppVersion=$appVersion", "$PSScriptRoot\installer.iss")
     Get-ChildItem "$dist\*.exe" | ForEach-Object {
         $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()

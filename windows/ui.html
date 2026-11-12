@@ -1,0 +1,533 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Telinha</title>
+<!--
+  Interface do app do Windows, mostrada num WebView2 pelo telinha.cpp.
+  Ponte: window.chrome.webview.postMessage("comando\targ...") para o app e
+  eventos JSON {type: ...} de volta. Aberta fora do app (ex.: no navegador),
+  mostra dados de demonstração; ?demo=live simula uma transmissão ao vivo.
+-->
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f3f3f7; --surface: #ffffff; --surface-2: #f7f7fa; --hover: rgba(0,0,0,.045);
+    --border: rgba(0,0,0,.075); --text: #1b1b20; --muted: #6a6a76; --faint: #9a9aa6;
+    --accent: #6d5dfc; --accent-2: #14b8c4; --accent-soft: rgba(109,93,252,.11); --on-accent: #fff;
+    --danger: #d64545; --danger-soft: rgba(214,69,69,.1); --live: #18a058; --live-soft: rgba(24,160,88,.12);
+    --warn-soft: rgba(217,140,24,.14); --warn: #b26b00;
+    --shadow: 0 1px 2px rgba(0,0,0,.05), 0 4px 16px rgba(0,0,0,.04);
+    --radius: 12px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #1b1b1f; --surface: #25252b; --surface-2: #2c2c33; --hover: rgba(255,255,255,.05);
+      --border: rgba(255,255,255,.07); --text: #f1f1f4; --muted: #a3a3ae; --faint: #74747f;
+      --accent: #8b7dff; --accent-soft: rgba(139,125,255,.15); --danger: #f06a6a; --danger-soft: rgba(240,106,106,.14);
+      --live: #3dd68c; --live-soft: rgba(61,214,140,.14); --warn-soft: rgba(255,184,77,.14); --warn: #ffb84d;
+      --shadow: 0 1px 2px rgba(0,0,0,.3), 0 6px 20px rgba(0,0,0,.18);
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body { background: var(--bg); color: var(--text); overflow: auto;
+    font: 14px/1.45 "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+    -webkit-user-select: none; user-select: none; }
+  button, select, input { font: inherit; color: inherit; }
+  svg { width: 18px; height: 18px; flex: none; fill: none; stroke: currentColor; stroke-width: 1.8;
+    stroke-linecap: round; stroke-linejoin: round; }
+  .app { max-width: 1100px; margin: 0 auto; padding: 20px 24px 28px; display: grid; gap: 16px; }
+
+  /* Topo */
+  header { display: flex; align-items: center; gap: 14px; }
+  header img { width: 40px; height: 40px; }
+  header .title { flex: 1; min-width: 0; }
+  header h1 { margin: 0; font: 600 20px/1.2 "Segoe UI Variable Display", "Segoe UI", system-ui, sans-serif; }
+  .pill { display: inline-flex; align-items: center; gap: 7px; margin-top: 3px; color: var(--muted); font-size: 13px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--faint); }
+  .live .dot { background: var(--live); box-shadow: 0 0 0 4px var(--live-soft); animation: pulse 2s infinite; }
+  .live .pill { color: var(--live); font-weight: 600; }
+  @keyframes pulse { 50% { box-shadow: 0 0 0 7px transparent; } }
+
+  .btn { display: inline-flex; align-items: center; justify-content: center; gap: 8px; height: 36px;
+    padding: 0 16px; border-radius: 8px; border: 1px solid var(--border); background: var(--surface);
+    cursor: pointer; font-weight: 600; transition: background .15s, transform .08s, opacity .15s; white-space: nowrap; }
+  .btn:hover { background: var(--surface-2); }
+  .btn:active { transform: scale(.98); }
+  .btn:disabled { opacity: .45; cursor: default; transform: none; }
+  .btn.primary { border: 0; color: var(--on-accent); background: linear-gradient(135deg, var(--accent), var(--accent-2));
+    box-shadow: 0 4px 14px rgba(109,93,252,.28); }
+  .btn.primary:hover { filter: brightness(1.06); }
+  .btn.big { height: 42px; padding: 0 22px; font-size: 15px; border-radius: 10px; }
+  .btn.stop { border: 0; color: #fff; background: var(--danger); box-shadow: 0 4px 14px rgba(214,69,69,.25); }
+  .btn.ghost { background: transparent; border-color: transparent; color: var(--muted); }
+  .btn.ghost:hover { background: var(--hover); color: var(--text); }
+  .icon-btn { width: 32px; height: 32px; padding: 0; border-radius: 8px; border: 0; background: transparent;
+    color: var(--muted); display: inline-grid; place-items: center; cursor: pointer; transition: background .15s, color .15s; }
+  .icon-btn:hover { background: var(--hover); color: var(--text); }
+  .icon-btn.danger:hover { background: var(--danger-soft); color: var(--danger); }
+
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+    box-shadow: var(--shadow); padding: 18px; min-width: 0; }
+  .card h2 { margin: 0 0 4px; font-size: 15px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+  .card h2 svg { color: var(--accent); }
+  .card .hint { margin: 0 0 14px; color: var(--muted); font-size: 13px; }
+  .count { margin-left: auto; min-width: 24px; height: 22px; padding: 0 8px; border-radius: 11px;
+    background: var(--accent-soft); color: var(--accent); font-size: 12px; font-weight: 700;
+    display: inline-grid; place-items: center; }
+
+  /* Link */
+  .link { display: flex; align-items: center; gap: 14px; padding: 16px 18px;
+    background: linear-gradient(135deg, var(--accent-soft), transparent 70%), var(--surface); }
+  .link .badge { width: 40px; height: 40px; border-radius: 10px; display: grid; place-items: center;
+    background: var(--accent-soft); color: var(--accent); flex: none; }
+  .link .badge svg { width: 20px; height: 20px; }
+  .link .text { flex: 1; min-width: 0; }
+  .link .label { font-size: 12px; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: .04em; }
+  .link .url { margin-top: 2px; font: 500 14px/1.4 "Cascadia Mono", Consolas, ui-monospace, monospace;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; -webkit-user-select: text; user-select: text; }
+  .link .url.placeholder { font-family: inherit; color: var(--faint); }
+  .link .actions { display: flex; gap: 8px; }
+
+  .grid { display: grid; grid-template-columns: minmax(300px, 5fr) minmax(320px, 6fr); gap: 16px; align-items: start; }
+  .stack { display: grid; gap: 16px; min-width: 0; }
+  @media (max-width: 760px) { .grid { grid-template-columns: 1fr; } .link { flex-wrap: wrap; } }
+
+  /* Campos */
+  .field { display: grid; gap: 7px; margin-top: 16px; }
+  .field:first-of-type { margin-top: 4px; }
+  .field > label, .field > .label { font-size: 13px; font-weight: 600; }
+  .select { position: relative; }
+  .select select { width: 100%; height: 38px; padding: 0 36px 0 12px; appearance: none; border-radius: 8px;
+    border: 1px solid var(--border); background: var(--surface-2); cursor: pointer; }
+  .select select:focus-visible, .seg button:focus-visible, .btn:focus-visible, .icon-btn:focus-visible,
+  .switch input:focus-visible + span { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .select svg { position: absolute; right: 12px; top: 10px; pointer-events: none; color: var(--muted); }
+  .note { font-size: 12px; color: var(--muted); }
+  .seg { display: grid; grid-template-columns: repeat(4, 1fr); padding: 3px; gap: 3px; border-radius: 9px;
+    background: var(--surface-2); border: 1px solid var(--border); }
+  .seg button { height: 32px; border: 0; border-radius: 6px; background: transparent; cursor: pointer;
+    color: var(--muted); font-weight: 600; font-size: 13px; transition: background .15s, color .15s; }
+  .seg button:hover { color: var(--text); }
+  .seg button[aria-pressed="true"] { background: var(--surface); color: var(--text); box-shadow: 0 1px 3px rgba(0,0,0,.12); }
+
+  .row { display: flex; align-items: center; gap: 12px; padding: 12px 0; border-top: 1px solid var(--border); }
+  .field + .row, .row.first { margin-top: 16px; }
+  .row .text { flex: 1; min-width: 0; }
+  .row .name { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .row .meta { font-size: 12.5px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .row.disabled .text { opacity: .55; }
+
+  .switch { position: relative; width: 40px; height: 22px; flex: none; }
+  .switch input { position: absolute; inset: 0; opacity: 0; margin: 0; cursor: pointer; }
+  .switch span { position: absolute; inset: 0; border-radius: 11px; background: var(--surface-2);
+    border: 1.5px solid var(--faint); transition: background .18s, border-color .18s; pointer-events: none; }
+  .switch span::after { content: ""; position: absolute; top: 3px; left: 3px; width: 13px; height: 13px; border-radius: 50%;
+    background: var(--muted); transition: transform .18s, background .18s, width .12s; }
+  .switch input:checked + span { background: var(--accent); border-color: var(--accent); }
+  .switch input:checked + span::after { transform: translateX(18px); background: #fff; }
+  .switch input:disabled { cursor: default; }
+  .switch input:disabled + span { opacity: .5; filter: saturate(.6); }
+  .switch input:disabled:checked + span::after { background: #fff; }
+
+  /* Pessoas e apps */
+  .list { display: grid; }
+  .person { display: flex; align-items: center; gap: 12px; padding: 10px 8px; margin: 0 -8px; border-radius: 10px; }
+  .person:hover { background: var(--hover); }
+  .avatar { width: 36px; height: 36px; border-radius: 50%; flex: none; display: grid; place-items: center;
+    color: #fff; font-weight: 700; font-size: 14px; }
+  .person .text { flex: 1; min-width: 0; }
+  .person .name { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .person .meta { font-size: 12.5px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .person .actions { display: flex; gap: 2px; opacity: .75; transition: opacity .15s; }
+  .person:hover .actions { opacity: 1; }
+  .tag { display: inline-flex; align-items: center; height: 20px; padding: 0 7px; border-radius: 6px; margin-left: 6px;
+    font-size: 11px; font-weight: 700; background: var(--warn-soft); color: var(--warn); vertical-align: 1px; }
+  .sub { margin: 14px 0 4px; font-size: 12px; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+  .empty { display: grid; justify-items: center; gap: 6px; padding: 18px 8px 10px; text-align: center; color: var(--muted); }
+  .empty .ring { width: 48px; height: 48px; border-radius: 50%; display: grid; place-items: center;
+    background: var(--surface-2); color: var(--faint); }
+  .empty .ring svg { width: 22px; height: 22px; }
+  .empty strong { color: var(--text); font-weight: 600; }
+  .app-row { display: flex; align-items: center; gap: 12px; padding: 9px 0; border-top: 1px solid var(--border); }
+  .app-row:first-child { border-top: 0; }
+  .app-icon { width: 30px; height: 30px; border-radius: 8px; display: grid; place-items: center; flex: none;
+    background: var(--surface-2); color: var(--muted); }
+  .app-icon svg { width: 16px; height: 16px; }
+  .app-row .name { flex: 1; min-width: 0; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+  .update { display: flex; align-items: center; gap: 14px; padding: 12px 16px; border-radius: var(--radius);
+    background: var(--accent-soft); border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent); }
+  .update[hidden] { display: none; }
+  .update .badge { width: 34px; height: 34px; border-radius: 9px; display: grid; place-items: center; flex: none;
+    color: var(--on-accent); background: linear-gradient(135deg, var(--accent), var(--accent-2)); }
+  .update .text { flex: 1; min-width: 0; }
+  .update .title { font-weight: 600; }
+  .update .meta { font-size: 12.5px; color: var(--muted); }
+  .update .meta.error { color: var(--danger); }
+  .bar { height: 4px; margin-top: 7px; border-radius: 2px; background: color-mix(in srgb, var(--accent) 18%, transparent); overflow: hidden; }
+  .bar span { display: block; height: 100%; width: 0; border-radius: 2px; transition: width .2s;
+    background: linear-gradient(90deg, var(--accent), var(--accent-2)); }
+  .bar.indeterminate span { width: 35%; animation: slide 1.2s infinite ease-in-out; }
+  @keyframes slide { from { transform: translateX(-100%); } to { transform: translateX(300%); } }
+  .update .actions { display: flex; gap: 8px; }
+  details { color: var(--muted); }
+  summary { cursor: pointer; font-size: 13px; font-weight: 600; width: max-content; padding: 4px 6px; margin-left: -6px; border-radius: 6px; }
+  summary:hover { background: var(--hover); color: var(--text); }
+  pre { margin: 10px 0 0; max-height: 180px; overflow: auto; padding: 12px; border-radius: 10px; background: var(--surface);
+    border: 1px solid var(--border); font: 12px/1.55 "Cascadia Mono", Consolas, monospace; white-space: pre-wrap;
+    -webkit-user-select: text; user-select: text; color: var(--text); }
+  footer { display: flex; justify-content: space-between; gap: 12px; align-items: flex-start; }
+  footer .note { padding-top: 5px; }
+
+  .toast { position: fixed; left: 50%; bottom: 24px; transform: translate(-50%, 20px); opacity: 0; pointer-events: none;
+    padding: 10px 16px; border-radius: 10px; background: var(--text); color: var(--bg); font-weight: 600;
+    box-shadow: 0 8px 24px rgba(0,0,0,.25); transition: opacity .2s, transform .2s; display: flex; gap: 8px; align-items: center; }
+  .toast.show { opacity: 1; transform: translate(-50%, 0); }
+  @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
+</style>
+</head>
+<body>
+<svg style="display:none" aria-hidden="true">
+  <symbol id="i-play" viewBox="0 0 24 24"><path d="M7 5.5v13l11-6.5z" fill="currentColor" stroke="none"/></symbol>
+  <symbol id="i-stop" viewBox="0 0 24 24"><rect x="6.5" y="6.5" width="11" height="11" rx="2" fill="currentColor" stroke="none"/></symbol>
+  <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 14a4.5 4.5 0 0 0 6.4 0l3-3a4.5 4.5 0 0 0-6.4-6.4l-1 1"/><path d="M14 10a4.5 4.5 0 0 0-6.4 0l-3 3a4.5 4.5 0 0 0 6.4 6.4l1-1"/></symbol>
+  <symbol id="i-copy" viewBox="0 0 24 24"><rect x="8.5" y="8.5" width="11" height="11" rx="2.5"/><path d="M15.5 8.5V6.5a2 2 0 0 0-2-2h-7a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h2"/></symbol>
+  <symbol id="i-open" viewBox="0 0 24 24"><path d="M14 4.5h5.5V10"/><path d="M19.5 4.5 11 13"/><path d="M18 14v4a1.5 1.5 0 0 1-1.5 1.5h-10A1.5 1.5 0 0 1 5 18V8a1.5 1.5 0 0 1 1.5-1.5h4"/></symbol>
+  <symbol id="i-screen" viewBox="0 0 24 24"><rect x="3" y="4.5" width="18" height="12" rx="2"/><path d="M9 20h6M12 16.5V20"/></symbol>
+  <symbol id="i-users" viewBox="0 0 24 24"><circle cx="9" cy="8.5" r="3.5"/><path d="M3 19.5a6 6 0 0 1 12 0"/><path d="M16 5.2a3.5 3.5 0 0 1 0 6.6M18 14.2a6 6 0 0 1 3 5.3"/></symbol>
+  <symbol id="i-sound" viewBox="0 0 24 24"><path d="M4 9.5v5h3.5L12 19V5L7.5 9.5z"/><path d="M15.5 9a4 4 0 0 1 0 6M18 6.5a7.5 7.5 0 0 1 0 11"/></symbol>
+  <symbol id="i-kick" viewBox="0 0 24 24"><path d="M14 4.5h3.5a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2H14"/><path d="M10 16l4-4-4-4M14 12H4"/></symbol>
+  <symbol id="i-block" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><path d="M6.4 6.4l11.2 11.2"/></symbol>
+  <symbol id="i-chev" viewBox="0 0 24 24"><path d="M7 10l5 5 5-5"/></symbol>
+  <symbol id="i-tune" viewBox="0 0 24 24"><path d="M4 7h10M18 7h2M4 17h4M12 17h8"/><circle cx="16" cy="7" r="2"/><circle cx="10" cy="17" r="2"/></symbol>
+  <symbol id="i-app" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="4"/><path d="M9.5 9.5v5l4.5-2.5z" fill="currentColor" stroke="none"/></symbol>
+  <symbol id="i-update" viewBox="0 0 24 24"><path d="M12 4v11M7.5 10.5 12 15l4.5-4.5"/><path d="M5 19.5h14"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7.5"/></symbol>
+</svg>
+
+<div class="app" id="app">
+  <header>
+    <img id="logo" alt="">
+    <div class="title">
+      <h1>Telinha</h1>
+      <div class="pill"><span class="dot"></span><span id="status">Pronto para compartilhar</span></div>
+    </div>
+    <button class="btn primary big" id="main-btn"><svg><use href="#i-play"/></svg><span>Iniciar transmissão</span></button>
+  </header>
+
+  <section class="update" id="update" hidden>
+    <div class="badge"><svg><use href="#i-update"/></svg></div>
+    <div class="text">
+      <div class="title" id="update-title"></div>
+      <div class="meta" id="update-meta"></div>
+      <div class="bar" id="update-bar" hidden><span id="update-fill"></span></div>
+    </div>
+    <div class="actions">
+      <button class="btn ghost" id="release-btn">Novidades</button>
+      <button class="btn primary" id="update-btn">Atualizar agora</button>
+    </div>
+  </section>
+
+  <section class="card link">
+    <div class="badge"><svg><use href="#i-link"/></svg></div>
+    <div class="text">
+      <div class="label" id="link-label">Link da transmissão</div>
+      <div class="url placeholder" id="url">Aparece aqui quando você iniciar, já copiado.</div>
+    </div>
+    <div class="actions">
+      <button class="btn" id="open-btn" disabled><svg><use href="#i-open"/></svg>Abrir</button>
+      <button class="btn primary" id="copy-btn" disabled><svg><use href="#i-copy"/></svg>Copiar link</button>
+    </div>
+  </section>
+
+  <div class="grid">
+    <div class="stack">
+      <section class="card">
+        <h2><svg><use href="#i-tune"/></svg>Transmissão</h2>
+        <p class="hint">O que vai para quem assiste.</p>
+        <div class="field">
+          <label for="monitor">Monitor</label>
+          <div class="select"><select id="monitor"></select><svg><use href="#i-chev"/></svg></div>
+          <div class="note" id="monitor-note">Com a transmissão ao vivo, mudar aqui troca a tela na hora.</div>
+        </div>
+        <div class="field">
+          <div class="label">Qualidade</div>
+          <div class="seg" id="quality" role="group" aria-label="Qualidade"></div>
+          <div class="note" id="quality-note"></div>
+        </div>
+        <div class="row first" id="audio-row">
+          <div class="text"><div class="name">Som dos aplicativos</div>
+            <div class="meta">Nunca o microfone. Chamadas ficam de fora.</div></div>
+          <label class="switch"><input type="checkbox" id="audio" aria-label="Som dos aplicativos"><span></span></label>
+        </div>
+        <div class="row" id="public-row">
+          <div class="text"><div class="name">Link público</div>
+            <div class="meta" id="public-meta">Qualquer pessoa com o link assiste.</div></div>
+          <label class="switch"><input type="checkbox" id="public" aria-label="Link público"><span></span></label>
+        </div>
+      </section>
+    </div>
+
+    <div class="stack">
+      <section class="card">
+        <h2><svg><use href="#i-users"/></svg>Espectadores <span class="count" id="viewer-count">0</span></h2>
+        <div class="list" id="viewers"></div>
+        <div id="blocked-wrap" hidden>
+          <div class="sub">Bloqueados</div>
+          <div class="list" id="blocked"></div>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2><svg><use href="#i-sound"/></svg>Apps no som</h2>
+        <p class="hint">Escolha o que entra na transmissão. Vale na hora.</p>
+        <div class="list" id="apps"></div>
+      </section>
+    </div>
+  </div>
+
+  <footer>
+    <details id="details"><summary>Detalhes técnicos</summary><pre id="log">Nada por enquanto.</pre></details>
+    <div class="note"><span id="version"></span>Fechar a janela mantém o Telinha perto do relógio.</div>
+  </footer>
+</div>
+<div class="toast" id="toast"><svg><use href="#i-check"/></svg><span id="toast-text"></span></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const QUALITIES = [
+  { name: 'Leve', kbps: 3000, fps: 30, note: '3 Mbps · 30 fps — para conexões lentas' },
+  { name: 'Equilibrada', kbps: 6000, fps: 60, note: '6 Mbps · 60 fps' },
+  { name: 'Alta', kbps: 12000, fps: 60, note: '12 Mbps · 60 fps — texto nítido' },
+  { name: 'Máxima', kbps: 20000, fps: 60, note: '20 Mbps · 60 fps — precisa de upload rápido' },
+];
+// Mesma lista do telinha (src/audio_rules.rs): fora por padrão, para não dar eco.
+const VOICE = ['discord', 'vesktop', 'webcord', 'legcord', 'armcord', 'equibop', 'webrtc', 'teamspeak', 'ts3client',
+  'mumble', 'zoom', 'slack', 'teams', 'skype', 'telegram', 'signal', 'whatsapp', 'element', 'jitsi'];
+const isVoice = (name) => VOICE.some((v) => name.toLowerCase().includes(v));
+
+const state = {
+  running: false, starting: false, link: '', monitors: [], monitor: 0, quality: 2, audio: true, public: true,
+  choices: {}, viewers: [], blocked: [], liveApps: [], log: [],
+  version: '', update: null, // {version, page, progress (null|-1|0..100), error}
+};
+
+// --- Ponte com o app (telinha.cpp). Fora dele, modo demonstração.
+const host = window.chrome?.webview;
+const send = (...parts) => host ? host.postMessage(parts.join('\t')) : demo(parts);
+
+function onMessage(msg) {
+  switch (msg.type) {
+    case 'init':
+      state.version = msg.version || '';
+      Object.assign(state, { monitors: msg.monitors, monitor: msg.monitor ?? 0, quality: msg.quality ?? 2,
+        audio: msg.audio !== false, public: msg.public !== false, choices: msg.apps || {} });
+      break;
+    case 'state':
+      state.running = msg.running; state.starting = msg.running && !msg.link; state.link = msg.link || '';
+      if (!msg.running) { state.viewers = []; state.blocked = []; state.liveApps = []; }
+      break;
+    case 'viewers': state.viewers = msg.data; break;
+    case 'blocked': state.blocked = msg.data; break;
+    case 'apps': state.liveApps = msg.data; break;
+    case 'log':
+      state.log.push(msg.text); if (state.log.length > 300) state.log.shift();
+      $('log').textContent = state.log.join('\n'); $('log').scrollTop = $('log').scrollHeight;
+      return;
+    case 'copied': toast('Link copiado'); return;
+    case 'update': state.update = { version: msg.version, page: msg.page, progress: null, error: '' }; break;
+    case 'update-progress': if (state.update) { state.update.progress = msg.percent; state.update.error = ''; } break;
+    case 'update-error': if (state.update) { state.update.progress = null; state.update.error = msg.text; } break;
+    case 'screen': if (msg.state === 'switched') toast('Tela trocada'); return;
+  }
+  render();
+}
+host?.addEventListener('message', (e) => onMessage(e.data));
+
+// --- Ações
+$('main-btn').onclick = () => {
+  if (state.running) return send('stop');
+  const q = QUALITIES[state.quality];
+  state.starting = true; render();
+  send('start', state.monitor, q.kbps, q.fps, state.audio ? 1 : 0, state.public ? 1 : 0);
+};
+$('copy-btn').onclick = () => send('copy');
+$('release-btn').onclick = () => send('release');
+$('update-btn').onclick = () => {
+  if (!state.update || state.update.progress !== null) return;
+  state.update.progress = -1; state.update.error = ''; render();
+  send('update');
+};
+$('open-btn').onclick = () => send('open');
+$('monitor').onchange = (e) => {
+  state.monitor = Number(e.target.value);
+  send('save', 'monitor', state.monitor);
+  if (state.running) send('screen', state.monitor);
+};
+$('audio').onchange = (e) => { state.audio = e.target.checked; send('save', 'audio', state.audio ? 1 : 0); render(); };
+$('public').onchange = (e) => { state.public = e.target.checked; send('save', 'publico', state.public ? 1 : 0); render(); };
+function setQuality(i) {
+  state.quality = i; send('save', 'qualidade', i);
+  if (state.running) send('send', `quality ${QUALITIES[i].kbps} ${QUALITIES[i].fps}`);
+  render();
+}
+function setApp(name, on) {
+  state.choices[name.toLowerCase()] = on;
+  send('app', name, on ? 1 : 0);
+}
+
+// --- Desenho
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const icon = (id) => `<svg><use href="#i-${id}"/></svg>`;
+function hue(text) { let h = 0; for (const c of text) h = (h * 31 + c.codePointAt(0)) % 360; return h; }
+function avatar(name) {
+  const initials = name.trim().split(/\s+/).slice(0, 2).map((w) => w[0]).join('').toUpperCase() || '?';
+  const h = hue(name);
+  return `<div class="avatar" style="background:linear-gradient(135deg,hsl(${h} 62% 56%),hsl(${(h + 40) % 360} 62% 46%))">${esc(initials)}</div>`;
+}
+function since(sec) {
+  const min = Math.max(0, Math.floor((Date.now() / 1000 - sec) / 60));
+  return min < 1 ? 'agora' : min < 60 ? `há ${min} min` : `há ${Math.floor(min / 60)} h ${min % 60} min`;
+}
+function empty(iconId, title, text) {
+  return `<div class="empty"><div class="ring">${icon(iconId)}</div><strong>${esc(title)}</strong><div>${esc(text)}</div></div>`;
+}
+function appList() {
+  const map = new Map();
+  for (const a of state.liveApps) map.set(a.name.toLowerCase(), { name: a.name, voice: a.voice, live: true });
+  for (const k of Object.keys(state.choices)) if (!map.has(k)) map.set(k, { name: k, voice: isVoice(k), live: false });
+  return [...map.values()].sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function renderUpdate() {
+  const u = state.update;
+  $('update').hidden = !u;
+  if (!u) return;
+  const busy = u.progress !== null;
+  $('update-title').textContent = busy ? `Baixando a versão ${u.version}…` : `Nova versão disponível: ${u.version}`;
+  $('update-meta').className = `meta${u.error ? ' error' : ''}`;
+  $('update-meta').textContent = u.error || (busy ? 'O Telinha fecha e reabre sozinho ao terminar.'
+    : state.running ? 'Atualizar encerra a transmissão atual.' : `Você está na ${state.version || 'versão atual'}. Leva menos de um minuto.`);
+  $('update-bar').hidden = !busy;
+  $('update-bar').classList.toggle('indeterminate', busy && u.progress < 0);
+  $('update-fill').style.width = busy && u.progress >= 0 ? `${u.progress}%` : '';
+  $('update-btn').disabled = busy;
+  $('update-btn').textContent = u.error ? 'Tentar de novo' : 'Atualizar agora';
+}
+
+function render() {
+  renderUpdate();
+  $('version').textContent = state.version ? `Telinha ${state.version} · ` : '';
+  const live = state.running && state.link;
+  document.body.classList.toggle('live', !!live);
+  const n = state.viewers.length;
+  $('status').textContent = state.starting ? 'Preparando a transmissão…'
+    : live ? (n ? `Ao vivo · ${n} ${n === 1 ? 'pessoa assistindo' : 'pessoas assistindo'}` : 'Ao vivo · esperando quem vai assistir')
+    : 'Pronto para compartilhar';
+
+  const main = $('main-btn');
+  main.className = `btn big ${state.running ? 'stop' : 'primary'}`;
+  main.innerHTML = state.running ? `${icon('stop')}<span>Parar</span>` : `${icon('play')}<span>Iniciar transmissão</span>`;
+  main.disabled = state.starting && !state.running;
+
+  $('url').textContent = live ? state.link : state.starting ? 'Gerando o link…' : 'Aparece aqui quando você iniciar, já copiado.';
+  $('url').classList.toggle('placeholder', !live);
+  $('link-label').textContent = live ? (state.public ? 'Link público' : 'Link do Tailscale') : 'Link da transmissão';
+  $('copy-btn').disabled = $('open-btn').disabled = !live;
+
+  const select = $('monitor');
+  const options = state.monitors.map((m, i) => `<option value="${i}">${esc(m.label)}${m.primary ? ' — principal' : ''}</option>`).join('');
+  if (select.dataset.options !== options) { select.innerHTML = options; select.dataset.options = options; }
+  select.value = String(state.monitor);
+
+  $('quality').innerHTML = QUALITIES.map((q, i) =>
+    `<button aria-pressed="${i === state.quality}" data-i="${i}">${q.name}</button>`).join('');
+  $('quality').querySelectorAll('button').forEach((b) => b.onclick = () => setQuality(Number(b.dataset.i)));
+  $('quality-note').textContent = `${QUALITIES[state.quality].note}. Cada pessoa usa isso do seu upload${state.running ? '; muda na hora' : ''}.`;
+
+  // Som e link só mudam com a transmissão parada.
+  for (const [id, row] of [['audio', 'audio-row'], ['public', 'public-row']]) {
+    $(id).checked = state[id]; $(id).disabled = state.running;
+    $(row).classList.toggle('disabled', state.running);
+  }
+  $('public-meta').textContent = state.running ? 'Pare a transmissão para mudar.'
+    : state.public ? 'Qualquer pessoa com o link assiste.' : 'Só quem está no seu Tailscale.';
+
+  $('viewer-count').textContent = n;
+  $('viewers').innerHTML = n ? state.viewers.map((v) => `
+    <div class="person">${avatar(v.name)}
+      <div class="text"><div class="name">${esc(v.name)}</div>
+        <div class="meta">${esc([v.device, v.ip, since(v.since)].filter(Boolean).join(' · '))}</div></div>
+      <div class="actions">
+        <button class="icon-btn" title="Expulsar (pode voltar pelo link)" data-kick="${v.id}">${icon('kick')}</button>
+        <button class="icon-btn danger" title="Bloquear (este navegador e IP não entram mais)" data-block="${v.id}">${icon('block')}</button>
+      </div></div>`).join('')
+    : state.running ? empty('users', 'Ninguém assistindo ainda', 'Mande o link: quem entrar aparece aqui com o nome que digitou.')
+    : empty('users', 'Sem transmissão', 'Inicie para ver quem está assistindo.');
+  $('viewers').querySelectorAll('[data-kick]').forEach((b) => b.onclick = () => send('send', `kick ${b.dataset.kick}`));
+  $('viewers').querySelectorAll('[data-block]').forEach((b) => b.onclick = () => send('send', `block ${b.dataset.block}`));
+
+  $('blocked-wrap').hidden = !state.blocked.length;
+  $('blocked').innerHTML = state.blocked.map((b) => `
+    <div class="person">${avatar(b.name)}
+      <div class="text"><div class="name">${esc(b.name)}</div><div class="meta">${esc([b.device, b.ip].filter(Boolean).join(' · '))}</div></div>
+      <button class="btn ghost" data-unblock="${esc(b.key)}">Desbloquear</button></div>`).join('');
+  $('blocked').querySelectorAll('[data-unblock]').forEach((b) => b.onclick = () => send('send', `unblock ${b.dataset.unblock}`));
+
+  const apps = appList();
+  $('apps').innerHTML = !state.audio ? empty('sound', 'Som desligado', 'Ligue “Som dos aplicativos” para escolher.')
+    : apps.length ? apps.map((a, i) => {
+      const choice = state.choices[a.name.toLowerCase()];
+      const on = choice === undefined ? !a.voice : choice;
+      return `<div class="app-row"><div class="app-icon">${icon('app')}</div>
+        <div class="name">${esc(a.name)}${a.voice ? '<span class="tag">Chamada</span>' : ''}</div>
+        <label class="switch"><input type="checkbox" data-app="${i}" ${on ? 'checked' : ''} aria-label="${esc(a.name)}"><span></span></label></div>`;
+    }).join('')
+    : empty('sound', 'Nenhum app tocando som', 'Os apps aparecem aqui assim que tocarem algo.');
+  $('apps').querySelectorAll('[data-app]').forEach((input) => input.onchange = () => setApp(apps[Number(input.dataset.app)].name, input.checked));
+}
+
+let toastTimer;
+function toast(text) {
+  $('toast-text').textContent = text; $('toast').classList.add('show');
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => $('toast').classList.remove('show'), 1800);
+}
+setInterval(() => { if (state.viewers.length) render(); }, 30000);
+$('logo').src = 'data:image/svg+xml,' + encodeURIComponent(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#6d5dfc"/><stop offset="1" stop-color="#14b8c4"/></linearGradient></defs><rect width="256" height="256" rx="58" fill="url(#g)"/><rect x="40" y="58" width="176" height="122" rx="22" fill="#fff"/><path d="M112 91v56l46-28z" fill="url(#g)"/><rect x="116" y="180" width="24" height="18" fill="#fff" opacity=".85"/><rect x="84" y="194" width="88" height="16" rx="8" fill="#fff"/></svg>`);
+
+// --- Demonstração (fora do app), para ver o design no navegador.
+function demo(parts) {
+  if (parts[0] === 'start') setTimeout(() => onMessage({ type: 'state', running: true, link: 'https://exemplo-de-link.trycloudflare.com/?k=Ab12Cd34' }), 600);
+  if (parts[0] === 'stop') onMessage({ type: 'state', running: false });
+  if (parts[0] === 'copy') onMessage({ type: 'copied' });
+  if (parts[0] === 'update') {
+    let p = 0;
+    const t = setInterval(() => { p += 7; onMessage({ type: 'update-progress', percent: Math.min(p, 100) }); if (p >= 100) clearInterval(t); }, 150);
+  }
+}
+if (!host) {
+  onMessage({ type: 'init', version: '0.2.0', monitors: [{ label: 'Monitor 1 (2560 × 1440)', primary: true }, { label: 'Monitor 2 (1920 × 1080)' }],
+    monitor: 0, quality: 2, audio: true, public: true, apps: { spotify: false } });
+  if (new URLSearchParams(location.search).get('demo') === 'live') {
+    const now = Date.now() / 1000;
+    onMessage({ type: 'state', running: true, link: 'https://bright-river-sample.trycloudflare.com/?k=Ab12Cd34Ef56' });
+    onMessage({ type: 'viewers', data: [
+      { id: 3, name: 'Ana Souza', device: 'Chrome · Windows', ip: '189.40.12.7', since: now - 760 },
+      { id: 5, name: 'Bia', device: 'Firefox · Linux', ip: '2804:14c::1b23', since: now - 95 },
+      { id: 6, name: 'Carlos', device: 'Safari · iOS', ip: '177.22.8.140', since: now - 20 } ] });
+    onMessage({ type: 'update', version: '0.3.0', page: 'https://github.com/BrunoMano2004/telinha/releases' });
+    onMessage({ type: 'blocked', data: [{ key: '0', name: 'Visitante', device: 'Edge · Windows', ip: '45.6.7.8' }] });
+    onMessage({ type: 'apps', data: [{ name: 'Discord', on: false, voice: true }, { name: 'firefox', on: true, voice: false },
+      { name: 'Spotify', on: false, voice: false }] });
+    for (const line of ['Encoder: nvd3d11h264enc · 12000 kbps · até 60 fps · com áudio', 'Túnel ativo: o link abre para qualquer pessoa na internet',
+      '+ espectador #3 Ana Souza · Chrome · Windows (189.40.12.7) · total 1', 'som: + firefox', 'som: - Discord (chamada de voz)'])
+      onMessage({ type: 'log', text: line });
+  } else render();
+}
+if (host) send('ready');
+</script>
+</body>
+</html>

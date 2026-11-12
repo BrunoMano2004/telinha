@@ -1,2 +1,6 @@
 // Ícone do app (janela, bandeja, atalhos e "Aplicativos instalados").
 1 ICON "..\\assets\\telinha.ico"
+// Interface (HTML) mostrada no WebView2.
+2 RCDATA "ui.html"
+// Manifesto: DPI por monitor e controles comuns v6.
+1 24 "telinha.manifest"

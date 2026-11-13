@@ -29,6 +29,9 @@ pub struct Settings {
     pub monitor: u32,
     #[cfg_attr(target_os = "linux", allow(dead_code))]
     pub monitor_handle: Option<u64>,
+    /// Windows: "auto" (WGC só com HDR ligado), "dxgi" ou "wgc".
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
+    pub capture_api: String,
 }
 
 pub fn pick_encoder(forced: Option<&str>) -> Result<String> {
@@ -56,7 +59,7 @@ pub fn pick_encoder(forced: Option<&str>) -> Result<String> {
 #[cfg(target_os = "windows")]
 fn probe_windows_encoder(name: &str) -> Result<()> {
     let settings = Settings { bitrate_kbps: 12000, fps: 30, profile: "constrained-baseline".into(),
-        encoder: None, monitor: 0, monitor_handle: None };
+        encoder: None, monitor: 0, monitor_handle: None, capture_api: "auto".into() };
     let pipeline = gst::parse::launch(&format!(
         "videotestsrc num-buffers=3 ! video/x-raw,format=BGRx,width=320,height=240,framerate=30/1 \
          ! {} ! {name} name=probe ! video/x-h264,profile=constrained-baseline ! fakesink", windows_convert(name, false)))?
@@ -131,13 +134,60 @@ pub fn pipeline_description(fd: i32, node: u32, encoder: &str, s: &Settings) -> 
     )
 }
 
+/// Windows: o monitor está em HDR? A captura DXGI só entrega 8 bits e, com
+/// HDR ligado, o Windows corta as cores na conversão (imagem lavada). A
+/// Windows Graphics Capture faz a conversão HDR -> SDR com ajuste de tons.
+#[cfg(target_os = "windows")]
+pub fn monitor_is_hdr(handle: Option<u64>, index: u32) -> bool {
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
+    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1, IDXGIOutput6};
+    use windows::core::Interface;
+    unsafe {
+        let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory1>() else { return false };
+        let mut position = 0u32;
+        let mut adapter_index = 0;
+        while let Ok(adapter) = factory.EnumAdapters1(adapter_index) {
+            adapter_index += 1;
+            let mut output_index = 0;
+            while let Ok(output) = adapter.EnumOutputs(output_index) {
+                output_index += 1;
+                let Ok(desc) = output.cast::<IDXGIOutput6>().and_then(|o| o.GetDesc1()) else { continue };
+                let this = match handle {
+                    Some(h) => desc.Monitor.0 as usize as u64 == h,
+                    None => position == index,
+                };
+                position += 1;
+                if this {
+                    return desc.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
+                }
+            }
+        }
+        false
+    }
+}
+
+/// API de captura para o monitor: WGC com HDR (ou se pedida), senão DXGI.
+#[cfg(target_os = "windows")]
+pub fn capture_api(choice: &str, handle: Option<u64>, index: u32) -> &'static str {
+    match choice {
+        "dxgi" => "dxgi",
+        "wgc" => "wgc",
+        _ if monitor_is_hdr(handle, index) => "wgc",
+        _ => "dxgi",
+    }
+}
+
 #[cfg(target_os = "windows")]
 pub fn pipeline_description(encoder: &str, s: &Settings) -> String {
     let convert = windows_convert(encoder, true);
     let monitor = s.monitor_handle.map(|handle| format!("monitor-handle={handle}"))
         .unwrap_or_else(|| format!("monitor-index={}", s.monitor));
+    let api = capture_api(&s.capture_api, s.monitor_handle, s.monitor);
+    if api == "wgc" {
+        println!("Captura: Windows Graphics Capture (HDR ligado ou escolhido)");
+    }
     format!(
-        "d3d11screencapturesrc name=screen {monitor} show-cursor=true \
+        "d3d11screencapturesrc name=screen {monitor} capture-api={api} show-border=false show-cursor=true \
          ! video/x-raw(memory:D3D11Memory),framerate={fps}/1 \
          ! {GATE} ! {convert} ! {tail}",
         fps = capture_fps(s),

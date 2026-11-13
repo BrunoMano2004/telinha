@@ -2,7 +2,7 @@
 # Uso: windows/memory-test.ps1 -Package <pasta do pacote> [-Args '--test']
 # Roda no CI (executor sem GPU, como uma VM): encoder e Direct3D por software.
 [CmdletBinding()]
-param([Parameter(Mandatory = $true)][string]$Package, [string[]]$Scenarios = @('--test', '--test --audio', '--monitor 0', '--monitor 0 --audio'))
+param([Parameter(Mandatory = $true)][string]$Package, [string[]]$Scenarios = @('--test', '--monitor 0', '--monitor 0 --capture-api wgc', '--monitor 0 --audio'))
 $ErrorActionPreference = 'Stop'
 $Package = (Resolve-Path $Package).Path
 $env:PATH = "$Package;$Package\gstreamer\bin;$env:PATH"
@@ -62,7 +62,7 @@ foreach ($scenario in $Scenarios) {
         if ($socket) { $socket.Dispose() }
         if (!$server.HasExited) { $server.Kill(); $server.WaitForExit() }
         $text = $output.GetAwaiter().GetResult() + $errors.GetAwaiter().GetResult()
-        ($text -split "`n" | Where-Object { $_ -match 'Encoder|Capturando|erro|Error|aviso' } | Select-Object -First 6) | ForEach-Object { "  | $_" }
+        ($text -split "`n" | Where-Object { $_ -match 'Encoder|Captura|erro|Error|aviso' } | Select-Object -First 6) | ForEach-Object { "  | $_" }
         $server.Dispose()
     }
 }

@@ -82,6 +82,11 @@ struct Args {
     #[arg(long)]
     monitor_handle: Option<u64>,
 
+    /// Windows: API de captura. "auto" usa a Windows Graphics Capture quando o
+    /// monitor está em HDR (a DXGI deixaria a imagem lavada) e a DXGI no resto.
+    #[arg(long, default_value = "auto", value_parser = ["auto", "dxgi", "wgc"])]
+    capture_api: String,
+
     /// Linux: ignora a tela salva e abre o seletor de novo.
     #[arg(long)]
     choose: bool,
@@ -124,6 +129,8 @@ struct App {
     viewers: viewers::Registry,
     bitrate: AtomicU32,
     shutdown: tokio::sync::watch::Sender<bool>,
+    #[cfg(target_os = "windows")]
+    capture_api: String,
     /// Sessão do portal da tela em uso (trocada pelo comando `screen`).
     #[cfg(target_os = "linux")]
     capture: std::sync::Mutex<Option<capture::portal::Capture>>,
@@ -148,6 +155,7 @@ async fn main() -> Result<()> {
         encoder: args.encoder.clone(),
         monitor: args.monitor,
         monitor_handle: args.monitor_handle,
+        capture_api: args.capture_api.clone(),
     };
     let encoder = capture::pick_encoder(settings.encoder.as_deref())?;
 
@@ -228,6 +236,8 @@ async fn main() -> Result<()> {
         shutdown: tokio::sync::watch::channel(false).0,
         #[cfg(target_os = "linux")]
         capture: std::sync::Mutex::new(_capture),
+        #[cfg(target_os = "windows")]
+        capture_api: args.capture_api.clone(),
     });
     schedule_idle_stop(app.clone(), generation);
 
@@ -521,7 +531,12 @@ fn switch_screen(app: &Arc<App>, _rt: &tokio::runtime::Handle, arg: &str) {
         println!("uso: screen <monitor-handle>");
         return;
     };
-    match app.streamer.replace_screen(|screen| screen.set_property("monitor-handle", handle)) {
+    // Cada monitor pode estar ou não em HDR: a API de captura é escolhida de novo.
+    let api = capture::capture_api(&app.capture_api, Some(handle), 0);
+    match app.streamer.replace_screen(|screen| {
+        screen.set_property("monitor-handle", handle);
+        screen.set_property_from_str("capture-api", api);
+    }) {
         Ok(()) => println!("@screen switched"),
         Err(e) => {
             println!("@screen cancelled");

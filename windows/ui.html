@@ -106,7 +106,7 @@
   .switch input:focus-visible + span { outline: 2px solid var(--accent); outline-offset: 2px; }
   .select svg { position: absolute; right: 12px; top: 10px; pointer-events: none; color: var(--muted); }
   .note { font-size: 12px; color: var(--muted); }
-  .seg { display: grid; grid-template-columns: repeat(4, 1fr); padding: 3px; gap: 3px; border-radius: 9px;
+  .seg { display: grid; grid-template-columns: repeat(5, 1fr); padding: 3px; gap: 3px; border-radius: 9px;
     background: var(--surface-2); border: 1px solid var(--border); }
   .seg button { height: 32px; border: 0; border-radius: 6px; background: transparent; cursor: pointer;
     color: var(--muted); font-weight: 600; font-size: 13px; transition: background .15s, color .15s; }
@@ -311,6 +311,7 @@ const isVoice = (name) => VOICE.some((v) => name.toLowerCase().includes(v));
 
 const state = {
   running: false, starting: false, link: '', monitors: [], monitor: 0, quality: 2, audio: true, public: true,
+  auto: true, autoNow: null, // qualidade automática e o que ela escolheu agora
   choices: {}, viewers: [], blocked: [], liveApps: [], log: [],
   version: '', update: null, // {version, page, progress (null|-1|0..100), error}
 };
@@ -324,15 +325,16 @@ function onMessage(msg) {
     case 'init':
       state.version = msg.version || '';
       Object.assign(state, { monitors: msg.monitors, monitor: msg.monitor ?? 0, quality: msg.quality ?? 2,
-        audio: msg.audio !== false, public: msg.public !== false, choices: msg.apps || {} });
+        audio: msg.audio !== false, public: msg.public !== false, choices: msg.apps || {}, auto: msg.auto !== false });
       break;
     case 'state':
       state.running = msg.running; state.starting = msg.running && !msg.link; state.link = msg.link || '';
-      if (!msg.running) { state.viewers = []; state.blocked = []; state.liveApps = []; }
+      if (!msg.running) { state.viewers = []; state.blocked = []; state.liveApps = []; state.autoNow = null; }
       break;
     case 'viewers': state.viewers = msg.data; break;
     case 'blocked': state.blocked = msg.data; break;
     case 'apps': state.liveApps = msg.data; break;
+    case 'quality': state.autoNow = msg.data.auto ? msg.data : null; break;
     case 'log':
       state.log.push(msg.text); if (state.log.length > 300) state.log.shift();
       $('log').textContent = state.log.join('\n'); $('log').scrollTop = $('log').scrollHeight;
@@ -352,7 +354,7 @@ $('main-btn').onclick = () => {
   if (state.running) return send('stop');
   const q = QUALITIES[state.quality];
   state.starting = true; render();
-  send('start', state.monitor, q.kbps, q.fps, state.audio ? 1 : 0, state.public ? 1 : 0);
+  send('start', state.monitor, q.kbps, q.fps, state.audio ? 1 : 0, state.public ? 1 : 0, state.auto ? 1 : 0);
 };
 $('copy-btn').onclick = () => send('copy');
 $('release-btn').onclick = () => send('release');
@@ -369,8 +371,14 @@ $('monitor').onchange = (e) => {
 };
 $('audio').onchange = (e) => { state.audio = e.target.checked; send('save', 'audio', state.audio ? 1 : 0); render(); };
 $('public').onchange = (e) => { state.public = e.target.checked; send('save', 'publico', state.public ? 1 : 0); render(); };
+function setAuto() {
+  state.auto = true; send('save', 'auto', 1);
+  if (state.running) send('send', 'quality auto');
+  render();
+}
 function setQuality(i) {
-  state.quality = i; send('save', 'qualidade', i);
+  state.quality = i; state.auto = false; state.autoNow = null;
+  send('save', 'qualidade', i); send('save', 'auto', 0);
   if (state.running) send('send', `quality ${QUALITIES[i].kbps} ${QUALITIES[i].fps}`);
   render();
 }
@@ -443,10 +451,14 @@ function render() {
   if (select.dataset.options !== options) { select.innerHTML = options; select.dataset.options = options; }
   select.value = String(state.monitor);
 
-  $('quality').innerHTML = QUALITIES.map((q, i) =>
-    `<button aria-pressed="${i === state.quality}" data-i="${i}">${q.name}</button>`).join('');
-  $('quality').querySelectorAll('button').forEach((b) => b.onclick = () => setQuality(Number(b.dataset.i)));
-  $('quality-note').textContent = `${QUALITIES[state.quality].note}. Cada pessoa usa isso do seu upload${state.running ? '; muda na hora' : ''}.`;
+  $('quality').innerHTML = `<button aria-pressed="${state.auto}" data-i="auto" title="Ajusta sozinha">Auto</button>` +
+    QUALITIES.map((q, i) => `<button aria-pressed="${!state.auto && i === state.quality}" data-i="${i}">${q.name}</button>`).join('');
+  $('quality').querySelectorAll('button').forEach((b) => b.onclick = () => b.dataset.i === 'auto' ? setAuto() : setQuality(Number(b.dataset.i)));
+  const now = state.autoNow;
+  $('quality-note').textContent = !state.auto
+    ? `${QUALITIES[state.quality].note}. Cada pessoa usa isso do seu upload${state.running ? '; muda na hora' : ''}.`
+    : now ? `Automática: agora ${(now.kbps / 1000).toFixed(1).replace('.', ',')} Mbps · ${now.fps} fps — ${now.reason}.`
+    : 'Automática: ajusta sozinha pela rede de quem assiste, pelo seu encoder (GPU ou CPU) e pelo uso do PC.';
 
   // Som e link só mudam com a transmissão parada.
   for (const [id, row] of [['audio', 'audio-row'], ['public', 'public-row']]) {
@@ -510,7 +522,7 @@ function demo(parts) {
 }
 if (!host) {
   onMessage({ type: 'init', version: '0.2.0', monitors: [{ label: 'Monitor 1 (2560 × 1440)', primary: true }, { label: 'Monitor 2 (1920 × 1080)' }],
-    monitor: 0, quality: 2, audio: true, public: true, apps: { spotify: false } });
+    monitor: 0, quality: 2, audio: true, public: true, auto: true, apps: { spotify: false } });
   if (new URLSearchParams(location.search).get('demo') === 'live') {
     const now = Date.now() / 1000;
     onMessage({ type: 'state', running: true, link: 'https://bright-river-sample.trycloudflare.com/?k=Ab12Cd34Ef56' });
@@ -518,6 +530,7 @@ if (!host) {
       { id: 3, name: 'Ana Souza', device: 'Chrome · Windows', ip: '189.40.12.7', since: now - 760 },
       { id: 5, name: 'Bia', device: 'Firefox · Linux', ip: '2804:14c::1b23', since: now - 95 },
       { id: 6, name: 'Carlos', device: 'Safari · iOS', ip: '177.22.8.140', since: now - 20 } ] });
+    onMessage({ type: 'quality', data: { auto: true, kbps: 9680, fps: 60, reason: 'rede com folga' } });
     onMessage({ type: 'update', version: '0.3.0', page: 'https://github.com/BrunoMano2004/telinha/releases' });
     onMessage({ type: 'blocked', data: [{ key: '0', name: 'Visitante', device: 'Edge · Windows', ip: '45.6.7.8' }] });
     onMessage({ type: 'apps', data: [{ name: 'Discord', on: false, voice: true }, { name: 'firefox', on: true, voice: false },

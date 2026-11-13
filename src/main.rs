@@ -3,6 +3,7 @@ mod audio;
 #[cfg(any(target_os = "windows", test))]
 mod audio_policy;
 mod audio_rules;
+mod auto_quality;
 mod viewers;
 #[cfg(target_os = "windows")]
 mod windows_audio;
@@ -60,6 +61,11 @@ struct Args {
     /// Quadros por segundo máximos.
     #[arg(short, long, default_value_t = 60)]
     fps: u32,
+
+    /// Qualidade automática: ajusta bitrate e fps ao vivo pela rede de quem
+    /// assiste, pelo encoder (GPU ou CPU) e pelo uso de CPU. Ignora -b/-f.
+    #[arg(long)]
+    auto_quality: bool,
 
     /// Perfil H.264: constrained-baseline (padrão, o único que o Firefox aceita
     /// no WebRTC), main ou high (só Chrome/Edge/Safari).
@@ -128,6 +134,10 @@ struct App {
     tunnel: bool,
     viewers: viewers::Registry,
     bitrate: AtomicU32,
+    /// Qualidade automática ligada (comando `quality auto`)?
+    auto: std::sync::atomic::AtomicBool,
+    /// Limites do automático para o encoder em uso.
+    limits: auto_quality::Limits,
     shutdown: tokio::sync::watch::Sender<bool>,
     #[cfg(target_os = "windows")]
     capture_api: String,
@@ -233,6 +243,8 @@ async fn main() -> Result<()> {
         tunnel: args.tunnel,
         viewers: viewers::Registry::default(),
         bitrate: AtomicU32::new(args.bitrate),
+        auto: std::sync::atomic::AtomicBool::new(args.auto_quality),
+        limits: auto_quality::limits_for(&encoder),
         shutdown: tokio::sync::watch::channel(false).0,
         #[cfg(target_os = "linux")]
         capture: std::sync::Mutex::new(_capture),
@@ -253,6 +265,7 @@ async fn main() -> Result<()> {
     println!("Assista em: {link}");
     app.viewers.emit_viewers();
     app.viewers.emit_blocked();
+    spawn_auto_quality(app.clone());
     spawn_console(app.clone(), tokio::runtime::Handle::current());
 
     let router = axum::Router::new()
@@ -435,23 +448,38 @@ fn spawn_console(app: Arc<App>, rt: tokio::runtime::Handle) {
             match cmd {
                 "q" => { app.shutdown.send_replace(true); break; }
                 "k" => app.streamer.request_keyframe(),
+                "stats" => {
+                    for stats in app.streamer.viewer_stats() {
+                        for (_, value) in stats.iter() {
+                            if let Ok(s) = value.get::<gst::Structure>() {
+                                println!("{s}");
+                            }
+                        }
+                    }
+                }
                 "s" => println!(
                     "{} espectador(es) · {} kbps · até {} fps",
                     app.streamer.viewer_count(),
                     app.bitrate.load(Ordering::Relaxed),
                     app.streamer.max_fps()
                 ),
+                "quality" if rest == "auto" => {
+                    app.auto.store(true, Ordering::Relaxed);
+                    println!("qualidade → automática");
+                }
                 "b" | "quality" => {
                     let mut parts = rest.split_whitespace().map(num);
                     let kbps = parts.next().flatten().map(|v| v as u32);
                     let fps = parts.next().flatten().map(|v| v as u32).unwrap_or(app.streamer.max_fps());
                     match kbps {
                         Some(kbps) if (500..=100_000).contains(&kbps) && (1..=240).contains(&fps) => {
+                            app.auto.store(false, Ordering::Relaxed);
                             app.bitrate.store(kbps, Ordering::Relaxed);
                             app.streamer.set_quality(kbps, fps);
+                            emit_quality(false, kbps, fps, "escolhida");
                             println!("qualidade → {kbps} kbps · até {fps} fps");
                         }
-                        _ => println!("uso: quality <kbps 500-100000> <fps 1-240>"),
+                        _ => println!("uso: quality auto | quality <kbps 500-100000> <fps 1-240>"),
                     }
                 }
                 "kick" | "block" => match num(rest) {
@@ -482,6 +510,62 @@ fn spawn_console(app: Arc<App>, rt: tokio::runtime::Handle) {
                 "screen" => switch_screen(&app, &rt, rest),
                 "" => {}
                 _ => println!("comandos: b · quality · kick · block · unblock · screen · app · s · q"),
+            }
+        }
+    });
+}
+
+/// `@quality {...}`: qualidade em uso e, no automático, o motivo da escolha.
+fn emit_quality(auto: bool, kbps: u32, fps: u32, reason: &str) {
+    println!("@quality {}", serde_json::json!({ "auto": auto, "kbps": kbps, "fps": fps, "reason": reason }));
+}
+
+/// Laço da qualidade automática: a cada 2 s mede a rede dos espectadores e o
+/// uso de CPU e deixa o `auto_quality::Controller` decidir.
+fn spawn_auto_quality(app: Arc<App>) {
+    tokio::spawn(async move {
+        let mut controller: Option<auto_quality::Controller> = None;
+        // Contadores do intervalo anterior por espectador (ssrc): pacotes e NACKs.
+        let mut previous: HashMap<u32, (u64, u32)> = HashMap::new();
+        let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1) as f64;
+        let mut last_cpu = (auto_quality::process_cpu_seconds(), std::time::Instant::now());
+        let mut ticker = tokio::time::interval(auto_quality::TICK);
+        loop {
+            ticker.tick().await;
+            let cpu_now = (auto_quality::process_cpu_seconds(), std::time::Instant::now());
+            let cpu = (cpu_now.0 - last_cpu.0) / cpu_now.1.duration_since(last_cpu.1).as_secs_f64().max(0.1) / cores;
+            last_cpu = cpu_now;
+            if !app.auto.load(Ordering::Relaxed) {
+                controller = None;
+                continue;
+            }
+            let controller = controller.get_or_insert_with(|| {
+                let c = auto_quality::Controller::new(app.limits);
+                let d = c.current();
+                app.bitrate.store(d.kbps, Ordering::Relaxed);
+                app.streamer.set_quality(d.kbps, d.fps);
+                emit_quality(true, d.kbps, d.fps, "começando pelo padrão do encoder");
+                c
+            });
+            let streamer_app = app.clone();
+            let network = tokio::task::spawn_blocking(move || streamer_app.streamer.viewer_network()).await.unwrap_or_default();
+            let mut sample = auto_quality::Sample { cpu, has_viewers: !network.is_empty(), ..Default::default() };
+            let mut seen = HashMap::new();
+            for (ssrc, loss, jitter, packets, nacks) in network {
+                // Pedidos de retransmissão no intervalo também contam como perda.
+                let (p0, n0) = previous.get(&ssrc).copied().unwrap_or((packets, nacks));
+                let sent = packets.saturating_sub(p0);
+                let nack_ratio = if sent > 0 { nacks.saturating_sub(n0) as f64 / sent as f64 } else { 0.0 };
+                sample.loss = sample.loss.max(loss).max(nack_ratio);
+                sample.jitter = sample.jitter.max(jitter);
+                seen.insert(ssrc, (packets, nacks));
+            }
+            previous = seen;
+            if let Some(d) = controller.step(sample) {
+                app.bitrate.store(d.kbps, Ordering::Relaxed);
+                app.streamer.set_quality(d.kbps, d.fps);
+                emit_quality(true, d.kbps, d.fps, d.reason);
+                println!("qualidade automática → {} kbps · até {} fps ({})", d.kbps, d.fps, d.reason);
             }
         }
     });

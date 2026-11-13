@@ -18,7 +18,11 @@ PageBase {
     // Relógio para o "há X min" de cada espectador.
     property real nowSec: Date.now() / 1000
 
+    // Primeiro item: automática; os outros seguem Telinha.qualities (índice - 1).
     readonly property list<MenuItem> qualityItems: [
+        MenuItem {
+            text: Tr.tr("Automatic")
+        },
         MenuItem {
             text: Telinha.qualities[0].name
         },
@@ -208,10 +212,23 @@ PageBase {
             first: true
             last: true
             label: Tr.tr("Video quality")
-            subtext: Telinha.currentQuality.detail + " · " + Tr.tr("each viewer uses this much upload; applies live")
+            subtext: {
+                if (!Telinha.autoQuality)
+                    return Telinha.currentQuality.detail + " · " + Tr.tr("each viewer uses this much upload; applies live");
+                const now = Telinha.autoNow;
+                if (!now)
+                    return Tr.tr("Adjusts live to the viewers' network, your encoder and CPU use");
+                return Tr.tr("Now %1 Mbps · %2 fps · %3").arg((now.kbps / 1000).toFixed(1)).arg(now.fps).arg(now.reason);
+            }
             menuItems: root.qualityItems
-            active: root.qualityItems[Telinha.quality] ?? root.qualityItems[2]
-            onSelected: item => Telinha.setQuality(root.qualityItems.indexOf(item))
+            active: Telinha.autoQuality ? root.qualityItems[0] : (root.qualityItems[Telinha.quality + 1] ?? root.qualityItems[0])
+            onSelected: item => {
+                const index = root.qualityItems.indexOf(item);
+                if (index === 0)
+                    Telinha.setAutoQuality();
+                else
+                    Telinha.setQuality(index - 1);
+            }
         }
 
         // Som

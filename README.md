@@ -112,7 +112,12 @@ configurações do Caelestia (Nexus), com tudo o que dá para mudar, quase tudo 
   pelo link) e **bloquear** (aquele navegador e IP não entram mais). O navegador não
   revela o nome do computador, então quem abre o link digita um nome, que fica salvo.
 - **Trocar tela**: abre o seletor de novo sem derrubar ninguém.
-- **Qualidade**: Leve (3 Mbps/30 fps), Equilibrada, Alta e Máxima (20 Mbps).
+- **Qualidade**: **Automática** (padrão) ou fixa: Leve (3 Mbps/30 fps), Equilibrada,
+  Alta e Máxima (20 Mbps). A automática olha a cada 2 s a rede de quem assiste
+  (perda de pacotes, retransmissões e atraso), o encoder (GPU aguenta até 20 Mbps/60 fps;
+  CPU, 8 Mbps/30 fps) e o uso de CPU do telinha: cai rápido quando a rede aperta e sobe
+  aos poucos quando sobra. Como o vídeo é codificado uma vez, vale o espectador com a
+  pior conexão.
 - **Som**: quais apps entram na transmissão.
 
 No Windows, as mesmas opções ficam na janela do app (o monitor pode ser trocado
@@ -140,6 +145,8 @@ tela cheia, e **S** mostra as estatísticas (fps, bitrate, RTT, buffer e decodif
 | `--bind <ip>` / `-p, --port` | IP do Tailscale / 8080 | |
 | `--test` | | Transmite um padrão de teste em vez da tela |
 | `--tunnel` | | Link público pela Cloudflare (veja abaixo) |
+| `--auto-quality` | | Qualidade automática (ignora `-b`/`-f`) |
+| `--capture-api <api>` | `auto` | Windows: `auto` usa a Windows Graphics Capture com HDR ligado, `dxgi`/`wgc` forçam |
 | `-a, --audio` | | Transmite também o som dos apps (veja abaixo) |
 | `--audio-include` / `--audio-exclude` | | Apps a incluir/excluir do som, por nome |
 
@@ -148,14 +155,14 @@ controlam o telinha):
 
 | Comando | |
 |---|---|
-| `quality <kbps> <fps>` | Muda a qualidade ao vivo (`b <kbps>` só o bitrate) |
+| `quality <kbps> <fps>` · `quality auto` | Muda a qualidade ao vivo (`b <kbps>` só o bitrate) |
 | `kick <id>` · `block <id>` · `unblock <chave>` | Expulsa, bloqueia ou desbloqueia |
 | `screen` | Linux: abre o seletor e troca a tela; Windows: `screen <monitor-handle>` |
 | `app on\|off <nome>` | Liga ou desliga o som de um app |
 | `k` · `s` · `q` | Keyframe, status, sair |
 
 Eventos na saída, uma linha JSON cada: `@viewers [...]`, `@blocked [...]`,
-`@apps [...]` e `@screen switched|cancelled`.
+`@apps [...]`, `@quality {...}` e `@screen switched|cancelled`.
 
 ### Link público (qualquer pessoa, sem Tailscale)
 

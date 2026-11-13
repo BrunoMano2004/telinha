@@ -25,6 +25,10 @@ Singleton {
     // Preferências (salvas em ~/.local/state/caelestia/telinha.json).
     property bool audio: true
     property int quality: 2
+    // Qualidade automática: o telinha ajusta bitrate e fps pela rede de quem
+    // assiste, pelo encoder e pelo uso de CPU. autoNow = o que ele escolheu agora.
+    property bool autoQuality: true
+    property var autoNow: null
     property var appChoices: ({}) // nome em minúsculas → entra no som?
 
     readonly property list<var> qualities: [
@@ -56,6 +60,7 @@ Singleton {
         viewers = [];
         blocked = [];
         liveApps = [];
+        autoNow = null;
         switchingScreen = false;
         proc.running = true;
     }
@@ -97,8 +102,16 @@ Singleton {
 
     function setQuality(index: int): void {
         quality = index;
+        autoQuality = false;
+        autoNow = null;
         save();
         send(`quality ${currentQuality.kbps} ${currentQuality.fps}`);
+    }
+
+    function setAutoQuality(): void {
+        autoQuality = true;
+        save();
+        send("quality auto");
     }
 
     function setAudio(value: bool): void {
@@ -118,6 +131,7 @@ Singleton {
         settings.setText(JSON.stringify({
             audio: audio,
             quality: quality,
+            auto: autoQuality,
             apps: appChoices
         }));
     }
@@ -135,7 +149,11 @@ Singleton {
         // Usa o telinha do PATH (pacote do AUR) ou o de ~/.local/bin (./install.sh).
         // O exec mantém o PID, então parar o processo ainda manda o SIGTERM ao telinha.
         command: {
-            const args = ["sh", "-c", 'exec "$(command -v telinha || echo "$HOME/.local/bin/telinha")" "$@"', "telinha", "--tunnel", "--bitrate", String(root.currentQuality.kbps), "--fps", String(root.currentQuality.fps)];
+            const args = ["sh", "-c", 'exec "$(command -v telinha || echo "$HOME/.local/bin/telinha")" "$@"', "telinha", "--tunnel"];
+            if (root.autoQuality)
+                args.push("--auto-quality");
+            else
+                args.push("--bitrate", String(root.currentQuality.kbps), "--fps", String(root.currentQuality.fps));
             if (root.audio) {
                 args.push("--audio");
                 const include = root.choiceArgs(true);
@@ -170,6 +188,8 @@ Singleton {
                         root.blocked = data;
                     else if (event[1] === "apps")
                         root.liveApps = data;
+                    else if (event[1] === "quality")
+                        root.autoNow = data.auto ? data : null;
                     return;
                 }
                 const link = line.match(/^Assista em: (\S+)/);
@@ -195,6 +215,7 @@ Singleton {
             root.url = "";
             root.viewers = [];
             root.liveApps = [];
+            root.autoNow = null;
             root.switchingScreen = false;
         }
     }
@@ -210,6 +231,7 @@ Singleton {
                 root.audio = data.audio !== false;
                 if (Number.isInteger(data.quality) && data.quality >= 0 && data.quality < root.qualities.length)
                     root.quality = data.quality;
+                root.autoQuality = data.auto !== false;
                 if (data.apps && typeof data.apps === "object")
                     root.appChoices = data.apps;
             } catch (e) {}

@@ -58,6 +58,7 @@ static void ReleaseWebView();
 static std::map<std::wstring, bool> appChoices;
 // Última qualidade escolhida (para o "Iniciar" pela bandeja).
 static int lastKbps = 12000, lastFps = 60;
+static bool lastAuto = true;
 // Mensagens para a interface vindas de outras threads (atualização).
 static std::vector<std::wstring> pendingJson;
 // Atualização disponível (preenchida pela verificação em segundo plano).
@@ -152,6 +153,7 @@ static void LoadSettings() {
     static const int kbps[] = { 3000, 6000, 12000, 20000 }, fps[] = { 30, 60, 60, 60 };
     int quality = IniInt(L"qualidade", 2);
     if (quality >= 0 && quality < 4) { lastKbps = kbps[quality]; lastFps = fps[quality]; }
+    lastAuto = IniInt(L"auto", 1) != 0;
 }
 
 // --- Ponte com a interface
@@ -184,6 +186,7 @@ static void PostInit() {
     if (monitor < 0 || monitor >= (int)monitors.size()) monitor = primaryMonitor;
     Post(L"{\"type\":\"init\",\"version\":" + JsonText(Utf8(TELINHA_VERSION)) + L",\"monitors\":" + list + L",\"monitor\":" + std::to_wstring(monitor) +
         L",\"quality\":" + std::to_wstring(IniInt(L"qualidade", 2)) +
+        L",\"auto\":" + (IniInt(L"auto", 1) ? L"true" : L"false") +
         L",\"audio\":" + (IniInt(L"audio", 1) ? L"true" : L"false") +
         L",\"public\":" + (IniInt(L"publico", 1) ? L"true" : L"false") +
         L",\"apps\":" + apps + L"}");
@@ -265,13 +268,14 @@ static std::wstring ChoiceList(bool on) {
     }
     return list;
 }
-static void Start(int monitor, int kbps, int fps, bool audio, bool isPublic) {
+static void Start(int monitor, int kbps, int fps, bool audio, bool isPublic, bool autoQuality) {
     if (child || monitors.empty()) return;
     if (monitor < 0 || monitor >= (int)monitors.size()) monitor = primaryMonitor;
     lastKbps = kbps; lastFps = fps;
     std::wstring args = Quote(folder + L"\\telinha.exe") + L" --monitor-handle " +
         std::to_wstring((unsigned long long)(UINT_PTR)monitors[monitor]) +
-        L" --bitrate " + std::to_wstring(kbps) + L" --fps " + std::to_wstring(fps);
+        (autoQuality ? std::wstring(L" --auto-quality")
+            : L" --bitrate " + std::to_wstring(kbps) + L" --fps " + std::to_wstring(fps));
     if (audio) {
         args += L" --audio";
         std::wstring include = ChoiceList(true), exclude = ChoiceList(false);
@@ -350,6 +354,7 @@ static void HandleLine(const std::wstring& line) {
     }
     if (event(L"blocked", data)) { lastBlocked = data; Post(L"{\"type\":\"blocked\",\"data\":" + data + L"}"); return; }
     if (event(L"apps", data)) { lastApps = data; Post(L"{\"type\":\"apps\",\"data\":" + data + L"}"); return; }
+    if (event(L"quality", data)) { Post(L"{\"type\":\"quality\",\"data\":" + data + L"}"); return; }
     if (event(L"screen", data)) { Post(L"{\"type\":\"screen\",\"state\":" + JsonText(data) + L"}"); return; }
     logLines.push_back(line);
     if (logLines.size() > 300) logLines.erase(logLines.begin());
@@ -372,7 +377,8 @@ static void HandleUi(const std::wstring& message) {
         IniSet(L"geral", L"monitor", arg(1));
         IniSet(L"geral", L"audio", arg(4));
         IniSet(L"geral", L"publico", arg(5));
-        Start(_wtoi(arg(1).c_str()), _wtoi(arg(2).c_str()), _wtoi(arg(3).c_str()), arg(4) == L"1", arg(5) == L"1");
+        IniSet(L"geral", L"auto", arg(6) == L"1" ? L"1" : L"0");
+        Start(_wtoi(arg(1).c_str()), _wtoi(arg(2).c_str()), _wtoi(arg(3).c_str()), arg(4) == L"1", arg(5) == L"1", arg(6) == L"1");
     }
     else if (cmd == L"stop") Stop();
     else if (cmd == L"copy") CopyLink();
@@ -394,9 +400,9 @@ static void HandleUi(const std::wstring& message) {
         std::lock_guard<std::mutex> lock(updateMutex);
         if (!available.page.empty()) ShellExecuteW(window, L"open", available.page.c_str(), NULL, NULL, SW_SHOWNORMAL);
     }
-    else if (cmd == L"save" && (arg(1) == L"monitor" || arg(1) == L"qualidade" || arg(1) == L"audio" || arg(1) == L"publico")) {
+    else if (cmd == L"save" && (arg(1) == L"monitor" || arg(1) == L"qualidade" || arg(1) == L"audio" || arg(1) == L"publico" || arg(1) == L"auto")) {
         IniSet(L"geral", arg(1), arg(2));
-        if (arg(1) == L"qualidade") LoadSettings();
+        if (arg(1) == L"qualidade" || arg(1) == L"auto") LoadSettings();
     }
 }
 
@@ -717,7 +723,7 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp
         case ID_OPEN: Show(); break;
         case ID_START: {
             int monitor = IniInt(L"monitor", primaryMonitor);
-            Start(monitor, lastKbps, lastFps, IniInt(L"audio", 1) != 0, IniInt(L"publico", 1) != 0);
+            Start(monitor, lastKbps, lastFps, IniInt(L"audio", 1) != 0, IniInt(L"publico", 1) != 0, lastAuto);
             break;
         }
         case ID_STOP: Stop(); break;

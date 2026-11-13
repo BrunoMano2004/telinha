@@ -343,6 +343,55 @@ impl Streamer {
         idle
     }
 
+    /// Rede de cada espectador, do vídeo: (ssrc, fração perdida, jitter em s,
+    /// pacotes enviados, pedidos de retransmissão), dos relatórios RTCP.
+    pub fn viewer_network(&self) -> Vec<(u32, f64, f64, u64, u32)> {
+        let mut out = Vec::new();
+        for stats in self.viewer_stats() {
+            let mut remote = None;
+            let mut sent = None;
+            for (_, value) in stats.iter() {
+                let Ok(s) = value.get::<gst::Structure>() else { continue };
+                if s.get::<&str>("kind").ok() != Some("video") {
+                    continue;
+                }
+                match s.get::<gst_webrtc::WebRTCStatsType>("type") {
+                    Ok(gst_webrtc::WebRTCStatsType::RemoteInboundRtp) => {
+                        remote = Some((s.get::<f64>("fraction-lost").unwrap_or(0.0), s.get::<f64>("jitter").unwrap_or(0.0)))
+                    }
+                    Ok(gst_webrtc::WebRTCStatsType::OutboundRtp) => {
+                        sent = Some((
+                            s.get::<u32>("ssrc").unwrap_or(0),
+                            s.get::<u64>("packets-sent").unwrap_or(0),
+                            s.get::<u32>("nack-count").unwrap_or(0),
+                        ))
+                    }
+                    _ => {}
+                }
+            }
+            if let (Some((loss, jitter)), Some((ssrc, packets, nacks))) = (remote, sent) {
+                out.push((ssrc, loss, jitter, packets, nacks));
+            }
+        }
+        out
+    }
+
+    /// Estatísticas WebRTC de cada espectador (resposta do `get-stats`).
+    pub fn viewer_stats(&self) -> Vec<gst::Structure> {
+        let webrtcs: Vec<gst::Element> = self.state.lock().unwrap().viewers.values().map(|v| v.webrtc.clone()).collect();
+        webrtcs
+            .iter()
+            .filter_map(|webrtc| {
+                let promise = gst::Promise::new();
+                webrtc.emit_by_name::<()>("get-stats", &[&None::<gst::Pad>, &promise]);
+                match promise.wait() {
+                    gst::PromiseResult::Replied => promise.get_reply().map(|r| r.to_owned()),
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+
     /// Pede um keyframe (IDR) ao encoder — usado quando alguém entra.
     pub fn request_keyframe(&self) {
         let event = gst_video::UpstreamForceKeyUnitEvent::builder().all_headers(true).build();

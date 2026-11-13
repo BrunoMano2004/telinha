@@ -21,9 +21,11 @@ $encoders = @('nvd3d11h264enc', 'qsvh264enc', 'amfh264enc', 'mfh264enc', 'x264en
     & gst-inspect-1.0.exe $_ *> $null; $LASTEXITCODE -eq 0
 }
 "Encoders disponíveis: $($encoders -join ', ')"
-$paths = @{
-    'GPU (d3d11convert)' = 'd3d11upload ! d3d11convert ! video/x-raw(memory:D3D11Memory),format=NV12'
-    'CPU (videoconvert)' = 'videoconvert ! video/x-raw,format=NV12'
+# Os mesmos caminhos do app (src/capture.rs, windows_convert): a captura chega
+# em memória D3D11; encoders sem entrada D3D11 recebem o quadro baixado da GPU.
+$paths = [ordered]@{
+    'D3D11 -> encoder' = 'd3d11upload ! d3d11convert ! video/x-raw(memory:D3D11Memory),format=NV12'
+    'D3D11 -> download -> CPU' = 'd3d11upload ! d3d11download ! videoconvert ! video/x-raw,format=NV12'
 }
 foreach ($encoder in $encoders) {
     foreach ($path in $paths.GetEnumerator()) {
@@ -33,7 +35,7 @@ foreach ($encoder in $encoders) {
             Remove-Item (Join-Path $work "$encoder-$pattern-*.png") -ErrorAction SilentlyContinue
             $log = & gst-launch-1.0.exe -v videotestsrc num-buffers=10 pattern=$pattern `
                 '!' 'video/x-raw,format=BGRA,width=640,height=360,framerate=30/1' '!' ($path.Value -split ' ') `
-                '!' $encoder '!' h264parse '!' avdec_h264 '!' videoconvert '!' 'video/x-raw,format=BGRA' `
+                '!' $encoder '!' h264parse '!' avdec_h264 '!' videoconvert '!' 'video/x-raw,format=RGB' `
                 '!' pngenc '!' multifilesink "location=$out" 2>&1
             $last = Get-ChildItem (Join-Path $work "$encoder-$pattern-*.png") -ErrorAction SilentlyContinue | Sort-Object LastWriteTime | Select-Object -Last 1
             if (!$last) { "  $pattern : falhou ($((($log | Select-String 'ERROR|erro' | Select-Object -First 1)) -replace '\s+', ' '))"; break }

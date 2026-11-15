@@ -17,6 +17,8 @@ pub struct Hello {
     pub name: String,
     pub device: String,
     pub client: String,
+    /// A página pediu o modo túnel (a conexão direta não fechou).
+    pub tunnel: bool,
 }
 
 impl Hello {
@@ -36,6 +38,7 @@ impl Hello {
             name: if name.is_empty() { "Anônimo".into() } else { name },
             device: field("device", 60),
             client,
+            tunnel: v["mode"] == "tunnel",
         })
     }
 }
@@ -188,7 +191,7 @@ mod tests {
     use super::*;
 
     fn hello(client: &str) -> Hello {
-        Hello { name: "Ana".into(), device: "Firefox · Linux".into(), client: client.into() }
+        Hello { name: "Ana".into(), device: "Firefox · Linux".into(), client: client.into(), tunnel: false }
     }
 
     #[test]

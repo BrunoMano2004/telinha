@@ -10,7 +10,11 @@
   :root { color-scheme: dark; }
   html, body { margin: 0; height: 100%; background: #000; overflow: hidden;
     font: 13px/1.4 system-ui, sans-serif; color: #e6e6e6; }
-  video { width: 100vw; height: 100vh; object-fit: contain; display: block; background: #000; }
+  video, canvas { width: 100vw; height: 100vh; object-fit: contain; display: block; background: #000; }
+  canvas[hidden], video[hidden] { display: none; }
+  #mode { padding: 6px 10px; border-radius: 6px; background: rgba(30,30,30,.85); border: 1px solid #3a3a3a;
+    color: #b8b8b8; font-size: 12px; }
+  #mode[hidden] { display: none; }
   #status { position: fixed; inset: 0; display: grid; place-items: center; pointer-events: none;
     font-size: 15px; color: #9a9a9a; }
   #status:empty { display: none; }
@@ -43,6 +47,8 @@
 </head>
 <body>
 <video id="video" autoplay playsinline muted></video>
+<!-- Modo túnel: o vídeo é decodificado com WebCodecs e desenhado aqui. -->
+<canvas id="canvas" hidden></canvas>
 <div id="status"></div>
 <pre id="stats"></pre>
 <form id="join" class="overlay">
@@ -62,6 +68,7 @@
   </div>
 </div>
 <div id="bar">
+  <span id="mode" hidden title="A conexão direta não fechou nesta rede; o vídeo vem pela Cloudflare, com um pouco mais de atraso">pelo túnel</span>
   <button id="btn-sound" title="Som (M)" hidden>Ativar som</button>
   <input id="volume" type="range" min="0" max="1" step="0.05" title="Volume (↑/↓)" aria-label="Volume" hidden>
   <button id="btn-stats" title="Estatísticas (S)">Estatísticas</button>
@@ -108,6 +115,7 @@ let viewerName = '';
 // Expulso ou bloqueado: para de reconectar e mostra o aviso.
 function ended(text, canRejoin) {
   if (activePc) { activePc.close(); activePc = null; }
+  if (tunnel) tunnel.close();
   video.srcObject = null;
   setStatus('');
   document.getElementById('ended-text').textContent = text;
@@ -133,6 +141,7 @@ function candidateKind(line) {
 }
 
 function connect() {
+  if (tunnelMode) return connectTunnel();
   // Variáveis locais: handlers de uma tentativa antiga nunca mexem na nova.
   const prevPc = activePc;
   let done = false;
@@ -176,6 +185,12 @@ function connect() {
     if (pc !== activePc) {
       pc.close();
       failedAttempts++;
+    }
+    // Duas tentativas diretas sem vídeo: passa a receber pelo túnel da Cloudflare.
+    if (failedAttempts >= 2 && !activePc && remote && tunnelSupported()) {
+      tunnelMode = true;
+      setTimeout(connectTunnel, 0);
+      return;
     }
     setStatus(failedAttempts >= 2 && !activePc ? BLOCKED_TEXT : text);
     setTimeout(connect, delay);
@@ -267,7 +282,234 @@ function connect() {
   ws.onclose = () => retry('Conexão perdida. Reconectando…');
 }
 
+// --- Modo túnel ---------------------------------------------------------------
+// Quando a conexão direta (WebRTC) não fecha, o vídeo H.264 e o áudio Opus já
+// codificados vêm pelo próprio WebSocket, que passa pela Cloudflare. Cada
+// mensagem binária: [tipo][pts em µs, u64][dados]; tipo 1 = quadro-chave,
+// 2 = quadro, 3 = áudio. Decodificação com WebCodecs; som pelo Web Audio.
+// "?tunel" no link força o modo túnel (para redes que sabidamente bloqueiam).
+let tunnelMode = new URLSearchParams(location.search).has('tunel'), tunnel = null, audioCtx = null;
+const canvas = document.getElementById('canvas');
+const tunnelSupported = () => 'VideoDecoder' in window && 'EncodedVideoChunk' in window;
+
+// Tipos de NAL de um quadro Annex B (diagnóstico): 1 = fatia, 5 = IDR, 6 = SEI, 7 = SPS, 8 = PPS, 9 = AUD.
+function nalTypes(data) {
+  const types = [];
+  for (let i = 0; i + 3 < data.length && types.length < 8; i++) {
+    if (data[i] === 0 && data[i + 1] === 0 && (data[i + 2] === 1 || (data[i + 2] === 0 && data[i + 3] === 1))) {
+      const at = data[i + 2] === 1 ? i + 3 : i + 4;
+      types.push(data[at] & 0x1f);
+      i = at;
+    }
+  }
+  return types;
+}
+
+// Limpa um quadro Annex B: tira o delimitador (AUD) e mantém só a primeira
+// cópia de SPS/PPS (o encoder e o h264parse podem repetir; o Firefox recusa).
+function cleanAccessUnit(data) {
+  const units = [];
+  let start = -1;
+  for (let i = 0; i + 2 < data.length; i++) {
+    if (data[i] === 0 && data[i + 1] === 0 && data[i + 2] === 1) {
+      if (start >= 0) units.push(data.subarray(start, i > 0 && data[i - 1] === 0 ? i - 1 : i));
+      start = i + 3;
+      i += 2;
+    }
+  }
+  if (start >= 0) units.push(data.subarray(start));
+  const seen = new Set();
+  const kept = units.filter((u) => {
+    const type = u[0] & 0x1f;
+    if (type === 9) return false;
+    if (type === 7 || type === 8) {
+      if (seen.has(type)) return false;
+      seen.add(type);
+    }
+    return u.length > 0;
+  });
+  const out = new Uint8Array(kept.reduce((n, u) => n + 4 + u.length, 0));
+  let at = 0;
+  for (const u of kept) { out.set([0, 0, 0, 1], at); out.set(u, at + 4); at += 4 + u.length; }
+  return out;
+}
+
+async function pickVideoCodec() {
+  const forced = new URLSearchParams(location.search).get('codec');
+  if (forced) return forced;
+  // H.264 constrained baseline; o nível só limita a resolução declarada.
+  for (const codec of ['avc1.42E034', 'avc1.42E02A', 'avc1.42E01F']) {
+    try {
+      if ((await VideoDecoder.isConfigSupported({ codec, optimizeForLatency: true })).supported) return codec;
+    } catch {}
+  }
+  return null;
+}
+
+function connectTunnel() {
+  const ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws${location.search}`);
+  ws.binaryType = 'arraybuffer';
+  const ctx2d = canvas.getContext('2d');
+  const log = (text) => {
+    if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'log', text: String(text).slice(0, 500) }));
+  };
+  const state = { ws, closed: false, decoder: null, audio: null, playhead: 0, waitingKey: true, shown: false,
+    frames: 0, bytes: 0, skipped: 0, codec: '' };
+  tunnel = state;
+  let stopped = false;
+  state.close = () => {
+    state.closed = true;
+    ws.onclose = null;
+    try { ws.close(); } catch {}
+    try { state.decoder?.close(); } catch {}
+    try { state.audio?.close(); } catch {}
+  };
+  const stop = (text, canRejoin) => { stopped = true; state.close(); ended(text, canRejoin); };
+  if (!state.shown) setStatus('Conectando pelo túnel…');
+  document.getElementById('mode').hidden = false;
+
+  const newDecoder = () => new VideoDecoder({
+    output: (frame) => {
+      if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
+        canvas.width = frame.displayWidth;
+        canvas.height = frame.displayHeight;
+      }
+      ctx2d.drawImage(frame, 0, 0);
+      frame.close();
+      state.frames++;
+      if (!state.shown) {
+        state.shown = true;
+        video.hidden = true;
+        canvas.hidden = false;
+        setStatus('');
+        log(`reproduzindo pelo túnel ${canvas.width}x${canvas.height} (${state.codec})`);
+      }
+    },
+    error: (err) => {
+      log(`erro no decodificador (quadro ${state.chunks}, ${state.lastKind}, NALs ${state.lastNals}): ${err.message}`);
+      state.waitingKey = true;
+      state.decoder = null;
+    },
+  });
+
+  const onVideo = (key, ts, data) => {
+    if (!state.decoder || state.decoder.state === 'closed') {
+      if (!state.codec) return;
+      state.decoder = newDecoder();
+      state.decoder.configure({ codec: state.codec, optimizeForLatency: true });
+      state.waitingKey = true;
+    }
+    // Computador sem fôlego para decodificar: pula até o próximo quadro-chave.
+    if (state.decoder.decodeQueueSize > 8) state.waitingKey = true;
+    if (state.waitingKey && !key) {
+      state.skipped++;
+      // O telinha só gera quadro-chave quando alguém pede: pede (no máximo 1/s).
+      const now = performance.now();
+      if (!state.lastKeyRequest || now - state.lastKeyRequest > 1000) {
+        state.lastKeyRequest = now;
+        if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'keyframe' }));
+      }
+      return;
+    }
+    data = cleanAccessUnit(data);
+    state.waitingKey = false;
+    state.chunks = (state.chunks || 0) + 1;
+    state.lastKind = key ? 'chave' : 'delta';
+    state.lastNals = nalTypes(data).join(',');
+    state.decoder.decode(new EncodedVideoChunk({ type: key ? 'key' : 'delta', timestamp: ts, data }));
+  };
+
+  const onAudio = (ts, data) => {
+    if (!audioCtx || !('AudioDecoder' in window)) return;
+    if (!state.audio) {
+      const gain = audioCtx.createGain();
+      gain.connect(audioCtx.destination);
+      state.gain = gain;
+      state.audio = new AudioDecoder({
+        output: (audioData) => {
+          const buffer = audioCtx.createBuffer(audioData.numberOfChannels, audioData.numberOfFrames, audioData.sampleRate);
+          for (let ch = 0; ch < audioData.numberOfChannels; ch++) {
+            const plane = new Float32Array(audioData.numberOfFrames);
+            audioData.copyTo(plane, { planeIndex: ch, format: 'f32-planar' });
+            buffer.copyToChannel(plane, ch);
+          }
+          audioData.close();
+          // Pequena reserva (80 ms) contra engasgos; se acumular atraso, recomeça.
+          const now = audioCtx.currentTime;
+          if (state.playhead < now + 0.02 || state.playhead > now + 0.4) state.playhead = now + 0.08;
+          const source = audioCtx.createBufferSource();
+          source.buffer = buffer;
+          source.connect(state.gain);
+          source.start(state.playhead);
+          state.playhead += buffer.duration;
+        },
+        error: (err) => { log(`erro no áudio: ${err.message}`); state.audio = null; },
+      });
+      state.audio.configure({ codec: 'opus', sampleRate: 48000, numberOfChannels: 2 });
+      soundBtn.hidden = false;
+      volumeEl.hidden = false;
+      applyTunnelVolume();
+      updateSound();
+    }
+    if (state.audio.state === 'configured') state.audio.decode(new EncodedAudioChunk({ type: 'key', timestamp: ts, data }));
+  };
+
+  ws.onopen = () => ws.send(JSON.stringify({ type: 'hello', name: viewerName, device: deviceName(), client: clientId, mode: 'tunnel' }));
+  ws.onmessage = async (e) => {
+    if (typeof e.data === 'string') {
+      const msg = JSON.parse(e.data);
+      if (msg.type === 'tunnel') {
+        state.codec = await pickVideoCodec();
+        log(`modo túnel · ${navigator.userAgent} · codec ${state.codec || 'nenhum H.264 suportado'}`);
+        if (!state.codec) setStatus('Este navegador não decodifica H.264 pelo WebCodecs. Tente o Chrome, o Edge ou o Firefox atualizado.');
+      } else if (msg.type === 'full') {
+        setStatus('A transmissão está cheia. Tentando de novo em instantes…');
+      } else if (msg.type === 'kicked') {
+        stop('Você foi removido da transmissão.', true);
+      } else if (msg.type === 'blocked') {
+        stop('Quem está transmitindo bloqueou você.', false);
+      }
+      return;
+    }
+    const view = new DataView(e.data);
+    const kind = view.getUint8(0);
+    const ts = Number(view.getBigUint64(1));
+    const data = new Uint8Array(e.data, 9);
+    state.bytes += e.data.byteLength;
+    if (kind === 3) onAudio(ts, data);
+    else onVideo(kind === 1, ts, data);
+  };
+  ws.onclose = () => {
+    state.close();
+    if (stopped) return;
+    if (!state.shown) setStatus('Conexão pelo túnel perdida. Reconectando…');
+    setTimeout(connectTunnel, 2000);
+  };
+}
+
+// No túnel o som sai pelo Web Audio; o <video> (escondido) continua sendo a
+// referência de volume e mudo, então os mesmos controles servem.
+function applyTunnelVolume() {
+  if (tunnel?.gain) tunnel.gain.gain.value = video.muted ? 0 : video.volume;
+}
+video.addEventListener('volumechange', applyTunnelVolume);
+
+function tunnelStats() {
+  const now = performance.now();
+  const t = tunnel;
+  const kbps = last ? ((t.bytes - last.bytes) * 8 / (now - last.t)).toFixed(0) : '–';
+  const fps = last?.frames !== undefined ? ((t.frames - last.frames) * 1000 / (now - last.t)).toFixed(0) : '–';
+  last = { bytes: t.bytes, frames: t.frames, t: now };
+  statsEl.textContent =
+    `modo        túnel (pela Cloudflare)\n` +
+    `resolução   ${canvas.width}x${canvas.height} @ ${fps} fps\n` +
+    `bitrate     ${kbps} kbps\n` +
+    `decodific.  ${t.codec || '–'} · fila ${t.decoder?.decodeQueueSize ?? 0}\n` +
+    `pulados     ${t.skipped} quadros`;
+}
+
 async function updateStats() {
+  if (tunnel && !tunnel.closed) return tunnelStats();
   const pc = activePc;
   if (!pc || pc.connectionState !== 'connected') return;
   const report = await pc.getStats();
@@ -334,6 +576,7 @@ soundBtn.onclick = toggleSound;
 document.getElementById('btn-stats').onclick = toggleStats;
 document.getElementById('btn-full').onclick = toggleFull;
 video.ondblclick = toggleFull;
+canvas.ondblclick = toggleFull;
 document.onkeydown = (e) => {
   // No campo de nome as teclas são texto; no controle de volume as setas já são dele.
   if (e.target instanceof HTMLInputElement && e.target.type !== 'range') return;
@@ -354,11 +597,14 @@ document.getElementById('join').onsubmit = (e) => {
   store('telinha-name', viewerName);
   document.getElementById('join').hidden = true;
   video.muted = false;
+  // Criado no clique: o navegador só deixa tocar som depois de um gesto (modo túnel).
+  try { audioCtx = new AudioContext({ latencyHint: 'interactive' }); } catch {}
   connect();
 };
 document.getElementById('rejoin').onclick = () => {
   document.getElementById('ended').hidden = true;
   video.muted = false;
+  audioCtx?.resume();
   connect();
 };
 </script>

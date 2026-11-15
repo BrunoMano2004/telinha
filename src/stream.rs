@@ -27,6 +27,8 @@ pub enum Signal {
     },
     /// Diagnóstico enviado pela página; só é impresso.
     Log { text: String },
+    /// Modo túnel: a página precisa de um quadro-chave para (re)começar.
+    Keyframe,
     /// Outras mensagens da página (ex.: um "hello" repetido) são ignoradas.
     #[serde(other)]
     Other,
@@ -34,7 +36,8 @@ pub enum Signal {
 
 struct Viewer {
     bin: gst::Bin,
-    webrtc: gst::Element,
+    /// `None` no modo túnel (vídeo e áudio pelo WebSocket, sem WebRTC).
+    webrtc: Option<gst::Element>,
     /// Um pad de cada tee (vídeo, áudio) ligado a este espectador.
     tee_pads: Vec<(gst::Element, gst::Pad)>,
 }
@@ -60,6 +63,9 @@ pub struct Streamer {
     teardown: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
     /// Limite de quadros por segundo antes do encoder, ajustável ao vivo.
     max_fps: Arc<AtomicU32>,
+    /// Quadros de vídeo enviados/descartados no modo túnel.
+    tunnel_sent: Arc<std::sync::atomic::AtomicU64>,
+    tunnel_dropped: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Streamer {
@@ -115,6 +121,8 @@ impl Streamer {
             state: Mutex::new(State::default()),
             teardown: Arc::new(Mutex::new(Vec::new())),
             max_fps,
+            tunnel_sent: Arc::default(),
+            tunnel_dropped: Arc::default(),
             pipeline,
         })
     }
@@ -262,7 +270,7 @@ impl Streamer {
         }
 
         let mut state = self.state.lock().unwrap();
-        state.viewers.insert(id, Viewer { bin, webrtc, tee_pads });
+        state.viewers.insert(id, Viewer { bin, webrtc: Some(webrtc), tee_pads });
         for valve in &self.valves {
             valve.set_property("drop", false);
         }
@@ -272,12 +280,129 @@ impl Streamer {
         Ok(())
     }
 
+    /// Espectador pelo túnel: quando a conexão direta (WebRTC) não fecha, o
+    /// vídeo e o áudio já codificados vão pelo próprio WebSocket, que passa pela
+    /// Cloudflare. Cada mensagem binária é [tipo][pts em µs, u64][dados]:
+    /// tipo 1 = quadro-chave H.264, 2 = quadro H.264, 3 = pacote Opus.
+    /// Se a conexão da pessoa não der conta (fila cheia), descarta até o
+    /// próximo quadro-chave e pede um novo: a imagem pula, mas não corrompe.
+    pub fn add_tunnel_viewer(&self, id: u64, tx: tokio::sync::mpsc::Sender<Vec<u8>>) -> Result<()> {
+        self.start()?;
+        let bin = gst::Bin::with_name(&format!("tunnel-{id}"));
+        let mut ghosts = Vec::new();
+        for (i, tee) in self.tees.iter().enumerate() {
+            let description = if i == 0 {
+                "queue leaky=downstream max-size-buffers=0 max-size-bytes=0 max-size-time=200000000 \
+                 ! rtph264depay ! h264parse config-interval=-1 \
+                 ! video/x-h264,stream-format=byte-stream,alignment=au \
+                 ! fakesink name=out signal-handoffs=true sync=false async=false"
+            } else {
+                "queue leaky=downstream max-size-buffers=0 max-size-bytes=0 max-size-time=200000000 \
+                 ! rtpopusdepay ! fakesink name=out signal-handoffs=true sync=false async=false"
+            };
+            let branch = gst::parse::bin_from_description(description, false)?;
+            let out = branch.by_name("out").unwrap();
+            out.set_property("name", format!("out{i}"));
+            let queue_sink = branch.iterate_sorted().into_iter().flatten().last()
+                .and_then(|first| first.static_pad("sink"))
+                .context("ramo do túnel sem entrada")?;
+            let ghost = gst::GhostPad::builder_with_target(&queue_sink)?.name(format!("sink_{i}")).build();
+            branch.add_pad(&ghost)?;
+            bin.add(&branch)?;
+            let outer = gst::GhostPad::builder_with_target(&ghost)?.name(format!("sink_{i}")).build();
+            bin.add_pad(&outer)?;
+            ghosts.push((tee.clone(), outer));
+
+            let tx = tx.clone();
+            let video = i == 0;
+            let need_key = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let (sent, dropped, encoder) = (self.tunnel_sent.clone(), self.tunnel_dropped.clone(), self.encoder.clone());
+            let last_request = Mutex::new(std::time::Instant::now() - std::time::Duration::from_secs(10));
+            out.connect("handoff", false, move |values| {
+                let Ok(buffer) = values[1].get::<gst::Buffer>() else { return None };
+                let key = video && !buffer.flags().contains(gst::BufferFlags::DELTA_UNIT);
+                let request_key = || {
+                    let mut last = last_request.lock().unwrap();
+                    if last.elapsed() > std::time::Duration::from_millis(500) {
+                        *last = std::time::Instant::now();
+                        let event = gst_video::UpstreamForceKeyUnitEvent::builder().all_headers(true).build();
+                        encoder.static_pad("src").unwrap().send_event(event);
+                    }
+                };
+                if video && !key && need_key.load(Ordering::Relaxed) {
+                    dropped.fetch_add(1, Ordering::Relaxed);
+                    request_key();
+                    return None;
+                }
+                let Ok(map) = buffer.map_readable() else { return None };
+                let pts = buffer.pts().map(|t| t.useconds()).unwrap_or(0);
+                let mut message = Vec::with_capacity(9 + map.len());
+                message.push(if !video { 3 } else if key { 1 } else { 2 });
+                message.extend_from_slice(&pts.to_be_bytes());
+                message.extend_from_slice(&map);
+                match tx.try_send(message) {
+                    Ok(()) => {
+                        sent.fetch_add(1, Ordering::Relaxed);
+                        if key {
+                            need_key.store(false, Ordering::Relaxed);
+                        }
+                    }
+                    Err(_) if video => {
+                        // Sem espaço: descarta até o próximo quadro-chave.
+                        dropped.fetch_add(1, Ordering::Relaxed);
+                        need_key.store(true, Ordering::Relaxed);
+                        request_key();
+                    }
+                    Err(_) => {}
+                }
+                None
+            });
+        }
+
+        self.pipeline.add(&bin)?;
+        bin.sync_state_with_parent()?;
+        let mut tee_pads = Vec::new();
+        for (tee, ghost) in ghosts {
+            let tee_pad = tee.request_pad_simple("src_%u").unwrap();
+            tee_pad.link(&ghost)?;
+            tee_pads.push((tee, tee_pad));
+        }
+        let mut state = self.state.lock().unwrap();
+        state.viewers.insert(id, Viewer { bin, webrtc: None, tee_pads });
+        for valve in &self.valves {
+            valve.set_property("drop", false);
+        }
+        drop(state);
+        self.request_keyframe();
+        Ok(())
+    }
+
+    /// Quadros de vídeo enviados e descartados pelo túnel, desde o início
+    /// (a qualidade automática usa a proporção de descartes como "perda").
+    pub fn tunnel_counters(&self) -> (u64, u64) {
+        (self.tunnel_sent.load(Ordering::Relaxed), self.tunnel_dropped.load(Ordering::Relaxed))
+    }
+
+    pub fn tunnel_viewer_count(&self) -> usize {
+        self.state.lock().unwrap().viewers.values().filter(|v| v.webrtc.is_none()).count()
+    }
+
     pub fn handle_message(&self, id: u64, text: &str) -> Result<()> {
         let webrtc = match self.state.lock().unwrap().viewers.get(&id) {
             Some(v) => v.webrtc.clone(),
             None => bail!("espectador desconhecido"),
         };
-        match serde_json::from_str::<Signal>(text)? {
+        let signal = serde_json::from_str::<Signal>(text)?;
+        // No modo túnel só os diagnósticos da página interessam.
+        let Some(webrtc) = webrtc else {
+            match signal {
+                Signal::Log { text } => println!("  #{id} {text}"),
+                Signal::Keyframe => self.request_keyframe(),
+                _ => {}
+            }
+            return Ok(());
+        };
+        match signal {
             Signal::Answer { sdp } => {
                 let sdp = gst_sdp::SDPMessage::parse_buffer(sdp.as_bytes())?;
                 let answer = gst_webrtc::WebRTCSessionDescription::new(gst_webrtc::WebRTCSDPType::Answer, sdp);
@@ -292,7 +417,7 @@ impl Streamer {
                 }
             }
             Signal::Log { text } => println!("  #{id} {text}"),
-            Signal::Other => {}
+            Signal::Keyframe | Signal::Other => {}
             Signal::Offer { .. } => bail!("o servidor é quem envia a oferta"),
         }
         Ok(())
@@ -378,7 +503,7 @@ impl Streamer {
 
     /// Estatísticas WebRTC de cada espectador (resposta do `get-stats`).
     pub fn viewer_stats(&self) -> Vec<gst::Structure> {
-        let webrtcs: Vec<gst::Element> = self.state.lock().unwrap().viewers.values().map(|v| v.webrtc.clone()).collect();
+        let webrtcs: Vec<gst::Element> = self.state.lock().unwrap().viewers.values().filter_map(|v| v.webrtc.clone()).collect();
         webrtcs
             .iter()
             .filter_map(|webrtc| {

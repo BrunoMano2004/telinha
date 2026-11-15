@@ -527,6 +527,7 @@ fn spawn_auto_quality(app: Arc<App>) {
         let mut controller: Option<auto_quality::Controller> = None;
         // Contadores do intervalo anterior por espectador (ssrc): pacotes e NACKs.
         let mut previous: HashMap<u32, (u64, u32)> = HashMap::new();
+        let mut tunnel_last = app.streamer.tunnel_counters();
         let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1) as f64;
         let mut last_cpu = (auto_quality::process_cpu_seconds(), std::time::Instant::now());
         let mut ticker = tokio::time::interval(auto_quality::TICK);
@@ -561,6 +562,17 @@ fn spawn_auto_quality(app: Arc<App>) {
                 seen.insert(ssrc, (packets, nacks));
             }
             previous = seen;
+            // Espectadores pelo túnel não mandam relatórios RTCP: a proporção de
+            // quadros descartados por fila cheia faz o papel da perda.
+            let (sent, dropped) = app.streamer.tunnel_counters();
+            let (ds, dd) = (sent.saturating_sub(tunnel_last.0), dropped.saturating_sub(tunnel_last.1));
+            tunnel_last = (sent, dropped);
+            if app.streamer.tunnel_viewer_count() > 0 {
+                sample.has_viewers = true;
+                if ds + dd > 0 {
+                    sample.loss = sample.loss.max(dd as f64 / (ds + dd) as f64);
+                }
+            }
             if let Some(d) = controller.step(sample) {
                 app.bitrate.store(d.kbps, Ordering::Relaxed);
                 app.streamer.set_quality(d.kbps, d.fps);
@@ -676,15 +688,27 @@ async fn handle_viewer(socket: WebSocket, ip: String, app: Arc<App>) {
     let id = app.next_id.fetch_add(1, Ordering::Relaxed);
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let notify = tx.clone();
-    if let Err(e) = app.streamer.add_viewer(id, tx) {
+    // Modo túnel: quadros binários com fila limitada (~2 s de vídeo); fila cheia
+    // = conexão lenta, e o streamer descarta até o próximo quadro-chave.
+    let (media_tx, mut media_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(300);
+    let tunnel = hello.tunnel;
+    let added = if tunnel {
+        let _ = notify.send(r#"{"type":"tunnel"}"#.into());
+        app.streamer.add_tunnel_viewer(id, media_tx)
+    } else {
+        drop(media_tx);
+        app.streamer.add_viewer(id, tx)
+    };
+    if let Err(e) = added {
         eprintln!("falha ao adicionar espectador: {e:#}");
         return;
     }
     let label = format!("{} · {}", hello.name, if hello.device.is_empty() { "?" } else { &hello.device });
     let mut removal = app.viewers.add(id, hello, ip.clone());
     println!(
-        "+ espectador #{id} {label}{} · total {}",
+        "+ espectador #{id} {label}{}{} · total {}",
         if ip.is_empty() { String::new() } else { format!(" ({ip})") },
+        if tunnel { " · pelo túnel" } else { "" },
         app.streamer.viewer_count()
     );
 
@@ -693,11 +717,16 @@ async fn handle_viewer(socket: WebSocket, ip: String, app: Arc<App>) {
     // O ping mantém o caminho vivo; o pong do navegador prova que ele segue lá.
     let mut sender = tokio::spawn(async move {
         let mut ping = tokio::time::interval(WS_PING_INTERVAL);
+        let mut media_open = true;
         loop {
             let msg = tokio::select! {
                 text = rx.recv() => match text {
                     Some(text) => Message::Text(text.into()),
                     None => break,
+                },
+                media = media_rx.recv(), if media_open => match media {
+                    Some(data) => Message::Binary(data.into()),
+                    None => { media_open = false; continue; }
                 },
                 _ = ping.tick() => Message::Ping(Default::default()),
             };

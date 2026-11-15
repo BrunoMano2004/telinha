@@ -180,9 +180,19 @@ e mostra um link `https://….trycloudflare.com/?k=…`. O card do Caelestia
 sempre usa esse modo. O túnel só existe enquanto a transmissão
 estiver rodando, e a chave `k` impede que alguém assista sem o link completo.
 
-O túnel leva só a página e a sinalização; o vídeo continua indo direto por WebRTC
-(o IP público é descoberto via STUN). Em redes que bloqueiam conexões diretas
-(algumas corporativas ou com NAT simétrico) o vídeo pode não conectar.
+Normalmente o vídeo vai direto entre as máquinas por WebRTC (o túnel leva só a
+página e a sinalização). Se a rede de um dos lados bloqueia conexões diretas
+(NAT restritivo, CGNAT da operadora, firewall), depois de duas tentativas a página
+passa sozinha para o **modo túnel**: o vídeo e o som, já codificados, vêm pelo próprio
+túnel da Cloudflare e são decodificados no navegador (WebCodecs: Chrome, Edge,
+Firefox e Safari recentes). Tem um pouco mais de atraso e aparece "pelo túnel" na
+barra. Se a conexão da pessoa não der conta, o telinha pula quadros até o próximo
+quadro-chave (a imagem não corrompe) e a qualidade automática baixa o bitrate.
+Para forçar o modo túnel, acrescente `&tunel` ao link.
+
+Na página **Screen share** do Caelestia (e em "Detalhes técnicos" no Windows) fica o
+log da transmissão, inclusive quais caminhos de rede o navegador de cada pessoa
+encontrou; o botão de copiar ajuda a investigar quando alguém não consegue assistir.
 
 ### Som
 

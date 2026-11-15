@@ -64,6 +64,86 @@ try {
         if (!$server.HasExited) { $server.Kill(); $server.WaitForExit() }
         $server.Dispose()
     }
+
+    # Jam: anfitrião + um convidado (--join) e um navegador simulado. A
+    # miniatura vem só com vídeo; a tela selecionada (camada alta), com som.
+    # Ao encerrar o anfitrião, o convidado sai sozinho ("a jam terminou").
+    function Start-Telinha([string]$arguments) {
+        $info = New-Object Diagnostics.ProcessStartInfo
+        $info.FileName = "$Package\telinha.exe"
+        $info.Arguments = $arguments
+        $info.UseShellExecute = $false
+        $info.CreateNoWindow = $true
+        $info.RedirectStandardInput = $true
+        return [Diagnostics.Process]::Start($info)
+    }
+    function Receive-Json($ws, $token) {
+        $buffer = New-Object byte[] 65536
+        $segment = New-Object 'ArraySegment[byte]' -ArgumentList @(,$buffer)
+        $text = ''
+        do {
+            $received = $ws.ReceiveAsync($segment, $token).GetAwaiter().GetResult()
+            $text += [Text.Encoding]::UTF8.GetString($buffer, 0, $received.Count)
+        } while (!$received.EndOfMessage)
+        if ($received.MessageType -ne [Net.WebSockets.WebSocketMessageType]::Text) { return $null }
+        return $text | ConvertFrom-Json
+    }
+    function Send-Json($ws, $token, [string]$json) {
+        $bytes = [Text.Encoding]::UTF8.GetBytes($json)
+        $segment = New-Object 'ArraySegment[byte]' -ArgumentList @(,$bytes)
+        $ws.SendAsync($segment, [Net.WebSockets.WebSocketMessageType]::Text, $true, $token).GetAwaiter().GetResult()
+    }
+    $jamHost = Start-Telinha '--jam --test --audio --encoder x264enc --bind 127.0.0.1 --port 18081 --name Anfitriao'
+    $guest = $null
+    $socket = New-Object Net.WebSockets.ClientWebSocket
+    $cancel = New-Object Threading.CancellationTokenSource
+    $cancel.CancelAfter(30000)
+    try {
+        $ready = $false
+        for ($i = 0; $i -lt 40; $i++) {
+            if ($jamHost.HasExited) { throw "Anfitriao da jam encerrou antes de iniciar ($($jamHost.ExitCode))." }
+            try {
+                $response = Invoke-WebRequest -UseBasicParsing 'http://127.0.0.1:18081' -TimeoutSec 1
+                if ($response.StatusCode -eq 200) { $ready = $true; break }
+            } catch { Start-Sleep -Milliseconds 250 }
+        }
+        if (!$ready) { throw 'A pagina da jam nao respondeu.' }
+        $guest = Start-Telinha '--join http://127.0.0.1:18081 --test --audio --encoder x264enc --name Convidado'
+        $socket.ConnectAsync([uri]'ws://127.0.0.1:18081/ws', $cancel.Token).GetAwaiter().GetResult()
+        Send-Json $socket $cancel.Token '{"type":"hello","name":"Smoke test","device":"CI","client":"smoke-jam"}'
+        # Espera a sala ter as duas telas.
+        $room = $null
+        while ($true) {
+            $msg = Receive-Json $socket $cancel.Token
+            if ($msg -and $msg.type -eq 'room' -and @($msg.presenters).Count -ge 2) { $room = $msg; break }
+        }
+        $hostId = (@($room.presenters) | Where-Object { $_.host }).id
+        $guestId = (@($room.presenters) | Where-Object { -not $_.host }).id
+        Send-Json $socket $cancel.Token "{""type"":""watch"",""sid"":1,""pub"":$guestId,""layer"":""low"",""mode"":""webrtc""}"
+        Send-Json $socket $cancel.Token "{""type"":""watch"",""sid"":2,""pub"":$hostId,""layer"":""high"",""mode"":""webrtc""}"
+        $offers = @{}
+        while ($offers.Count -lt 2) {
+            $msg = Receive-Json $socket $cancel.Token
+            if ($msg -and $msg.type -eq 'closed') { throw "Sessao $($msg.sid) recusada: $($msg.reason)" }
+            if ($msg -and $msg.type -eq 'signal' -and $msg.payload.type -eq 'offer') { $offers[[int]$msg.sid] = $msg.payload.sdp }
+        }
+        if ($offers[1] -notmatch 'm=video' -or $offers[1] -match 'm=audio') { throw 'Miniatura da jam deveria ter so video.' }
+        if ($offers[2] -notmatch 'm=video' -or $offers[2] -notmatch 'm=audio') { throw 'Tela selecionada da jam deveria ter video e som.' }
+        $jamHost.StandardInput.WriteLine('q')
+        if (!$jamHost.WaitForExit(5000)) { throw 'Anfitriao da jam nao encerrou pelo comando q.' }
+        if ($jamHost.ExitCode -ne 0) { throw "Anfitriao da jam falhou ($($jamHost.ExitCode))." }
+        if (!$guest.WaitForExit(8000)) { throw 'O convidado nao saiu quando a jam terminou.' }
+        if ($guest.ExitCode -ne 0) { throw "Convidado da jam falhou ($($guest.ExitCode))." }
+    } finally {
+        $socket.Dispose()
+        $cancel.Dispose()
+        foreach ($p in @($jamHost, $guest)) {
+            if ($p) {
+                if (!$p.HasExited) { $p.Kill(); $p.WaitForExit() }
+                $p.Dispose()
+            }
+        }
+    }
 } finally {
     Remove-Item $env:GST_REGISTRY_1_0 -Force -ErrorAction SilentlyContinue
 }

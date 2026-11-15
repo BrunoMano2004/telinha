@@ -154,6 +154,10 @@ tela cheia, e **S** mostra as estatísticas (fps, bitrate, RTT, buffer e decodif
 | `--capture-api <api>` | `auto` | Windows: `auto` usa a Windows Graphics Capture com HDR ligado, `dxgi`/`wgc` forçam |
 | `-a, --audio` | | Transmite também o som dos apps (veja abaixo) |
 | `--audio-include` / `--audio-exclude` | | Apps a incluir/excluir do som, por nome |
+| `--jam` | | Cria uma jam (veja abaixo) |
+| `--join <link>` | | Entra na jam do link e compartilha a sua tela nela |
+| `--name <nome>` | nome do PC | Seu nome na jam |
+| `--max-presenters <n>` | 5 | Jam: máximo de telas ao mesmo tempo |
 
 Comandos pelo stdin enquanto roda (é assim que o Caelestia e o app do Windows
 controlam o telinha):
@@ -164,10 +168,49 @@ controlam o telinha):
 | `kick <id>` · `block <id>` · `unblock <chave>` | Expulsa, bloqueia ou desbloqueia |
 | `screen` | Linux: abre o seletor e troca a tela; Windows: `screen <monitor-handle>` |
 | `app on\|off <nome>` | Liga ou desliga o som de um app |
+| `share on\|off` | Jam: retoma ou pausa a sua tela (sem sair) |
+| `stop-share <id>` · `lock on\|off` | Jam (anfitrião): para a tela de alguém · tranca a jam |
 | `k` · `s` · `q` | Keyframe, status, sair |
 
 Eventos na saída, uma linha JSON cada: `@viewers [...]`, `@blocked [...]`,
-`@apps [...]`, `@quality {...}` e `@screen switched|cancelled`.
+`@apps [...]`, `@quality {...}` e `@screen switched|cancelled`. Na jam também:
+`@jam {...}` (link e página), `@room {...}` (telas e quem vê o quê),
+`@share on|off` e `@jam-ended {...}`.
+
+### Jam: várias telas num link só
+
+Na jam, todo mundo que entra com o telinha compartilha a própria tela, e quem
+abre o link vê todas em grade. Clicar numa tela a mostra grande; **Ver só esta**
+(ou **V**) deixa só ela e para de receber as outras.
+
+```bash
+telinha --jam --tunnel                 # cria a jam (link público)
+telinha --join "https://….trycloudflare.com/?k=…"   # entra compartilhando a sua tela
+```
+
+No Caelestia: **Create jam** e **Join copied jam** no card. Para entrar, copie
+antes o link que receberam. No Windows, use o cartão **Jam** do app. A página da
+jam abre sozinha, sem a sua própria tela.
+
+- **Quem coordena é quem criou a jam**, mas ele não processa o vídeo dos outros: só
+  repassa a sinalização. O vídeo vai direto (WebRTC) de quem compartilha para
+  cada navegador. Cada PC codifica só a própria tela.
+- **Cada tela sai em duas versões**: uma miniatura (640×360, 15 fps, ~0,8 Mbps)
+  para a grade e a qualidade cheia para quem selecionou aquela tela. Cada versão
+  só é codificada se alguém estiver vendo.
+- **Som só da tela selecionada.** Na grade, nada toca, e o som nem é enviado. Ao
+  selecionar uma tela, toca só o som dela. Na página aberta pelo seu telinha, o
+  som começa desligado, para o som dos outros não voltar pela sua transmissão.
+- Quem entra (`--join`) **não abre porta nem túnel**: só conecta no link.
+  Linux e Windows entram na mesma jam.
+- Se a conexão direta não fecha, aquela tela passa pelo PC de quem criou a jam
+  (relé), sem decodificar nada.
+- Quem criou a jam pode parar a tela de alguém (`stop-share`), expulsar ou
+  bloquear (`kick`/`block`) e trancar a jam (`lock on`). Se quem criou sai, a jam
+  acaba para todos. Se a conexão de quem entrou cai, ele reconecta sozinho.
+
+Na página: **1–9** selecionam uma tela, **G** ou **Esc** voltam para a grade, **M**
+liga ou desliga o som, **S** mostra estatísticas por tela e **F** abre a tela cheia.
 
 ### Link público (qualquer pessoa, sem Tailscale)
 

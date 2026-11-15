@@ -4,6 +4,9 @@ mod audio;
 mod audio_policy;
 mod audio_rules;
 mod auto_quality;
+mod jam;
+mod publisher;
+mod room;
 mod viewers;
 #[cfg(target_os = "windows")]
 mod windows_audio;
@@ -26,17 +29,18 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use stream::Streamer;
+use stream::{Layer, Streamer};
 
 const VIEWER_PAGE: &str = include_str!("../web/index.html");
+const JAM_PAGE: &str = include_str!("../web/jam.html");
+const COMMON_JS: &str = include_str!("../web/common.js");
 const FAVICON_SVG: &str = include_str!("../assets/telinha.svg");
 const FAVICON_ICO: &[u8] = include_bytes!("../assets/telinha.ico");
 /// Tempo para a página se apresentar (nome, aparelho) antes de receber vídeo.
-const HELLO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+pub(crate) const HELLO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 const STUN_SERVER: &str = "stun://stun.l.google.com:19302";
-const IDLE_STOP_DELAY: std::time::Duration = std::time::Duration::from_secs(10);
-const WS_PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
-const WS_DEAD_AFTER: std::time::Duration = std::time::Duration::from_secs(45);
+pub(crate) const WS_PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+pub(crate) const WS_DEAD_AFTER: std::time::Duration = std::time::Duration::from_secs(45);
 
 /// Compartilhamento de tela leve e de baixa latência (WebRTC + encoder de hardware).
 #[derive(Parser)]
@@ -76,9 +80,26 @@ struct Args {
     #[arg(long)]
     encoder: Option<String>,
 
-    /// Número máximo de espectadores simultâneos.
-    #[arg(long, default_value_t = 4)]
-    max_viewers: usize,
+    /// Número máximo de espectadores simultâneos (padrão: 4; na jam, 12).
+    #[arg(long)]
+    max_viewers: Option<usize>,
+
+    /// Cria uma jam: todo mundo que entrar com o telinha (`--join`) compartilha
+    /// a própria tela, e o link mostra todas as telas.
+    #[arg(long)]
+    jam: bool,
+
+    /// Entra na jam deste link e compartilha a sua tela nela.
+    #[arg(long, value_name = "LINK")]
+    join: Option<String>,
+
+    /// Seu nome na jam (padrão: o nome do computador).
+    #[arg(long)]
+    name: Option<String>,
+
+    /// Jam: máximo de telas compartilhadas ao mesmo tempo (contando a sua).
+    #[arg(long, default_value_t = 5)]
+    max_presenters: usize,
 
     /// Monitor a capturar (Windows). No Linux a escolha é feita pelo seletor do sistema.
     #[arg(short, long, default_value_t = 0)]
@@ -123,8 +144,8 @@ struct Args {
     audio_include: Vec<String>,
 }
 
-struct App {
-    streamer: Streamer,
+pub(crate) struct App {
+    streamer: Arc<Streamer>,
     max_viewers: usize,
     next_id: AtomicU64,
     /// Chave exigida em `?k=` no modo túnel (o link *.trycloudflare.com é público).
@@ -132,13 +153,18 @@ struct App {
     /// Pelo túnel todo mundo chega de 127.0.0.1; o IP real vem do cabeçalho
     /// CF-Connecting-IP, que só é confiável nesse modo.
     tunnel: bool,
-    viewers: viewers::Registry,
+    pub(crate) viewers: viewers::Registry,
     bitrate: AtomicU32,
     /// Qualidade automática ligada (comando `quality auto`)?
     auto: std::sync::atomic::AtomicBool,
     /// Limites do automático para o encoder em uso.
     limits: auto_quality::Limits,
-    shutdown: tokio::sync::watch::Sender<bool>,
+    pub(crate) shutdown: tokio::sync::watch::Sender<bool>,
+    /// Jam, no anfitrião: a sala e o id da tela dele nela.
+    pub(crate) room: Option<Arc<room::Room>>,
+    local_presenter: Option<u64>,
+    /// Jam, em quem entrou com `--join`.
+    pub(crate) uplink: Option<Arc<jam::Uplink>>,
     #[cfg(target_os = "windows")]
     capture_api: String,
     /// Sessão do portal da tela em uso (trocada pelo comando `screen`).
@@ -156,7 +182,12 @@ async fn main() -> Result<()> {
         libc::mallopt(libc::M_ARENA_MAX, 2);
     }
     gst::init()?;
+    // TLS do `--join` (wss:// pelo túnel da Cloudflare).
+    let _ = rustls::crypto::ring::default_provider().install_default();
     audio_rules::init(&args.audio_exclude, &args.audio_include);
+    anyhow::ensure!(!(args.jam && args.join.is_some()), "use --jam (criar uma jam) ou --join <link> (entrar), não os dois");
+    let joining = args.join.clone();
+    let jam = args.jam || joining.is_some();
 
     let settings = capture::Settings {
         bitrate_kbps: args.bitrate,
@@ -166,28 +197,38 @@ async fn main() -> Result<()> {
         monitor: args.monitor,
         monitor_handle: args.monitor_handle,
         capture_api: args.capture_api.clone(),
+        thumbnail: jam,
     };
     let encoder = capture::pick_encoder(settings.encoder.as_deref())?;
+    // Na jam cada navegador é um participante; o padrão de 4 seria apertado.
+    let max_viewers = args.max_viewers.unwrap_or(if jam { 12 } else { 4 });
 
-    // Abre a porta antes de pedir a tela, para falhar cedo se ela estiver ocupada.
-    // No túnel o cloudflared faz o proxy para 127.0.0.1; não precisa escutar fora.
-    let (bind, host) = match (args.tunnel, args.bind) {
-        (true, bind) => (bind.unwrap_or(Ipv4Addr::LOCALHOST.into()), String::new()),
-        (false, bind) => resolve_bind(bind, args.require_tailscale).await?,
-    };
-    let addr = SocketAddr::new(bind, args.port);
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .with_context(|| format!("não foi possível escutar em {addr}"))?;
-    let key = args.tunnel.then(|| {
-        rand::rng().sample_iter(rand::distr::Alphanumeric).take(20).map(char::from).collect::<String>()
-    });
-    let (_tunnel, link) = match &key {
-        Some(key) => {
-            let (child, url) = start_tunnel(args.port).await?;
-            (Some(child), format!("{url}/?k={key}"))
-        }
-        None => (None, format!("http://{host}:{}", args.port)),
+    // Quem entra numa jam não escuta nada: só abre uma conexão de saída.
+    // Os outros abrem a porta antes de pedir a tela, para falhar cedo se ela
+    // estiver ocupada. No túnel o cloudflared faz o proxy para 127.0.0.1.
+    let (listener, key, _tunnel, link) = if let Some(join) = &joining {
+        jam::uplink_url(join)?;
+        (None, None, None, join.trim().to_string())
+    } else {
+        let (bind, host) = match (args.tunnel, args.bind) {
+            (true, bind) => (bind.unwrap_or(Ipv4Addr::LOCALHOST.into()), String::new()),
+            (false, bind) => resolve_bind(bind, args.require_tailscale).await?,
+        };
+        let addr = SocketAddr::new(bind, args.port);
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .with_context(|| format!("não foi possível escutar em {addr}"))?;
+        let key = args.tunnel.then(|| {
+            rand::rng().sample_iter(rand::distr::Alphanumeric).take(20).map(char::from).collect::<String>()
+        });
+        let (tunnel, link) = match &key {
+            Some(key) => {
+                let (child, url) = start_tunnel(args.port).await?;
+                (Some(child), format!("{url}/?k={key}"))
+            }
+            None => (None, format!("http://{host}:{}", args.port)),
+        };
+        (Some(listener), key, tunnel, link)
     };
 
     #[cfg(target_os = "linux")]
@@ -225,19 +266,30 @@ async fn main() -> Result<()> {
         Some(source) => format!("{description} {}", capture::audio_description(&source)),
         None => description,
     };
-    let streamer = Streamer::new(&description, args.tunnel.then(|| STUN_SERVER.to_string()), args.fps)?;
+    // STUN para quem está fora da tailnet descobrir nosso IP público: no túnel
+    // e quando a jam em que entramos é pelo link público (https).
+    let public = args.tunnel || joining.as_deref().is_some_and(|l| l.trim().starts_with("https://"));
+    let streamer = Arc::new(Streamer::new(&description, public.then(|| STUN_SERVER.to_string()), args.fps)?);
     #[cfg(target_os = "windows")]
     let _audio = if args.audio && !args.test {
         Some(windows_audio::start(&streamer.pipeline)?)
     } else { None };
     capture::configure_encoder(&streamer.encoder, &settings);
+    if let Some(low) = streamer.low_encoder() {
+        capture::configure_encoder(low, &capture::thumbnail_settings(&settings));
+    }
     watch_bus(&streamer.pipeline);
 
     // Liga uma vez para validar captura e encoder; sem espectadores, desliga sozinho.
     let generation = streamer.start()?;
+    // Id deste telinha na jam: a página aberta por ele (`?local=`) esconde a própria tela.
+    let client: String = rand::rng().sample_iter(rand::distr::Alphanumeric).take(16).map(char::from).collect();
+    let name = args.name.clone().unwrap_or_else(jam::default_name);
+    let publisher = Arc::new(publisher::Publisher::new(streamer.clone()));
+    let room = args.jam.then(|| Arc::new(room::Room::new(args.max_presenters, max_viewers)));
     let app = Arc::new(App {
         streamer,
-        max_viewers: args.max_viewers,
+        max_viewers,
         next_id: AtomicU64::new(1),
         key,
         tunnel: args.tunnel,
@@ -246,12 +298,15 @@ async fn main() -> Result<()> {
         auto: std::sync::atomic::AtomicBool::new(args.auto_quality),
         limits: auto_quality::limits_for(&encoder),
         shutdown: tokio::sync::watch::channel(false).0,
+        room: room.clone(),
+        local_presenter: room.as_ref().map(|r| r.next_id()),
+        uplink: joining.is_some().then(|| Arc::new(jam::Uplink::new(publisher.clone()))),
         #[cfg(target_os = "linux")]
         capture: std::sync::Mutex::new(_capture),
         #[cfg(target_os = "windows")]
         capture_api: args.capture_api.clone(),
     });
-    schedule_idle_stop(app.clone(), generation);
+    stream::schedule_idle_stop(app.streamer.clone(), generation);
 
     println!(
         "Encoder: {encoder} · {} kbps · até {} fps · {}",
@@ -262,27 +317,74 @@ async fn main() -> Result<()> {
     if args.tunnel {
         println!("Túnel ativo: o link abre para qualquer pessoa na internet");
     }
-    println!("Assista em: {link}");
+    if let (Some(room), Some(id)) = (&room, app.local_presenter) {
+        let info = room::PresenterInfo {
+            name: name.clone(),
+            os: jam::os_name().into(),
+            client: client.clone(),
+            audio: args.audio,
+            version: env!("CARGO_PKG_VERSION").into(),
+        };
+        room.add_presenter(id, info, room::Link::Local(publisher.clone()), true).map_err(anyhow::Error::msg)?;
+        let watch = jam::with_param(&link, "local", &client);
+        println!("Jam criada: quem tiver o telinha entra com `telinha --join {link}`");
+        println!("Link da jam (para assistir e para entrar): {link}");
+        println!("Sua página (sem a sua tela): {watch}");
+        println!("@jam {}", serde_json::json!({ "role": "host", "id": id, "link": link, "watch": watch }));
+    } else if joining.is_none() {
+        println!("Assista em: {link}");
+    }
     app.viewers.emit_viewers();
     app.viewers.emit_blocked();
     spawn_auto_quality(app.clone());
     spawn_console(app.clone(), tokio::runtime::Handle::current());
 
-    let router = axum::Router::new()
-        .route("/", get(viewer_page))
-        .route("/ws", get(ws_handler))
+    if let Some(join) = joining {
+        println!("Entrando na jam…");
+        let result = tokio::select! {
+            r = jam::run_uplink(app.clone(), join, name, client, args.audio) => r,
+            _ = shutdown_signal() => Ok(()),
+        };
+        app.shutdown.send_replace(true);
+        app.streamer.shutdown();
+        println!("\nEncerrado.");
+        // Sai já: o runtime do tokio esperaria para sempre por uma consulta de
+        // estatísticas (qualidade automática) presa num ramo já desmontado.
+        let code = match result {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("Error: {e:#}");
+                1
+            }
+        };
+        std::process::exit(code);
+    }
+
+    let mut router = axum::Router::new();
+    router = if app.room.is_some() {
+        router
+            .route("/", get(jam_page))
+            .route("/ws", get(jam_member_ws))
+            .route("/pub", get(jam_presenter_ws))
+    } else {
+        router.route("/", get(viewer_page)).route("/ws", get(ws_handler))
+    };
+    let router = router
+        .route("/common.js", get(|| async { ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8")], COMMON_JS) }))
         .route("/favicon.svg", get(|| async { ([(header::CONTENT_TYPE, "image/svg+xml")], FAVICON_SVG) }))
         .route("/favicon.ico", get(|| async { ([(header::CONTENT_TYPE, "image/x-icon")], FAVICON_ICO) }))
         .with_state(app.clone());
 
     let shutdown_app = app.clone();
     let mut shutdown_rx = app.shutdown.subscribe();
+    let listener = listener.expect("porta aberta");
     axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>())
         .with_graceful_shutdown(async move {
             tokio::select! {
                 _ = shutdown_signal() => {},
                 _ = shutdown_rx.wait_for(|stopping| *stopping) => {},
             }
+            // Na jam, cada conexão avisa que ela acabou ao ver este sinal.
             shutdown_app.shutdown.send_replace(true);
         })
         .await?;
@@ -402,15 +504,50 @@ async fn viewer_page(Query(query): Query<HashMap<String, String>>, State(app): S
     Html(VIEWER_PAGE).into_response()
 }
 
-/// Espera um pouco (cobre recarregar a página) e, se continuar sem ninguém,
-/// para captura e encoder — o processo volta a ~30 MB e ~0% de CPU.
-fn schedule_idle_stop(app: Arc<App>, generation: u64) {
-    tokio::spawn(async move {
-        tokio::time::sleep(IDLE_STOP_DELAY).await;
-        if app.streamer.stop_if_idle(generation) {
-            println!("ninguém assistindo · captura e encoder pausados");
-        }
-    });
+async fn jam_page(Query(query): Query<HashMap<String, String>>, State(app): State<Arc<App>>) -> Response {
+    if !authorized(&app, &query) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    Html(JAM_PAGE).into_response()
+}
+
+/// IP de quem conecta: pelo túnel todo mundo chega de 127.0.0.1, e o real vem
+/// do cabeçalho CF-Connecting-IP (só confiável nesse modo).
+fn client_ip(app: &App, peer: SocketAddr, headers: &HeaderMap) -> String {
+    let ip = if app.tunnel {
+        headers.get("cf-connecting-ip").and_then(|v| v.to_str().ok()).unwrap_or_default().trim().to_string()
+    } else {
+        peer.ip().to_string()
+    };
+    viewers::useful_ip(&ip)
+}
+
+async fn jam_member_ws(
+    ws: WebSocketUpgrade,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+    State(app): State<Arc<App>>,
+) -> Response {
+    if !authorized(&app, &query) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let ip = client_ip(&app, peer, &headers);
+    ws.on_upgrade(move |socket| jam::handle_member(socket, ip, app)).into_response()
+}
+
+async fn jam_presenter_ws(
+    ws: WebSocketUpgrade,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+    State(app): State<Arc<App>>,
+) -> Response {
+    if !authorized(&app, &query) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let ip = client_ip(&app, peer, &headers);
+    ws.on_upgrade(move |socket| jam::handle_presenter(socket, ip, app)).into_response()
 }
 
 fn watch_bus(pipeline: &gst::Pipeline) {
@@ -437,9 +574,18 @@ fn watch_bus(pipeline: &gst::Pipeline) {
 /// Comandos pelo stdin (terminal, card do Caelestia ou app do Windows):
 ///   q · k · s · b <kbps> · quality <kbps> <fps> · kick <id> · block <id>
 ///   unblock <chave> · screen [monitor] · app on|off <nome>
+///   jam: share on|off · stop-share <id> · lock on|off
 fn spawn_console(app: Arc<App>, rt: tokio::runtime::Handle) {
-    println!("Comandos: b <kbps> · quality <kbps> <fps> · kick/block <id> · screen · s · q (sair)");
+    if app.room.is_some() {
+        println!("Comandos: quality · kick/block <id> · stop-share <id> · lock on|off · share on|off · screen · s · q (sair)");
+    } else if app.uplink.is_some() {
+        println!("Comandos: quality · share on|off · screen · s · q (sair)");
+    } else {
+        println!("Comandos: b <kbps> · quality <kbps> <fps> · kick/block <id> · screen · s · q (sair)");
+    }
     std::thread::spawn(move || {
+        // Fechar sessões da jam agenda tarefas no tokio.
+        let _rt = rt.enter();
         for line in std::io::stdin().lines().map_while(Result::ok) {
             let line = line.trim();
             let (cmd, rest) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
@@ -508,8 +654,34 @@ fn spawn_console(app: Arc<App>, rt: tokio::runtime::Handle) {
                     _ => println!("uso: app on|off <nome>"),
                 },
                 "screen" => switch_screen(&app, &rt, rest),
+                "share" if rest == "on" || rest == "off" => {
+                    let on = rest == "on";
+                    if let Some(uplink) = &app.uplink {
+                        uplink.set_sharing(on);
+                    } else if let (Some(room), Some(id)) = (&app.room, app.local_presenter) {
+                        room.set_sharing(id, on);
+                        println!("@share {rest}");
+                    } else {
+                        println!("share só vale numa jam");
+                    }
+                }
+                "stop-share" => match (&app.room, num(rest)) {
+                    (Some(room), Some(id)) => {
+                        let name = room.presenter_name(id).unwrap_or_default();
+                        if room.stop_share(id) {
+                            println!("compartilhamento parado: #{id} {name}");
+                        } else {
+                            println!("tela #{id} não encontrada");
+                        }
+                    }
+                    _ => println!("uso (anfitrião da jam): stop-share <id>"),
+                },
+                "lock" if app.room.is_some() && (rest == "on" || rest == "off") => {
+                    app.room.as_ref().unwrap().set_locked(rest == "on");
+                    println!("jam {}", if rest == "on" { "trancada: ninguém novo entra" } else { "aberta" });
+                }
                 "" => {}
-                _ => println!("comandos: b · quality · kick · block · unblock · screen · app · s · q"),
+                _ => println!("comandos: b · quality · kick · block · unblock · screen · app · share · stop-share · lock · s · q"),
             }
         }
     });
@@ -651,12 +823,8 @@ async fn ws_handler(
     if !authorized(&app, &query) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let ip = if app.tunnel {
-        headers.get("cf-connecting-ip").and_then(|v| v.to_str().ok()).unwrap_or_default().trim().to_string()
-    } else {
-        peer.ip().to_string()
-    };
-    ws.on_upgrade(move |socket| handle_viewer(socket, viewers::useful_ip(&ip), app)).into_response()
+    let ip = client_ip(&app, peer, &headers);
+    ws.on_upgrade(move |socket| handle_viewer(socket, ip, app)).into_response()
 }
 
 async fn handle_viewer(socket: WebSocket, ip: String, app: Arc<App>) {
@@ -694,10 +862,10 @@ async fn handle_viewer(socket: WebSocket, ip: String, app: Arc<App>) {
     let tunnel = hello.tunnel;
     let added = if tunnel {
         let _ = notify.send(r#"{"type":"tunnel"}"#.into());
-        app.streamer.add_tunnel_viewer(id, media_tx)
+        app.streamer.add_tunnel_viewer(id, media_tx, Layer::High, Vec::new())
     } else {
         drop(media_tx);
-        app.streamer.add_viewer(id, tx)
+        app.streamer.add_viewer(id, tx, Layer::High)
     };
     if let Err(e) = added {
         eprintln!("falha ao adicionar espectador: {e:#}");
@@ -767,7 +935,7 @@ async fn handle_viewer(socket: WebSocket, ip: String, app: Arc<App>) {
     }
 
     if let Some(generation) = app.streamer.remove_viewer(id) {
-        schedule_idle_stop(app.clone(), generation);
+        stream::schedule_idle_stop(app.streamer.clone(), generation);
     }
     app.viewers.remove(id);
     // Sem remetentes, o envio termina depois de entregar o último aviso.

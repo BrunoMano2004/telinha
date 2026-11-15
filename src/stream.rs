@@ -1,6 +1,10 @@
 //! Lado WebRTC: um único pipeline codifica a tela (e o áudio, se ligado) uma
 //! vez e cada espectador recebe um webrtcbin com um `queue` pendurado em cada
 //! `tee` (vídeo e áudio).
+//!
+//! Na jam a tela sai em duas camadas: a alta (`tee`, com áudio) para quem
+//! selecionou esta tela e a miniatura (`ltee`, só vídeo) para a grade. Cada
+//! camada tem sua `valve`, aberta só enquanto alguém assiste àquela camada.
 
 use anyhow::{Context, Result, bail};
 use gstreamer as gst;
@@ -34,12 +38,35 @@ pub enum Signal {
     Other,
 }
 
+/// Camada de vídeo que um espectador recebe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Layer {
+    /// Qualidade cheia (a de sempre), com o som junto.
+    High,
+    /// Miniatura da grade da jam: ~640x360, poucos quadros e sem som.
+    Low,
+}
+
+/// Quadros por segundo da miniatura.
+pub const LOW_FPS: u32 = 15;
+/// Bitrate da miniatura (kbps).
+pub const LOW_KBPS: u32 = 800;
+
+/// Uma camada de vídeo do pipeline: portão, encoder e tee.
+struct VideoLayer {
+    tee: gst::Element,
+    valve: gst::Element,
+    encoder: gst::Element,
+}
+
 struct Viewer {
     bin: gst::Bin,
     /// `None` no modo túnel (vídeo e áudio pelo WebSocket, sem WebRTC).
     webrtc: Option<gst::Element>,
     /// Um pad de cada tee (vídeo, áudio) ligado a este espectador.
     tee_pads: Vec<(gst::Element, gst::Pad)>,
+    layer: Layer,
 }
 
 #[derive(Default)]
@@ -53,9 +80,12 @@ struct State {
 
 pub struct Streamer {
     pub pipeline: gst::Pipeline,
-    /// `tee` do vídeo e, com áudio ligado, `atee`.
-    tees: Vec<gst::Element>,
-    valves: Vec<gst::Element>,
+    /// Camada alta (`tee`/`valve`/`enc`).
+    high: VideoLayer,
+    /// Miniatura (`ltee`/`lvalve`/`lenc`), só no modo jam.
+    low: Option<VideoLayer>,
+    /// `atee` e `avalve`, com áudio ligado.
+    audio: Option<(gst::Element, gst::Element)>,
     pub encoder: gst::Element,
     /// Servidor STUN para quem está fora da tailnet descobrir nosso IP público.
     stun: Option<String>,
@@ -68,6 +98,42 @@ pub struct Streamer {
     tunnel_dropped: Arc<std::sync::atomic::AtomicU64>,
 }
 
+/// Sem ninguém assistindo, espera isto antes de parar captura e encoder.
+pub const IDLE_STOP_DELAY: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Espera um pouco (cobre recarregar a página) e, se continuar sem ninguém,
+/// para captura e encoder — o processo volta a ~30 MB e ~0% de CPU.
+pub fn schedule_idle_stop(streamer: Arc<Streamer>, generation: u64) {
+    tokio::spawn(async move {
+        tokio::time::sleep(IDLE_STOP_DELAY).await;
+        if streamer.stop_if_idle(generation) {
+            println!("ninguém assistindo · captura e encoder pausados");
+        }
+    });
+}
+
+/// Limite de fps por timestamp: a captura roda no máximo dela e aqui só
+/// descartamos quadros. Mudar o limite não renegocia formato nenhum
+/// (renegociar com o PipeWire já travou a captura antes).
+fn limit_fps(valve: &gst::Element, limit: Arc<AtomicU32>) {
+    let last = Mutex::new(None::<gst::ClockTime>);
+    valve.static_pad("sink").unwrap().add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+        let Some(pts) = info.buffer().and_then(|b| b.pts()) else { return gst::PadProbeReturn::Ok };
+        // 10% de folga para o jitter de quem entrega a ~60 Hz.
+        let min_gap = gst::ClockTime::SECOND.nseconds() * 9 / 10 / u64::from(limit.load(Ordering::Relaxed).max(1));
+        let mut last = last.lock().unwrap();
+        // Timestamp voltando = captura reiniciada ou trocada: recomeça a conta.
+        if let Some(prev) = *last
+            && pts > prev
+            && (pts - prev).nseconds() < min_gap
+        {
+            return gst::PadProbeReturn::Drop;
+        }
+        *last = Some(pts);
+        gst::PadProbeReturn::Ok
+    });
+}
+
 impl Streamer {
     pub fn new(description: &str, stun: Option<String>, fps: u32) -> Result<Self> {
         let pipeline = gst::parse::launch(description)
@@ -75,9 +141,14 @@ impl Streamer {
             .downcast::<gst::Pipeline>()
             .unwrap();
         let get = |name: &str| pipeline.by_name(name).expect("elemento nomeado no pipeline");
-        let audio = pipeline.by_name("atee").is_some();
-        let tees: Vec<_> = if audio { vec![get("tee"), get("atee")] } else { vec![get("tee")] };
-        let valves: Vec<_> = if audio { vec![get("valve"), get("avalve")] } else { vec![get("valve")] };
+        let high = VideoLayer { tee: get("tee"), valve: get("valve"), encoder: get("enc") };
+        let low = pipeline
+            .by_name("ltee")
+            .map(|tee| VideoLayer { tee, valve: get("lvalve"), encoder: get("lenc") });
+        let audio = pipeline.by_name("atee").map(|tee| (tee, get("avalve")));
+        let mut valves = vec![high.valve.clone()];
+        valves.extend(low.iter().map(|l| l.valve.clone()));
+        valves.extend(audio.iter().map(|(_, v)| v.clone()));
 
         // Cada webrtcbin novo manda RECONFIGURE rio acima. Se isso chega ao
         // pipewiresrc, ele renegocia o formato com o portal em loop e a captura
@@ -91,32 +162,17 @@ impl Streamer {
             });
         }
 
-        // Limite de fps por timestamp: a captura roda no máximo dela e aqui só
-        // descartamos quadros. Mudar o limite não renegocia formato nenhum
-        // (renegociar com o PipeWire já travou a captura antes).
         let max_fps = Arc::new(AtomicU32::new(fps.max(1)));
-        let limit = max_fps.clone();
-        let last = Mutex::new(None::<gst::ClockTime>);
-        valves[0].static_pad("sink").unwrap().add_probe(gst::PadProbeType::BUFFER, move |_, info| {
-            let Some(pts) = info.buffer().and_then(|b| b.pts()) else { return gst::PadProbeReturn::Ok };
-            // 10% de folga para o jitter de quem entrega a ~60 Hz.
-            let min_gap = gst::ClockTime::SECOND.nseconds() * 9 / 10 / u64::from(limit.load(Ordering::Relaxed).max(1));
-            let mut last = last.lock().unwrap();
-            // Timestamp voltando = captura reiniciada ou trocada: recomeça a conta.
-            if let Some(prev) = *last
-                && pts > prev
-                && (pts - prev).nseconds() < min_gap
-            {
-                return gst::PadProbeReturn::Drop;
-            }
-            *last = Some(pts);
-            gst::PadProbeReturn::Ok
-        });
+        limit_fps(&high.valve, max_fps.clone());
+        if let Some(low) = &low {
+            limit_fps(&low.valve, Arc::new(AtomicU32::new(LOW_FPS)));
+        }
 
         Ok(Self {
-            tees,
-            valves,
-            encoder: get("enc"),
+            encoder: high.encoder.clone(),
+            high,
+            low,
+            audio,
             stun,
             state: Mutex::new(State::default()),
             teardown: Arc::new(Mutex::new(Vec::new())),
@@ -159,11 +215,59 @@ impl Streamer {
         self.state.lock().unwrap().viewers.len()
     }
 
-    /// Aguarda a remoção dos ramos antes de encerrar o processo.
+    /// Camada que este pipeline realmente tem: sem miniatura (fora da jam),
+    /// todo mundo recebe a alta.
+    fn layer(&self, layer: Layer) -> Layer {
+        if self.low.is_some() { layer } else { Layer::High }
+    }
+
+    fn video(&self, layer: Layer) -> &VideoLayer {
+        match layer {
+            Layer::Low => self.low.as_ref().unwrap_or(&self.high),
+            Layer::High => &self.high,
+        }
+    }
+
+    /// Tees que alimentam um espectador da camada: o vídeo dela e, na alta, o
+    /// áudio (`true` = vídeo).
+    fn branch_tees(&self, layer: Layer) -> Vec<(gst::Element, bool)> {
+        let mut tees = vec![(self.video(layer).tee.clone(), true)];
+        if layer == Layer::High
+            && let Some((atee, _)) = &self.audio
+        {
+            tees.push((atee.clone(), false));
+        }
+        tees
+    }
+
+    /// Cada portão só fica aberto se alguém assiste àquela camada; o áudio
+    /// acompanha a camada alta.
+    fn update_valves(&self, state: &State) {
+        let watching = |layer| state.viewers.values().any(|v| v.layer == layer);
+        let high = watching(Layer::High);
+        self.high.valve.set_property("drop", !high);
+        if let Some(low) = &self.low {
+            low.valve.set_property("drop", !watching(Layer::Low));
+        }
+        if let Some((_, avalve)) = &self.audio {
+            avalve.set_property("drop", !high);
+        }
+    }
+
+    /// Aguarda a remoção dos ramos antes de encerrar o processo (até 3 s: um
+    /// ramo que não desmonta não pode prender a saída do programa).
     pub fn shutdown(&self) {
         let _ = self.pipeline.set_state(gst::State::Null);
         let workers: Vec<_> = self.teardown.lock().unwrap().drain(..).collect();
-        for worker in workers { let _ = worker.join(); }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        for worker in workers {
+            while !worker.is_finished() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            if worker.is_finished() {
+                let _ = worker.join();
+            }
+        }
     }
 
     /// Liga captura + encoder. Retorna a geração atual, usada por `stop_if_idle`.
@@ -194,7 +298,8 @@ impl Streamer {
         true
     }
 
-    pub fn add_viewer(&self, id: u64, tx: UnboundedSender<String>) -> Result<()> {
+    pub fn add_viewer(&self, id: u64, tx: UnboundedSender<String>, layer: Layer) -> Result<()> {
+        let layer = self.layer(layer);
         self.start()?;
 
         let bin = gst::Bin::with_name(&format!("viewer-{id}"));
@@ -207,7 +312,7 @@ impl Streamer {
         bin.add(&webrtc)?;
 
         let mut ghosts = Vec::new();
-        for (i, tee) in self.tees.iter().enumerate() {
+        for (i, (tee, video)) in self.branch_tees(layer).into_iter().enumerate() {
             let queue = gst::ElementFactory::make("queue")
                 .property_from_str("leaky", "downstream")
                 .property("max-size-buffers", 0u32)
@@ -224,12 +329,12 @@ impl Streamer {
             }
             let transceiver = sink.property::<gst_webrtc::WebRTCRTPTransceiver>("transceiver");
             transceiver.set_property("direction", gst_webrtc::WebRTCRTPTransceiverDirection::Sendonly);
-            transceiver.set_property("do-nack", i == 0);
+            transceiver.set_property("do-nack", video);
             let ghost = gst::GhostPad::builder_with_target(&queue.static_pad("sink").unwrap())?
                 .name(format!("sink_{i}"))
                 .build();
             bin.add_pad(&ghost)?;
-            ghosts.push((tee.clone(), ghost));
+            ghosts.push((tee, ghost));
         }
 
         let offer_tx = tx.clone();
@@ -270,13 +375,11 @@ impl Streamer {
         }
 
         let mut state = self.state.lock().unwrap();
-        state.viewers.insert(id, Viewer { bin, webrtc: Some(webrtc), tee_pads });
-        for valve in &self.valves {
-            valve.set_property("drop", false);
-        }
+        state.viewers.insert(id, Viewer { bin, webrtc: Some(webrtc), tee_pads, layer });
+        self.update_valves(&state);
         drop(state);
 
-        self.request_keyframe();
+        self.request_keyframe_for(layer);
         Ok(())
     }
 
@@ -286,12 +389,20 @@ impl Streamer {
     /// tipo 1 = quadro-chave H.264, 2 = quadro H.264, 3 = pacote Opus.
     /// Se a conexão da pessoa não der conta (fila cheia), descarta até o
     /// próximo quadro-chave e pede um novo: a imagem pula, mas não corrompe.
-    pub fn add_tunnel_viewer(&self, id: u64, tx: tokio::sync::mpsc::Sender<Vec<u8>>) -> Result<()> {
+    /// `prefix` vai antes de cada mensagem (na jam, a sessão a que ela pertence).
+    pub fn add_tunnel_viewer(
+        &self,
+        id: u64,
+        tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+        layer: Layer,
+        prefix: Vec<u8>,
+    ) -> Result<()> {
+        let layer = self.layer(layer);
         self.start()?;
         let bin = gst::Bin::with_name(&format!("tunnel-{id}"));
         let mut ghosts = Vec::new();
-        for (i, tee) in self.tees.iter().enumerate() {
-            let description = if i == 0 {
+        for (i, (tee, video)) in self.branch_tees(layer).into_iter().enumerate() {
+            let description = if video {
                 "queue leaky=downstream max-size-buffers=0 max-size-bytes=0 max-size-time=200000000 \
                  ! rtph264depay ! h264parse config-interval=-1 \
                  ! video/x-h264,stream-format=byte-stream,alignment=au \
@@ -311,12 +422,18 @@ impl Streamer {
             bin.add(&branch)?;
             let outer = gst::GhostPad::builder_with_target(&ghost)?.name(format!("sink_{i}")).build();
             bin.add_pad(&outer)?;
-            ghosts.push((tee.clone(), outer));
+            ghosts.push((tee, outer));
 
             let tx = tx.clone();
-            let video = i == 0;
+            let prefix = prefix.clone();
             let need_key = Arc::new(std::sync::atomic::AtomicBool::new(true));
-            let (sent, dropped, encoder) = (self.tunnel_sent.clone(), self.tunnel_dropped.clone(), self.encoder.clone());
+            // Só a camada alta conta para a qualidade automática.
+            let (sent, dropped) = if layer == Layer::High {
+                (self.tunnel_sent.clone(), self.tunnel_dropped.clone())
+            } else {
+                (Arc::default(), Arc::default())
+            };
+            let encoder = self.video(layer).encoder.clone();
             let last_request = Mutex::new(std::time::Instant::now() - std::time::Duration::from_secs(10));
             out.connect("handoff", false, move |values| {
                 let Ok(buffer) = values[1].get::<gst::Buffer>() else { return None };
@@ -336,7 +453,8 @@ impl Streamer {
                 }
                 let Ok(map) = buffer.map_readable() else { return None };
                 let pts = buffer.pts().map(|t| t.useconds()).unwrap_or(0);
-                let mut message = Vec::with_capacity(9 + map.len());
+                let mut message = Vec::with_capacity(prefix.len() + 9 + map.len());
+                message.extend_from_slice(&prefix);
                 message.push(if !video { 3 } else if key { 1 } else { 2 });
                 message.extend_from_slice(&pts.to_be_bytes());
                 message.extend_from_slice(&map);
@@ -368,12 +486,10 @@ impl Streamer {
             tee_pads.push((tee, tee_pad));
         }
         let mut state = self.state.lock().unwrap();
-        state.viewers.insert(id, Viewer { bin, webrtc: None, tee_pads });
-        for valve in &self.valves {
-            valve.set_property("drop", false);
-        }
+        state.viewers.insert(id, Viewer { bin, webrtc: None, tee_pads, layer });
+        self.update_valves(&state);
         drop(state);
-        self.request_keyframe();
+        self.request_keyframe_for(layer);
         Ok(())
     }
 
@@ -383,8 +499,9 @@ impl Streamer {
         (self.tunnel_sent.load(Ordering::Relaxed), self.tunnel_dropped.load(Ordering::Relaxed))
     }
 
+    /// Espectadores pelo túnel na camada alta (a que a qualidade automática ajusta).
     pub fn tunnel_viewer_count(&self) -> usize {
-        self.state.lock().unwrap().viewers.values().filter(|v| v.webrtc.is_none()).count()
+        self.state.lock().unwrap().viewers.values().filter(|v| v.webrtc.is_none() && v.layer == Layer::High).count()
     }
 
     pub fn handle_message(&self, id: u64, text: &str) -> Result<()> {
@@ -430,11 +547,7 @@ impl Streamer {
         let viewer = state.viewers.remove(&id)?;
         state.generation += 1;
         let idle = state.viewers.is_empty().then_some(state.generation);
-        if idle.is_some() {
-            for valve in &self.valves {
-                valve.set_property("drop", true);
-            }
-        }
+        self.update_valves(&state);
         drop(state);
 
         let Viewer { bin, tee_pads, .. } = viewer;
@@ -470,9 +583,10 @@ impl Streamer {
 
     /// Rede de cada espectador, do vídeo: (ssrc, fração perdida, jitter em s,
     /// pacotes enviados, pedidos de retransmissão), dos relatórios RTCP.
+    /// Só a camada alta: a miniatura tem qualidade fixa.
     pub fn viewer_network(&self) -> Vec<(u32, f64, f64, u64, u32)> {
         let mut out = Vec::new();
-        for stats in self.viewer_stats() {
+        for stats in self.stats_of(Some(Layer::High)) {
             let mut remote = None;
             let mut sent = None;
             for (_, value) in stats.iter() {
@@ -503,7 +617,19 @@ impl Streamer {
 
     /// Estatísticas WebRTC de cada espectador (resposta do `get-stats`).
     pub fn viewer_stats(&self) -> Vec<gst::Structure> {
-        let webrtcs: Vec<gst::Element> = self.state.lock().unwrap().viewers.values().filter_map(|v| v.webrtc.clone()).collect();
+        self.stats_of(None)
+    }
+
+    fn stats_of(&self, layer: Option<Layer>) -> Vec<gst::Structure> {
+        let webrtcs: Vec<gst::Element> = self
+            .state
+            .lock()
+            .unwrap()
+            .viewers
+            .values()
+            .filter(|v| layer.is_none_or(|l| v.layer == l))
+            .filter_map(|v| v.webrtc.clone())
+            .collect();
         webrtcs
             .iter()
             .filter_map(|webrtc| {
@@ -517,10 +643,31 @@ impl Streamer {
             .collect()
     }
 
-    /// Pede um keyframe (IDR) ao encoder — usado quando alguém entra.
+    /// Pede um keyframe (IDR) a todos os encoders.
     pub fn request_keyframe(&self) {
+        self.request_keyframe_for(Layer::High);
+        if self.low.is_some() {
+            self.request_keyframe_for(Layer::Low);
+        }
+    }
+
+    /// Pede um keyframe (IDR) ao encoder da camada — usado quando alguém entra.
+    pub fn request_keyframe_for(&self, layer: Layer) {
         let event = gst_video::UpstreamForceKeyUnitEvent::builder().all_headers(true).build();
-        self.encoder.static_pad("src").unwrap().send_event(event);
+        self.video(self.layer(layer)).encoder.static_pad("src").unwrap().send_event(event);
+    }
+
+    /// Encoder da miniatura (jam), para configurar na partida.
+    pub fn low_encoder(&self) -> Option<&gst::Element> {
+        self.low.as_ref().map(|l| &l.encoder)
+    }
+
+    /// Pede um keyframe da camada que o espectador `id` recebe.
+    pub fn request_keyframe_of(&self, id: u64) {
+        let layer = self.state.lock().unwrap().viewers.get(&id).map(|v| v.layer);
+        if let Some(layer) = layer {
+            self.request_keyframe_for(layer);
+        }
     }
 }
 
@@ -559,6 +706,118 @@ mod tests {
         streamer.pipeline.set_state(gst::State::Null).unwrap();
         assert!((26..=34).contains(&at30), "limite 30 fps deixou passar {at30}");
         assert!((54..=66).contains(&at60), "limite 60 fps deixou passar {at60}");
+    }
+
+    /// Contador de buffers que chegam a um elemento nomeado.
+    fn counter(streamer: &Streamer, name: &str) -> Arc<AtomicUsize> {
+        let count = Arc::new(AtomicUsize::new(0));
+        let c = count.clone();
+        let pad = streamer.pipeline.by_name(name).unwrap().static_pad("sink").unwrap();
+        pad.add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+            c.fetch_add(1, Ordering::Relaxed);
+            gst::PadProbeReturn::Ok
+        });
+        count
+    }
+
+    /// Espectador de mentira (sem ramo no pipeline), só para os portões.
+    fn fake_viewer(streamer: &Streamer, id: u64, layer: Layer) {
+        let mut state = streamer.state.lock().unwrap();
+        state.viewers.insert(id, Viewer { bin: gst::Bin::new(), webrtc: None, tee_pads: Vec::new(), layer });
+        streamer.update_valves(&state);
+    }
+
+    fn clear_viewers(streamer: &Streamer) {
+        let mut state = streamer.state.lock().unwrap();
+        state.viewers.clear();
+        streamer.update_valves(&state);
+    }
+
+    /// Jam: o pipeline real (fonte de teste, x264, áudio) com as duas camadas.
+    /// Cada camada só codifica com alguém assistindo a ela, o som vai com a
+    /// alta, e a miniatura sai a ~15 fps.
+    #[test]
+    fn jam_layers_encode_only_what_is_watched() {
+        gst::init().unwrap();
+        if gst::ElementFactory::find("x264enc").is_none() {
+            eprintln!("x264enc indisponível; teste ignorado");
+            return;
+        }
+        let settings = crate::capture::Settings {
+            bitrate_kbps: 2000,
+            fps: 30,
+            profile: "constrained-baseline".into(),
+            encoder: None,
+            monitor: 0,
+            monitor_handle: None,
+            capture_api: "auto".into(),
+            thumbnail: true,
+        };
+        let description = format!(
+            "{} {}",
+            crate::capture::test_description("x264enc", &settings),
+            crate::capture::audio_description("audiotestsrc is-live=true wave=ticks")
+        );
+        let streamer = Streamer::new(&description, None, 30).unwrap();
+        crate::capture::configure_encoder(&streamer.encoder, &settings);
+        crate::capture::configure_encoder(streamer.low_encoder().unwrap(), &crate::capture::thumbnail_settings(&settings));
+        let (high, low, audio) = (counter(&streamer, "tee"), counter(&streamer, "ltee"), counter(&streamer, "atee"));
+        let measure = || {
+            for c in [&high, &low, &audio] {
+                c.store(0, Ordering::Relaxed);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+            [&high, &low, &audio].map(|c| c.load(Ordering::Relaxed))
+        };
+        streamer.start().unwrap();
+
+        clear_viewers(&streamer);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let [h, l, a] = measure();
+        assert_eq!((h, l, a), (0, 0, 0), "sem ninguém, nada é codificado");
+
+        fake_viewer(&streamer, 1, Layer::Low);
+        streamer.request_keyframe();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let [h, l, a] = measure();
+        assert_eq!((h, a), (0, 0), "na grade (só miniatura) não sai a camada alta nem som");
+        // ~15 quadros/s; pacotes RTP ≥ quadros.
+        assert!(l >= 15, "miniatura deveria sair: {l} pacotes em 1,5 s");
+
+        fake_viewer(&streamer, 2, Layer::High);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let [h, l, a] = measure();
+        assert!(h > 0 && l > 0 && a > 0, "alta, miniatura e som: {h} {l} {a}");
+
+        // Só a alta: a miniatura para.
+        streamer.state.lock().unwrap().viewers.remove(&1);
+        streamer.update_valves(&streamer.state.lock().unwrap());
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let [h, l, _] = measure();
+        assert!(h > 0 && l == 0, "só a alta: {h} {l}");
+        streamer.pipeline.set_state(gst::State::Null).unwrap();
+    }
+
+    /// Fora da jam (sem miniatura) quem pede a miniatura recebe a alta, e o
+    /// som acompanha só a camada alta.
+    #[test]
+    fn layers_fall_back_and_audio_follows_high() {
+        gst::init().unwrap();
+        let streamer = Streamer::new(
+            "videotestsrc is-live=true ! valve name=valve drop=true ! identity name=enc ! tee name=tee \
+             audiotestsrc is-live=true ! valve name=avalve drop=true ! identity ! tee name=atee",
+            None,
+            30,
+        )
+        .unwrap();
+        assert_eq!(streamer.layer(Layer::Low), Layer::High);
+        assert_eq!(streamer.branch_tees(Layer::High).len(), 2);
+        fake_viewer(&streamer, 1, Layer::High);
+        assert!(!streamer.high.valve.property::<bool>("drop"));
+        assert!(!streamer.audio.as_ref().unwrap().1.property::<bool>("drop"));
+        clear_viewers(&streamer);
+        assert!(streamer.high.valve.property::<bool>("drop"));
+        assert!(streamer.audio.as_ref().unwrap().1.property::<bool>("drop"));
     }
 
     /// Trocar a captura com o pipeline rodando: o elemento `screen` reinicia

@@ -32,7 +32,13 @@ pub struct Settings {
     /// Windows: "auto" (WGC só com HDR ligado), "dxgi" ou "wgc".
     #[cfg_attr(target_os = "linux", allow(dead_code))]
     pub capture_api: String,
+    /// Jam: gera também a miniatura (camada baixa) para a grade.
+    pub thumbnail: bool,
 }
+
+/// Tamanho da miniatura da jam (com bordas pretas se a proporção for outra).
+const THUMB_WIDTH: u32 = 640;
+const THUMB_HEIGHT: u32 = 360;
 
 pub fn pick_encoder(forced: Option<&str>) -> Result<String> {
     if let Some(name) = forced {
@@ -59,7 +65,7 @@ pub fn pick_encoder(forced: Option<&str>) -> Result<String> {
 #[cfg(target_os = "windows")]
 fn probe_windows_encoder(name: &str) -> Result<()> {
     let settings = Settings { bitrate_kbps: 12000, fps: 30, profile: "constrained-baseline".into(),
-        encoder: None, monitor: 0, monitor_handle: None, capture_api: "auto".into() };
+        encoder: None, monitor: 0, monitor_handle: None, capture_api: "auto".into(), thumbnail: false };
     let pipeline = gst::parse::launch(&format!(
         "videotestsrc num-buffers=3 ! video/x-raw,format=BGRx,width=320,height=240,framerate=30/1 \
          ! {} ! {name} name=probe ! video/x-h264,profile=constrained-baseline ! fakesink", windows_convert(name, false)))?
@@ -84,35 +90,78 @@ fn capture_fps(s: &Settings) -> u32 {
 }
 
 /// Parte comum: encoder → RTP → tee (cada espectador pendura um ramo no tee).
-fn tail(encoder: &str, s: &Settings) -> String {
+/// `p` é o prefixo dos nomes: "" na camada alta (`enc`, `tee`) e "l" na
+/// miniatura (`lenc`, `ltee`).
+fn tail(encoder: &str, s: &Settings, p: &str) -> String {
     format!(
-        "{encoder} name=enc \
+        "{encoder} name={p}enc \
          ! video/x-h264,profile={profile},stream-format=byte-stream \
          ! h264parse config-interval=-1 \
          ! rtph264pay config-interval=-1 pt=96 mtu=1200 aggregate-mode=zero-latency \
          ! application/x-rtp,media=video,encoding-name=H264,payload=96,clock-rate=90000,\
            rtcp-fb-nack-pli=(boolean)true,rtcp-fb-nack=(boolean)true,rtcp-fb-ccm-fir=(boolean)true \
-         ! tee name=tee allow-not-linked=true",
+         ! tee name={p}tee allow-not-linked=true",
         profile = s.profile,
     )
 }
 
 /// `valve` corta o fluxo antes do encoder quando ninguém está assistindo,
 /// e a fila de 1 buffer descarta frames antigos se o encoder atrasar.
-const GATE: &str = "valve name=valve drop=true ! queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream";
+fn gate(p: &str) -> String {
+    format!("valve name={p}valve drop=true ! queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream")
+}
+
+/// Tudo depois da fonte. Fora da jam: portão → conversão → encoder → tee.
+/// Na jam, um `tee` de vídeo cru alimenta as duas camadas, cada uma com seu
+/// portão e encoder: a alta e a miniatura (`thumb` = conversão + escala).
+fn encode(encoder: &str, s: &Settings, convert: &str, thumb: &str) -> String {
+    if !s.thumbnail {
+        return format!("{} ! {convert} ! {}", gate(""), tail(encoder, s, ""));
+    }
+    const BRANCH: &str = "queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream";
+    format!(
+        "tee name=raw allow-not-linked=true \
+         raw. ! {BRANCH} ! {} ! {convert} ! {} \
+         raw. ! {BRANCH} ! {} ! {thumb} ! {}",
+        gate(""),
+        tail(encoder, s, ""),
+        gate("l"),
+        tail(encoder, s, "l"),
+    )
+}
+
+/// Escala para a miniatura no Linux (memória comum).
+#[cfg(target_os = "linux")]
+fn linux_thumb() -> String {
+    format!("videoscale ! video/x-raw,width={THUMB_WIDTH},height={THUMB_HEIGHT},pixel-aspect-ratio=1/1 ! videoconvert")
+}
+
+/// Configuração do encoder da miniatura: qualidade fixa e baixa.
+pub fn thumbnail_settings(s: &Settings) -> Settings {
+    Settings {
+        bitrate_kbps: crate::stream::LOW_KBPS,
+        fps: crate::stream::LOW_FPS,
+        profile: s.profile.clone(),
+        encoder: s.encoder.clone(),
+        monitor: s.monitor,
+        monitor_handle: s.monitor_handle,
+        capture_api: s.capture_api.clone(),
+        thumbnail: true,
+    }
+}
 
 /// Fonte sintética, para testar rede e navegador sem capturar a tela.
 pub fn test_description(encoder: &str, s: &Settings) -> String {
     #[cfg(target_os = "linux")]
-    let convert = "videoconvert".to_string();
+    let (convert, thumb) = ("videoconvert".to_string(), linux_thumb());
     #[cfg(target_os = "windows")]
-    let convert = windows_convert(encoder, false);
+    let (convert, thumb) = (windows_convert(encoder, false), windows_thumb(encoder, false));
     format!(
         "videotestsrc is-live=true pattern=ball \
          ! video/x-raw,format=BGRx,width=1920,height=1080,framerate={fps}/1 \
-         ! {GATE} ! {convert} ! {tail}",
+         ! {encode}",
         fps = capture_fps(s),
-        tail = tail(encoder, s),
+        encode = encode(encoder, s, &convert, &thumb),
     )
 }
 
@@ -128,9 +177,9 @@ pub fn pipeline_description(fd: i32, node: u32, encoder: &str, s: &Settings) -> 
         "pipewiresrc name=screen fd={fd} path={node} do-timestamp=true always-copy=true keepalive-time=1000 \
          ! video/x-raw,max-framerate={fps}/1 \
          ! videorate drop-only=true max-rate={fps} \
-         ! {GATE} ! videoconvert ! {tail}",
+         ! {encode}",
         fps = capture_fps(s),
-        tail = tail(encoder, s),
+        encode = encode(encoder, s, "videoconvert", &linux_thumb()),
     )
 }
 
@@ -189,10 +238,24 @@ pub fn pipeline_description(encoder: &str, s: &Settings) -> String {
     format!(
         "d3d11screencapturesrc name=screen {monitor} capture-api={api} show-border=false show-cursor=true \
          ! video/x-raw(memory:D3D11Memory),framerate={fps}/1 \
-         ! {GATE} ! {convert} ! {tail}",
+         ! {encode}",
         fps = capture_fps(s),
-        tail = tail(encoder, s),
+        encode = encode(encoder, s, &convert, &windows_thumb(encoder, true)),
     )
+}
+
+/// Miniatura no Windows: o d3d11convert converte e redimensiona na GPU; sem
+/// encoder que aceite memória D3D11, a escala é feita na CPU.
+#[cfg(target_os = "windows")]
+fn windows_thumb(encoder: &str, gpu_input: bool) -> String {
+    let size = format!("width={THUMB_WIDTH},height={THUMB_HEIGHT}");
+    let convert = windows_convert(encoder, gpu_input);
+    if convert.contains("D3D11Memory),format=NV12") {
+        // Mesma conversão, já no tamanho da miniatura.
+        format!("{convert},{size}")
+    } else {
+        format!("{} ! videoscale ! video/x-raw,format=NV12,{size}", convert.trim_end_matches(" ! video/x-raw,format=NV12"))
+    }
 }
 
 #[cfg(target_os = "windows")]

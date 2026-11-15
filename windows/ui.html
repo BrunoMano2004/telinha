@@ -119,6 +119,10 @@
   .row .name { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .row .meta { font-size: 12.5px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .row.disabled .text { opacity: .55; }
+  .join { display: flex; gap: 8px; }
+  .join input { flex: 1; min-width: 0; height: 36px; box-sizing: border-box; padding: 0 12px; border-radius: 8px;
+    border: 1px solid var(--border); background: var(--surface-2); color: var(--text); font: inherit; }
+  .join input:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 
   .switch { position: relative; width: 40px; height: 22px; flex: none; }
   .switch input { position: absolute; inset: 0; opacity: 0; margin: 0; cursor: pointer; }
@@ -269,6 +273,38 @@
           <label class="switch"><input type="checkbox" id="public" aria-label="Link público"><span></span></label>
         </div>
       </section>
+
+      <section class="card">
+        <h2><svg><use href="#i-users"/></svg>Jam</h2>
+        <p class="hint">Várias telas num link só: quem entra com o Telinha compartilha a própria tela, e o link mostra todas.</p>
+        <div id="jam-idle">
+          <div class="field">
+            <button class="btn" id="jam-create"><svg><use href="#i-play"/></svg>Criar jam</button>
+            <div class="note">Usa o monitor, a qualidade, o som e o tipo de link escolhidos acima.</div>
+          </div>
+          <div class="field">
+            <label for="jam-link">Entrar numa jam</label>
+            <div class="join"><input id="jam-link" placeholder="Cole aqui o link da jam" autocomplete="off" spellcheck="false">
+              <button class="btn primary" id="jam-join">Entrar</button></div>
+            <div class="note">Sua tela vai para a jam e a página com as telas dos outros abre sozinha.</div>
+          </div>
+        </div>
+        <div id="jam-live" hidden>
+          <div class="row first">
+            <div class="text"><div class="name" id="jam-title"></div><div class="meta" id="jam-meta"></div></div>
+            <button class="btn" id="jam-open"><svg><use href="#i-open"/></svg>Abrir a jam</button>
+          </div>
+          <div class="row">
+            <div class="text"><div class="name">Minha tela</div><div class="meta" id="share-meta"></div></div>
+            <button class="btn" id="jam-pause">Pausar</button>
+          </div>
+          <div class="row" id="lock-row">
+            <div class="text"><div class="name">Trancar a jam</div><div class="meta">Ninguém novo entra; quem já está continua.</div></div>
+            <label class="switch"><input type="checkbox" id="jam-lock" aria-label="Trancar a jam"><span></span></label>
+          </div>
+          <div class="list" id="jam-screens"></div>
+        </div>
+      </section>
     </div>
 
     <div class="stack">
@@ -314,6 +350,9 @@ const state = {
   auto: true, autoNow: null, // qualidade automática e o que ela escolheu agora
   choices: {}, viewers: [], blocked: [], liveApps: [], log: [],
   version: '', update: null, // {version, page, progress (null|-1|0..100), error}
+  // Jam: mode '' (transmissão), 'jam' (você criou) ou 'join' (entrou); jam = {role, id, link, watch};
+  // room = estado da sala (só no anfitrião); paused = sua tela pausada.
+  mode: '', jam: null, room: null, paused: false,
 };
 
 // --- Ponte com o app (telinha.cpp). Fora dele, modo demonstração.
@@ -329,8 +368,15 @@ function onMessage(msg) {
       break;
     case 'state':
       state.running = msg.running; state.starting = msg.running && !msg.link; state.link = msg.link || '';
-      if (!msg.running) { state.viewers = []; state.blocked = []; state.liveApps = []; state.autoNow = null; }
+      if (!msg.running) {
+        state.viewers = []; state.blocked = []; state.liveApps = []; state.autoNow = null;
+        state.jam = null; state.room = null; state.paused = false;
+      }
       break;
+    case 'jam': state.jam = msg.data; toast(msg.data.role === 'host' ? 'Jam criada · link copiado' : 'Você entrou na jam'); break;
+    case 'room': state.room = msg.data; break;
+    case 'share': state.paused = msg.state === 'off'; break;
+    case 'jam-ended': toast(msg.data.reason || 'A jam terminou'); return;
     case 'viewers': state.viewers = msg.data; break;
     case 'blocked': state.blocked = msg.data; break;
     case 'apps': state.liveApps = msg.data; break;
@@ -350,12 +396,22 @@ function onMessage(msg) {
 host?.addEventListener('message', (e) => onMessage(e.data));
 
 // --- Ações
-$('main-btn').onclick = () => {
-  if (state.running) return send('stop');
+function start(mode = '', link = '') {
   const q = QUALITIES[state.quality];
-  state.starting = true; render();
-  send('start', state.monitor, q.kbps, q.fps, state.audio ? 1 : 0, state.public ? 1 : 0, state.auto ? 1 : 0);
+  state.mode = mode; state.starting = true; render();
+  send('start', state.monitor, q.kbps, q.fps, state.audio ? 1 : 0, state.public ? 1 : 0, state.auto ? 1 : 0, mode, link);
+}
+$('main-btn').onclick = () => state.running ? send('stop') : start();
+$('jam-create').onclick = () => start('jam');
+$('jam-join').onclick = () => {
+  const link = $('jam-link').value.trim();
+  if (!/^https?:\/\/\S+$/.test(link)) { toast('Cole o link completo da jam'); return; }
+  start('join', link);
 };
+$('jam-link').onkeydown = (e) => { if (e.key === 'Enter') $('jam-join').click(); };
+$('jam-open').onclick = () => send('jam-open');
+$('jam-pause').onclick = () => send('send', `share ${state.paused ? 'on' : 'off'}`);
+$('jam-lock').onchange = (e) => send('send', `lock ${e.target.checked ? 'on' : 'off'}`);
 $('copy-btn').onclick = () => send('copy');
 $('release-btn').onclick = () => send('release');
 $('update-btn').onclick = () => {
@@ -432,18 +488,22 @@ function render() {
   const live = state.running && state.link;
   document.body.classList.toggle('live', !!live);
   const n = state.viewers.length;
-  $('status').textContent = state.starting ? 'Preparando a transmissão…'
+  const inJam = state.running && state.mode !== '';
+  const others = state.room ? state.room.presenters.filter((p) => !p.host) : [];
+  $('status').textContent = state.starting ? (state.mode === 'join' ? 'Entrando na jam…' : 'Preparando a transmissão…')
+    : live && inJam ? (state.mode === 'jam' ? `Jam ao vivo · ${others.length} ${others.length === 1 ? 'outra tela' : 'outras telas'}` : 'Na jam · compartilhando sua tela')
     : live ? (n ? `Ao vivo · ${n} ${n === 1 ? 'pessoa assistindo' : 'pessoas assistindo'}` : 'Ao vivo · esperando quem vai assistir')
     : 'Pronto para compartilhar';
 
   const main = $('main-btn');
   main.className = `btn big ${state.running ? 'stop' : 'primary'}`;
-  main.innerHTML = state.running ? `${icon('stop')}<span>Parar</span>` : `${icon('play')}<span>Iniciar transmissão</span>`;
+  main.innerHTML = state.running ? `${icon('stop')}<span>${inJam ? (state.mode === 'jam' ? 'Encerrar jam' : 'Sair da jam') : 'Parar'}</span>`
+    : `${icon('play')}<span>Iniciar transmissão</span>`;
   main.disabled = state.starting && !state.running;
 
   $('url').textContent = live ? state.link : state.starting ? 'Gerando o link…' : 'Aparece aqui quando você iniciar, já copiado.';
   $('url').classList.toggle('placeholder', !live);
-  $('link-label').textContent = live ? (state.public ? 'Link público' : 'Link do Tailscale') : 'Link da transmissão';
+  $('link-label').textContent = live && inJam ? 'Link da jam' : live ? (state.public ? 'Link público' : 'Link do Tailscale') : 'Link da transmissão';
   $('copy-btn').disabled = $('open-btn').disabled = !live;
 
   const select = $('monitor');
@@ -467,6 +527,28 @@ function render() {
   }
   $('public-meta').textContent = state.running ? 'Pare a transmissão para mudar.'
     : state.public ? 'Qualquer pessoa com o link assiste.' : 'Só quem está no seu Tailscale.';
+
+  // Jam
+  $('jam-idle').hidden = state.running;
+  $('jam-live').hidden = !inJam;
+  $('jam-create').disabled = $('jam-join').disabled = state.running;
+  if (inJam) {
+    $('jam-title').textContent = state.mode === 'jam' ? 'Você criou esta jam' : 'Você está numa jam';
+    $('jam-meta').textContent = state.jam ? 'A página mostra as telas dos outros; a sua fica de fora.' : 'Conectando…';
+    $('jam-open').disabled = !state.jam;
+    $('jam-pause').disabled = !state.jam;
+    $('jam-pause').textContent = state.paused ? 'Retomar' : 'Pausar';
+    $('share-meta').textContent = state.paused ? 'Pausada: sumiu da jam.' : 'Na jam. Pausar esconde sem sair.';
+    $('lock-row').hidden = state.mode !== 'jam';
+    $('jam-lock').checked = !!state.room?.locked;
+    $('jam-screens').innerHTML = state.mode !== 'jam' ? '' : others.length ? others.map((p) => `
+      <div class="person">${avatar(p.name)}
+        <div class="text"><div class="name">${esc(p.name)}</div>
+          <div class="meta">${esc([p.os === 'windows' ? 'Windows' : 'Linux', p.sharing ? `${p.sessions} assistindo` : 'pausada'].join(' · '))}</div></div>
+        <div class="actions">${p.sharing ? `<button class="btn ghost" data-stop="${p.id}">Parar tela</button>` : ''}</div></div>`).join('')
+      : empty('screen', 'Só a sua tela por enquanto', 'Mande o link: quem entrar com o Telinha aparece aqui.');
+    $('jam-screens').querySelectorAll('[data-stop]').forEach((b) => b.onclick = () => send('send', `stop-share ${b.dataset.stop}`));
+  }
 
   $('viewer-count').textContent = n;
   $('viewers').innerHTML = n ? state.viewers.map((v) => `
@@ -512,7 +594,18 @@ $('logo').src = 'data:image/svg+xml,' + encodeURIComponent(`<svg xmlns="http://w
 
 // --- Demonstração (fora do app), para ver o design no navegador.
 function demo(parts) {
-  if (parts[0] === 'start') setTimeout(() => onMessage({ type: 'state', running: true, link: 'https://exemplo-de-link.trycloudflare.com/?k=Ab12Cd34' }), 600);
+  if (parts[0] === 'start') setTimeout(() => {
+    const link = 'https://exemplo-de-link.trycloudflare.com/?k=Ab12Cd34';
+    onMessage({ type: 'state', running: true, link });
+    if (parts[7]) {
+      onMessage({ type: 'jam', data: { role: parts[7] === 'jam' ? 'host' : 'guest', id: 1, link, watch: `${link}&local=demo` } });
+      if (parts[7] === 'jam') onMessage({ type: 'room', data: { locked: false, viewers: [], presenters: [
+        { id: 1, name: 'Este PC', os: 'windows', host: true, sharing: true, sessions: 0 },
+        { id: 2, name: 'Bia', os: 'linux', host: false, sharing: true, sessions: 2 },
+        { id: 3, name: 'Carlos', os: 'windows', host: false, sharing: false, sessions: 0 } ] } });
+    }
+  }, 600);
+  if (parts[0] === 'send' && /^share (on|off)$/.test(parts[1])) onMessage({ type: 'share', state: parts[1].slice(6) });
   if (parts[0] === 'stop') onMessage({ type: 'state', running: false });
   if (parts[0] === 'copy') onMessage({ type: 'copied' });
   if (parts[0] === 'update') {

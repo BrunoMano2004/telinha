@@ -92,10 +92,18 @@ PageBase {
         RowButton {
             first: true
             icon: Telinha.running ? "stop_circle" : "cast"
-            text: Telinha.running ? Tr.tr("Stop sharing") : Tr.tr("Start sharing")
+            text: {
+                if (!Telinha.running)
+                    return Tr.tr("Start sharing");
+                if (Telinha.jamHost)
+                    return Tr.tr("End the jam");
+                return Telinha.inJam ? Tr.tr("Leave the jam") : Tr.tr("Stop sharing");
+            }
             subtext: {
                 if (Telinha.selecting)
                     return Tr.tr("Choose a screen in the system picker...");
+                if (Telinha.jamHost)
+                    return Tr.tr("Everyone in the jam sees that it ended");
                 if (Telinha.running)
                     return Tr.tr("Live · public link, anyone with it can watch");
                 return Tr.tr("Creates a public link and copies it");
@@ -118,6 +126,91 @@ PageBase {
             text: Telinha.switchingScreen ? Tr.tr("Choosing a new screen...") : Tr.tr("Switch screen")
             subtext: Tr.tr("Pick another screen or window without disconnecting viewers")
             onClicked: Telinha.switchScreen()
+        }
+
+        // Jam: várias telas num link só
+        SectionHeader {
+            text: Tr.tr("Jam")
+        }
+
+        RowButton {
+            first: true
+            visible: !Telinha.running
+            icon: "groups"
+            text: Tr.tr("Create a jam")
+            subtext: Tr.tr("Everyone who joins with telinha shares their screen; one link shows all screens")
+            onClicked: Telinha.startJam()
+        }
+
+        RowButton {
+            last: true
+            visible: !Telinha.running
+            icon: "login"
+            text: Tr.tr("Join the copied jam")
+            subtext: Tr.tr("Copy the jam link someone sent you, then click here to share your screen in it")
+            onClicked: Telinha.joinJam()
+        }
+
+        InfoRow {
+            visible: Telinha.running && !Telinha.inJam
+            first: true
+            last: true
+            icon: "groups"
+            label: Tr.tr("Not in a jam")
+            subtext: Tr.tr("Stop this share to create or join a jam")
+        }
+
+        RowButton {
+            first: true
+            visible: Telinha.inJam
+            disabled: !Telinha.jam
+            icon: "open_in_new"
+            text: Tr.tr("Open the jam")
+            subtext: Tr.tr("Everyone else's screens. Click one to see it big and hear it; yours stays out")
+            onClicked: Telinha.openJam()
+        }
+
+        RowButton {
+            last: !Telinha.jamHost
+            visible: Telinha.inJam
+            disabled: !Telinha.jam
+            icon: Telinha.sharePaused ? "play_circle" : "pause_circle"
+            text: Telinha.sharePaused ? Tr.tr("Resume my screen") : Tr.tr("Pause my screen")
+            subtext: Telinha.sharePaused ? Tr.tr("Your screen is hidden from the jam") : Tr.tr("Hides your screen from the jam without leaving")
+            onClicked: Telinha.setSharing(Telinha.sharePaused)
+        }
+
+        ToggleRow {
+            visible: Telinha.jamHost
+            last: Telinha.jamScreens.length === 0
+            text: Tr.tr("Lock the jam")
+            subtext: Tr.tr("Nobody new gets in; who is already in stays")
+            checked: Telinha.room?.locked ?? false
+            onToggled: Telinha.setLocked(checked)
+        }
+
+        Repeater {
+            model: Telinha.jamHost ? Telinha.jamScreens : []
+
+            PersonRow {
+                id: screenRow
+
+                required property var modelData
+                required property int index
+
+                last: index === Telinha.jamScreens.length - 1
+                icon: modelData.sharing ? "screen_share" : "stop_screen_share"
+                name: modelData.name
+                detail: [modelData.os === "windows" ? "Windows" : "Linux", modelData.sharing ? Tr.tr("%1 watching").arg(modelData.sessions) : Tr.tr("paused")].join(" · ")
+
+                IconButton {
+                    // Para o compartilhamento (a pessoa pode retomar); expulsar fica em Espectadores.
+                    visible: screenRow.modelData.sharing
+                    icon: "cancel_presentation"
+                    type: IconButton.Text
+                    onClicked: Telinha.stopShare(screenRow.modelData.id)
+                }
+            }
         }
 
         // Espectadores
@@ -145,7 +238,8 @@ PageBase {
 
                 first: index === 0
                 last: index === Telinha.viewers.length - 1
-                icon: "person"
+                // Na jam, quem compartilha também aparece aqui (e pode ser expulso).
+                icon: modelData.role === "presenter" ? "screen_share" : "person"
                 name: modelData.name
                 detail: [modelData.device, modelData.ip, root.since(modelData.since)].filter(s => s).join(" · ")
 

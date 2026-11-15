@@ -19,6 +19,8 @@ pub struct Hello {
     pub client: String,
     /// A página pediu o modo túnel (a conexão direta não fechou).
     pub tunnel: bool,
+    /// Jam: é um telinha que entrou para compartilhar a tela, não um navegador.
+    pub presenter: bool,
 }
 
 impl Hello {
@@ -39,6 +41,7 @@ impl Hello {
             device: field("device", 60),
             client,
             tunnel: v["mode"] == "tunnel",
+            presenter: v["role"] == "presenter",
         })
     }
 }
@@ -51,6 +54,8 @@ struct ViewerInfo {
     ip: String,
     /// Entrada, em segundos desde 1970 (as interfaces mostram "há X min").
     since: u64,
+    /// "viewer" (navegador) ou, na jam, "presenter" (telinha compartilhando).
+    role: &'static str,
 }
 
 #[derive(Clone, Serialize)]
@@ -107,7 +112,8 @@ impl Registry {
     /// Registra quem entrou. O receptor avisa se a pessoa foi expulsa ou bloqueada.
     pub fn add(&self, id: u64, hello: Hello, ip: String) -> oneshot::Receiver<Removal> {
         let (tx, rx) = oneshot::channel();
-        let info = ViewerInfo { id, name: hello.name, device: hello.device, ip, since: now() };
+        let role = if hello.presenter { "presenter" } else { "viewer" };
+        let info = ViewerInfo { id, name: hello.name, device: hello.device, ip, since: now(), role };
         self.viewers.lock().unwrap().insert(id, Entry { info, client: hello.client, remove: Some(tx) });
         self.emit_viewers();
         rx
@@ -191,7 +197,7 @@ mod tests {
     use super::*;
 
     fn hello(client: &str) -> Hello {
-        Hello { name: "Ana".into(), device: "Firefox · Linux".into(), client: client.into(), tunnel: false }
+        Hello { name: "Ana".into(), device: "Firefox · Linux".into(), client: client.into(), tunnel: false, presenter: false }
     }
 
     #[test]

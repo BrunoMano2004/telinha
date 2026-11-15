@@ -21,6 +21,16 @@ Singleton {
     property var blocked: []   // [{key, name, device, ip}]
     property var liveApps: []  // [{name, on, voice}] apps tocando som agora
     property bool switchingScreen: false
+    // Jam: "" (transmissão normal), "jam" (você criou) ou "join" (entrou numa jam).
+    property string mode: ""
+    property string joinLink: ""
+    property var jam: null     // {role, id, link, watch}
+    property var room: null    // {locked, presenters: [...], viewers: [...]} (só o anfitrião recebe)
+    property bool sharePaused: false
+    readonly property bool inJam: mode !== ""
+    readonly property bool jamHost: mode === "jam"
+    // Telas na jam, sem contar a sua.
+    readonly property var jamScreens: room ? room.presenters.filter(p => !p.host) : []
     // Log da transmissão atual (detalhes técnicos), para copiar e investigar.
     property var logLines: []
 
@@ -69,8 +79,44 @@ Singleton {
     }
 
     function start(): void {
+        startMode("");
+    }
+
+    // Cria uma jam: o link mostra a sua tela e a de todo mundo que entrar.
+    function startJam(): void {
+        startMode("jam");
+    }
+
+    // Entra na jam do link copiado e compartilha a sua tela nela.
+    function joinJam(): void {
+        if (!proc.running)
+            paste.running = true;
+    }
+
+    function openJam(): void {
+        if (jam?.watch)
+            Qt.openUrlExternally(jam.watch);
+    }
+
+    function setSharing(on: bool): void {
+        send(`share ${on ? "on" : "off"}`);
+    }
+
+    function stopShare(id: int): void {
+        send(`stop-share ${id}`);
+    }
+
+    function setLocked(on: bool): void {
+        send(`lock ${on ? "on" : "off"}`);
+    }
+
+    function startMode(newMode: string): void {
         if (proc.running)
             return;
+        mode = newMode;
+        jam = null;
+        room = null;
+        sharePaused = false;
         url = "";
         lastError = "";
         viewers = [];
@@ -158,6 +204,24 @@ Singleton {
         return Object.keys(appChoices).filter(n => appChoices[n] === on && !n.includes(",") && n.trim());
     }
 
+    // Lê o link da jam da área de transferência (wl-paste) antes de entrar.
+    Process {
+        id: paste
+
+        command: ["wl-paste", "--no-newline", "--type", "text"]
+        stdout: StdioCollector {
+            onStreamFinished: {
+                const link = text.trim();
+                if (!/^https?:\/\/\S+$/.test(link)) {
+                    Toaster.toast(Tr.tr("No jam link copied"), Tr.tr("Copy the jam link someone sent you, then try again"), "content_paste", Toast.Error);
+                    return;
+                }
+                root.joinLink = link;
+                root.startMode("join");
+            }
+        }
+    }
+
     Process {
         id: proc
 
@@ -166,7 +230,14 @@ Singleton {
         // Usa o telinha do PATH (pacote do AUR) ou o de ~/.local/bin (./install.sh).
         // O exec mantém o PID, então parar o processo ainda manda o SIGTERM ao telinha.
         command: {
-            const args = ["sh", "-c", 'exec "$(command -v telinha || echo "$HOME/.local/bin/telinha")" "$@"', "telinha", "--tunnel"];
+            const args = ["sh", "-c", 'exec "$(command -v telinha || echo "$HOME/.local/bin/telinha")" "$@"', "telinha"];
+            // Quem entra numa jam só abre uma conexão de saída: não precisa de túnel.
+            if (root.mode === "join")
+                args.push("--join", root.joinLink);
+            else
+                args.push("--tunnel");
+            if (root.mode === "jam")
+                args.push("--jam");
             if (root.autoQuality)
                 args.push("--auto-quality");
             else
@@ -191,7 +262,12 @@ Singleton {
                         root.switchingScreen = false;
                     return;
                 }
-                const event = line.match(/^@(\w+) (.*)$/);
+                const share = line.match(/^@share (on|off)/);
+                if (share) {
+                    root.sharePaused = share[1] === "off";
+                    return;
+                }
+                const event = line.match(/^@([\w-]+) (.*)$/);
                 if (event) {
                     let data;
                     try {
@@ -207,6 +283,21 @@ Singleton {
                         root.liveApps = data;
                     else if (event[1] === "quality")
                         root.autoNow = data.auto ? data : null;
+                    else if (event[1] === "room")
+                        root.room = data;
+                    else if (event[1] === "jam") {
+                        // Jam no ar: o link (para os outros) vai para a área de
+                        // transferência e a sua página (sem a sua tela) abre.
+                        root.jam = data;
+                        root.url = data.link;
+                        Quickshell.clipboardText = data.link;
+                        if (data.role === "host")
+                            Toaster.toast(Tr.tr("Jam started"), Tr.tr("Link copied: %1").arg(data.link), "groups", Toast.Success);
+                        else
+                            Toaster.toast(Tr.tr("You joined the jam"), Tr.tr("Your screen is shared; opening the other screens"), "groups", Toast.Success);
+                        Qt.openUrlExternally(data.watch);
+                    } else if (event[1] === "jam-ended")
+                        Toaster.toast(Tr.tr("Jam ended"), data.reason, "groups", Toast.Info);
                     return;
                 }
                 root.addLog(line);
@@ -236,6 +327,9 @@ Singleton {
             root.liveApps = [];
             root.autoNow = null;
             root.switchingScreen = false;
+            root.jam = null;
+            root.room = null;
+            root.sharePaused = false;
         }
     }
 

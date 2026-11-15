@@ -36,6 +36,8 @@ static HWND window;
 static HANDLE child, inputPipe, job, wakeEvent;
 static std::thread reader;
 static std::wstring folder, link, iniPath;
+// Jam: a página com as telas dos outros (sem a sua), vinda do evento @jam.
+static std::wstring jamWatch;
 static std::vector<HMONITOR> monitors;
 static int primaryMonitor = 0;
 static NOTIFYICONDATAW tray = {};
@@ -246,6 +248,7 @@ static void CloseChild() {
     if (child) { CloseHandle(child); child = NULL; }
     { std::lock_guard<std::mutex> lock(linesMutex); lines.clear(); }
     link.clear();
+    jamWatch.clear();
     lastViewers = lastBlocked = lastApps = L"[]";
     PostState();
     Status(L"Telinha - parado");
@@ -268,7 +271,10 @@ static std::wstring ChoiceList(bool on) {
     }
     return list;
 }
-static void Start(int monitor, int kbps, int fps, bool audio, bool isPublic, bool autoQuality) {
+// Jam: mode L"jam" cria uma (o link mostra todas as telas); L"join" entra na
+// jam de joinLink compartilhando esta tela (sem túnel nem porta aberta).
+static void Start(int monitor, int kbps, int fps, bool audio, bool isPublic, bool autoQuality,
+                  const std::wstring& mode = L"", const std::wstring& joinLink = L"") {
     if (child || monitors.empty()) return;
     if (monitor < 0 || monitor >= (int)monitors.size()) monitor = primaryMonitor;
     lastKbps = kbps; lastFps = fps;
@@ -282,8 +288,10 @@ static void Start(int monitor, int kbps, int fps, bool audio, bool isPublic, boo
         if (!include.empty()) args += L" --audio-include " + Quote(include);
         if (!exclude.empty()) args += L" --audio-exclude " + Quote(exclude);
     }
-    if (isPublic) args += L" --tunnel";
+    if (mode == L"join") args += L" --join " + Quote(joinLink);
+    else if (isPublic) args += L" --tunnel";
     else args += L" --require-tailscale";
+    if (mode == L"jam") args += L" --jam";
     HANDLE outputRead = NULL, outputWrite = NULL, inputRead = NULL;
     SECURITY_ATTRIBUTES security = { sizeof(security), NULL, TRUE };
     bool pipes = CreatePipe(&outputRead, &outputWrite, &security, 0) &&
@@ -333,6 +341,15 @@ static void Start(int monitor, int kbps, int fps, bool audio, bool isPublic, boo
     });
     ResumeThread(process.hThread); CloseHandle(process.hThread);
 }
+// Valor de texto de um campo num JSON de uma linha (os links não têm aspas).
+static std::wstring JsonField(const std::wstring& json, const std::wstring& key) {
+    std::wstring needle = L"\"" + key + L"\":\"";
+    size_t at = json.find(needle);
+    if (at == std::wstring::npos) return L"";
+    at += needle.size();
+    size_t end = json.find(L'"', at);
+    return end == std::wstring::npos ? L"" : json.substr(at, end - at);
+}
 // Uma linha da saída do telinha: evento "@..." vai para a interface; o resto, para o log.
 static void HandleLine(const std::wstring& line) {
     auto event = [&](const wchar_t* name, std::wstring& data) {
@@ -356,6 +373,26 @@ static void HandleLine(const std::wstring& line) {
     if (event(L"apps", data)) { lastApps = data; Post(L"{\"type\":\"apps\",\"data\":" + data + L"}"); return; }
     if (event(L"quality", data)) { Post(L"{\"type\":\"quality\",\"data\":" + data + L"}"); return; }
     if (event(L"screen", data)) { Post(L"{\"type\":\"screen\",\"state\":" + JsonText(data) + L"}"); return; }
+    if (event(L"room", data)) { Post(L"{\"type\":\"room\",\"data\":" + data + L"}"); return; }
+    if (event(L"share", data)) { Post(L"{\"type\":\"share\",\"state\":" + JsonText(data) + L"}"); return; }
+    if (event(L"jam-ended", data)) { Post(L"{\"type\":\"jam-ended\",\"data\":" + data + L"}"); return; }
+    if (event(L"jam", data)) {
+        // Jam no ar: o link (para os outros) é copiado e a página com as telas
+        // dos outros abre (sem a sua tela, e começando sem som para não dar eco).
+        Post(L"{\"type\":\"jam\",\"data\":" + data + L"}");
+        std::wstring jamLink = JsonField(data, L"link"), watch = JsonField(data, L"watch");
+        if (child && !jamLink.empty()) {
+            link = jamLink;
+            PostState();
+            CopyLink();
+            Status(L"Telinha - na jam (link copiado)");
+        }
+        if (watch.compare(0, 4, L"http") == 0) {
+            jamWatch = watch;
+            ShellExecuteW(window, L"open", watch.c_str(), NULL, NULL, SW_SHOWNORMAL);
+        }
+        return;
+    }
     logLines.push_back(line);
     if (logLines.size() > 300) logLines.erase(logLines.begin());
     Post(L"{\"type\":\"log\",\"text\":" + JsonText(line) + L"}");
@@ -378,12 +415,17 @@ static void HandleUi(const std::wstring& message) {
         IniSet(L"geral", L"audio", arg(4));
         IniSet(L"geral", L"publico", arg(5));
         IniSet(L"geral", L"auto", arg(6) == L"1" ? L"1" : L"0");
-        Start(_wtoi(arg(1).c_str()), _wtoi(arg(2).c_str()), _wtoi(arg(3).c_str()), arg(4) == L"1", arg(5) == L"1", arg(6) == L"1");
+        // arg(7): "" (transmissão), "jam" (criar) ou "join" (entrar no link arg(8)).
+        std::wstring mode = arg(7) == L"jam" || arg(7) == L"join" ? arg(7) : L"";
+        if (mode == L"join" && arg(8).compare(0, 4, L"http") != 0) return;
+        Start(_wtoi(arg(1).c_str()), _wtoi(arg(2).c_str()), _wtoi(arg(3).c_str()), arg(4) == L"1", arg(5) == L"1", arg(6) == L"1",
+              mode, arg(8));
     }
     else if (cmd == L"stop") Stop();
     else if (cmd == L"copy") CopyLink();
     else if (cmd == L"open" && !link.empty()) ShellExecuteW(window, L"open", link.c_str(), NULL, NULL, SW_SHOWNORMAL);
     else if (cmd == L"send") Send(arg(1));
+    else if (cmd == L"jam-open" && !jamWatch.empty()) ShellExecuteW(window, L"open", jamWatch.c_str(), NULL, NULL, SW_SHOWNORMAL);
     else if (cmd == L"screen") {
         int monitor = _wtoi(arg(1).c_str());
         if (monitor >= 0 && monitor < (int)monitors.size())

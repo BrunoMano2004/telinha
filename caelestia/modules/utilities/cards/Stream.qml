@@ -14,7 +14,7 @@ StyledRect {
     property ScreenState screenState
 
     readonly property bool live: Telinha.url !== ""
-    readonly property real nonAnimHeight: btnLayout.implicitHeight + (live ? linkRow.implicitHeight + layout.spacing : 0) + Tokens.padding.large * 2
+    readonly property real nonAnimHeight: btnLayout.implicitHeight + (live ? linkRow.implicitHeight + layout.spacing : 0) + (!Telinha.running ? jamRow.implicitHeight + layout.spacing : 0) + Tokens.padding.large * 2
 
     implicitHeight: layout.implicitHeight + Tokens.padding.large * 2
 
@@ -62,7 +62,7 @@ StyledRect {
 
                 StyledText {
                     Layout.fillWidth: true
-                    text: Tr.tr("Screen share")
+                    text: Telinha.running && Telinha.inJam ? Tr.tr("Jam") : Tr.tr("Screen share")
                     font: Tokens.font.body.medium
                     elide: Text.ElideRight
                 }
@@ -73,7 +73,15 @@ StyledRect {
                         if (Telinha.selecting)
                             return Tr.tr("Choose a screen...");
                         if (!root.live)
-                            return Tr.tr("Ready");
+                            return Telinha.running && Telinha.mode === "join" ? Tr.tr("Joining the jam...") : Tr.tr("Ready");
+                        if (Telinha.inJam) {
+                            const paused = Telinha.sharePaused ? " · " + Tr.tr("your screen is paused") : "";
+                            if (!Telinha.jamHost)
+                                return Tr.tr("In the jam · sharing your screen") + paused;
+                            const others = Telinha.jamScreens.length;
+                            const watching = Telinha.room ? Telinha.room.viewers.length : 0;
+                            return Tr.tr("Live · %1 other screens · %2 watching").arg(others).arg(watching) + paused;
+                        }
                         const n = Telinha.viewers.length;
                         if (Telinha.switchingScreen)
                             return Tr.tr("Live · choosing a new screen...");
@@ -129,9 +137,48 @@ StyledRect {
             }
 
             IconButton {
+                // Jam: a sua página, com as telas dos outros.
+                visible: Telinha.inJam
+                icon: "open_in_new"
+                type: IconButton.Text
+                onClicked: Telinha.openJam()
+            }
+
+            IconButton {
+                visible: Telinha.inJam
+                icon: Telinha.sharePaused ? "play_arrow" : "pause"
+                type: IconButton.Text
+                onClicked: Telinha.setSharing(Telinha.sharePaused)
+            }
+
+            IconButton {
                 icon: "content_copy"
                 type: IconButton.Text
                 onClicked: Telinha.copyLink()
+            }
+        }
+
+        // Jam: várias telas num link só. Entrar usa o link da área de transferência.
+        RowLayout {
+            id: jamRow
+
+            visible: !Telinha.running
+            spacing: Tokens.spacing.small
+
+            IconTextButton {
+                Layout.fillWidth: true
+                icon: "groups"
+                text: Tr.tr("Create jam")
+                type: IconTextButton.Tonal
+                onClicked: Telinha.startJam()
+            }
+
+            IconTextButton {
+                Layout.fillWidth: true
+                icon: "login"
+                text: Tr.tr("Join copied jam")
+                type: IconTextButton.Tonal
+                onClicked: Telinha.joinJam()
             }
         }
     }

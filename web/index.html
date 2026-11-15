@@ -117,6 +117,20 @@ function ended(text, canRejoin) {
 
 // Tempo máximo para uma tentativa chegar ao vídeo; depois disso, recomeça do zero.
 const CONNECT_TIMEOUT_MS = 20000;
+// Tentativas seguidas sem vídeo; a partir de 2, explica o que está acontecendo.
+let failedAttempts = 0;
+const BLOCKED_TEXT = 'Não foi possível ligar o vídeo direto entre você e quem transmite: a rede de um ' +
+  'dos lados (roteador, firewall ou operadora) bloqueia esse tipo de conexão. Tentando de novo… ' +
+  'Se continuar, tente outra rede (por exemplo, o 4G/5G do celular).';
+
+// Resumo dos candidatos ICE de uma linha SDP "candidate:": tipo e família do endereço.
+function candidateKind(line) {
+  const parts = line.split(' ');
+  const address = parts[4] || '';
+  const type = parts[parts.indexOf('typ') + 1] || '?';
+  const family = address.endsWith('.local') ? 'mDNS' : address.includes(':') ? 'IPv6' : 'IPv4';
+  return `${type}/${family}`;
+}
 
 function connect() {
   // Variáveis locais: handlers de uma tentativa antiga nunca mexem na nova.
@@ -130,7 +144,10 @@ function connect() {
     bundlePolicy: 'max-bundle',
     iceServers: remote ? [{ urls: 'stun:stun.l.google.com:19302' }] : [],
   });
-  if (!prevPc) setStatus('Conectando…');
+  if (!prevPc) setStatus(failedAttempts >= 2 ? BLOCKED_TEXT : 'Conectando…');
+  const kinds = { local: {}, remote: {} };
+  const count = (side, line) => { const k = candidateKind(line); kinds[side][k] = (kinds[side][k] || 0) + 1; };
+  const summary = (side) => Object.entries(kinds[side]).map(([k, n]) => `${k}×${n}`).join(' ') || 'nenhum';
   ws.onopen = () => ws.send(JSON.stringify({ type: 'hello', name: viewerName, device: deviceName(), client: clientId }));
   // Fim definitivo (sem nova tentativa).
   const stop = (text, canRejoin) => {
@@ -151,11 +168,16 @@ function connect() {
     if (done) return;
     done = true;
     clearTimeout(timer);
+    // Antes de fechar o WebSocket, que é por onde o diagnóstico chega a quem transmite.
+    if (pc !== activePc) log(`sem vídeo nesta tentativa · ICE ${pc.iceConnectionState} · caminhos daqui: ${summary('local')} · de lá: ${summary('remote')}`);
     ws.onclose = null;
     try { ws.close(); } catch {}
     // A conexão em uso fica aberta: mantém a última imagem até a próxima conectar.
-    if (pc !== activePc) pc.close();
-    setStatus(text);
+    if (pc !== activePc) {
+      pc.close();
+      failedAttempts++;
+    }
+    setStatus(failedAttempts >= 2 && !activePc ? BLOCKED_TEXT : text);
     setTimeout(connect, delay);
   };
   const timer = setTimeout(() => retry('Reconectando…', 0), CONNECT_TIMEOUT_MS);
@@ -171,17 +193,28 @@ function connect() {
     }
   };
   pc.onicecandidate = (e) => {
+    if (e.candidate?.candidate) count('local', e.candidate.candidate);
     if (e.candidate && ws.readyState === 1) {
       ws.send(JSON.stringify({ type: 'ice', candidate: e.candidate.candidate,
                                sdpMLineIndex: e.candidate.sdpMLineIndex ?? 0 }));
     }
   };
   pc.oniceconnectionstatechange = () => log(`ICE ${pc.iceConnectionState}`);
-  pc.onicegatheringstatechange = () => log(`coleta ICE ${pc.iceGatheringState}`);
+  pc.onicegatheringstatechange = () => {
+    log(`coleta ICE ${pc.iceGatheringState}${pc.iceGatheringState === 'complete' ? ` · caminhos daqui: ${summary('local')}` : ''}`);
+  };
   pc.onconnectionstatechange = () => {
     log(`conexão ${pc.connectionState}`);
     if (pc.connectionState === 'connected') {
       clearTimeout(timer);
+      failedAttempts = 0;
+      // Qual caminho funcionou (direto, via NAT, IPv4/IPv6): ajuda a entender redes difíceis.
+      pc.getStats().then((report) => {
+        let pair;
+        report.forEach((r) => { if (r.type === 'candidate-pair' && r.nominated && r.state === 'succeeded') pair = r; });
+        const side = (id) => { const c = id && report.get(id); return c ? `${c.candidateType}/${(c.address || c.ip || '').includes(':') ? 'IPv6' : 'IPv4'}` : '?'; };
+        if (pair) log(`caminho em uso: daqui ${side(pair.localCandidateId)} → lá ${side(pair.remoteCandidateId)}`);
+      }).catch(() => {});
       // Só agora larga a conexão anterior: a última imagem fica na tela até aqui.
       // Vídeo e áudio chegam em eventos separados; o elemento recebe as duas trilhas.
       video.srcObject = new MediaStream(pc.getReceivers().map((r) => r.track));
@@ -221,6 +254,7 @@ function connect() {
         setStatus(`Erro na negociação do vídeo: ${err.message}`);
       }
     } else if (msg.type === 'ice') {
+      if (msg.candidate) count('remote', msg.candidate);
       try { await pc.addIceCandidate({ candidate: msg.candidate, sdpMLineIndex: msg.sdpMLineIndex }); } catch {}
     } else if (msg.type === 'full') {
       retry('A transmissão está cheia. Tentando de novo em instantes…', 5000);

@@ -21,6 +21,22 @@ Singleton {
     property var blocked: []   // [{key, name, device, ip}]
     property var liveApps: []  // [{name, on, voice}] apps tocando som agora
     property bool switchingScreen: false
+    // Log da transmissão atual (detalhes técnicos), para copiar e investigar.
+    property var logLines: []
+
+    function addLog(line: string): void {
+        if (!line.trim())
+            return;
+        const lines = logLines.concat([line]);
+        logLines = lines.length > 300 ? lines.slice(lines.length - 300) : lines;
+    }
+
+    function copyLog(): void {
+        if (!logLines.length)
+            return;
+        Quickshell.clipboardText = logLines.join("\n");
+        Toaster.toast(Tr.tr("Technical details copied"), Tr.tr("%1 lines").arg(logLines.length), "content_copy");
+    }
 
     // Preferências (salvas em ~/.local/state/caelestia/telinha.json).
     property bool audio: true
@@ -58,6 +74,7 @@ Singleton {
         url = "";
         lastError = "";
         viewers = [];
+        logLines = [];
         blocked = [];
         liveApps = [];
         autoNow = null;
@@ -192,6 +209,7 @@ Singleton {
                         root.autoNow = data.auto ? data : null;
                     return;
                 }
+                root.addLog(line);
                 const link = line.match(/^Assista em: (\S+)/);
                 if (link) {
                     root.url = link[1];
@@ -203,6 +221,7 @@ Singleton {
 
         stderr: SplitParser {
             onRead: line => {
+                root.addLog(line);
                 if (line.trim() && !line.startsWith("aviso"))
                     root.lastError = line.replace(/^Error: /, "");
             }

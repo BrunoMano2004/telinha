@@ -23,7 +23,12 @@ paru -S telinha-git     # ou yay -S telinha-git
 telinha-caelestia       # adiciona o card ao Caelestia (rode como seu usuário)
 ```
 
-Rode `telinha-caelestia` de novo depois de atualizar o `caelestia-shell`.
+O `telinha-caelestia` só mexe no que é do telinha: se você já tem uma cópia do
+Caelestia em `~/.config/quickshell/caelestia` (com módulos seus, por exemplo), ela é
+usada como está; as alterações do telinha ficam entre `// >>> telinha` e
+`// <<< telinha`, e rodar de novo substitui só elas. Antes de mexer, os arquivos
+alterados vão para `~/.local/state/telinha/backups/`. `telinha-caelestia --remove`
+tira o telinha e deixa o resto intacto.
 
 Ou a partir do código:
 

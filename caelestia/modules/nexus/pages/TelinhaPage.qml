@@ -281,6 +281,43 @@ PageBase {
                 onToggled: Telinha.setApp(modelData.name, checked)
             }
         }
+
+        // Detalhes técnicos: o log da transmissão (inclui o que o navegador de
+        // cada espectador relata sobre a conexão).
+        SectionHeader {
+            text: Tr.tr("Technical details")
+        }
+
+        RowButton {
+            first: true
+            last: Telinha.logLines.length === 0
+            disabled: Telinha.logLines.length === 0
+            icon: "content_copy"
+            text: Tr.tr("Copy technical details")
+            subtext: Tr.tr("Connection log of the current share, useful when someone can't watch")
+            onClicked: Telinha.copyLog()
+        }
+
+        ConnectedRect {
+            visible: Telinha.logLines.length > 0
+            last: true
+            Layout.fillWidth: true
+            implicitHeight: logText.implicitHeight + Tokens.padding.medium * 2
+
+            StyledText {
+                id: logText
+
+                anchors.fill: parent
+                anchors.margins: Tokens.padding.medium
+                anchors.leftMargin: Tokens.padding.largeIncreased
+                text: Telinha.logLines.slice(-12).join("\n")
+                color: Colours.palette.m3onSurfaceVariant
+                font.family: "monospace"
+                font.pointSize: Tokens.font.label.small.pointSize
+                wrapMode: Text.WrapAnywhere
+                textFormat: Text.PlainText
+            }
+        }
     }
 
     // Linha de pessoa (espectador ou bloqueado) com botões de ação à direita.

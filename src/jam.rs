@@ -165,7 +165,8 @@ enum FromMember {
 }
 
 /// Um navegador na jam: entra na sala e pede as telas que quer ver.
-pub async fn handle_member(socket: WebSocket, ip: String, app: Arc<App>) {
+/// `local`: o `?local=` da página (aberta pelo próprio telinha).
+pub async fn handle_member(socket: WebSocket, ip: String, local: String, app: Arc<App>) {
     let room = app.room.clone().expect("anfitrião");
     let (mut sink, mut incoming) = socket.split();
     let reply = |kind: &str| Message::Text(format!(r#"{{"type":"{kind}"}}"#).into());
@@ -194,7 +195,13 @@ pub async fn handle_member(socket: WebSocket, ip: String, app: Arc<App>) {
     let id = room.next_id();
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
     let (media_tx, mut media_rx) = mpsc::channel::<Vec<u8>>(MEDIA_QUEUE);
-    if let Err(kind) = room.join_member(id, hello.name.clone(), hello.device.clone(), tx.clone(), media_tx) {
+    let info = room::MemberInfo {
+        name: hello.name.clone(),
+        device: hello.device.clone(),
+        client: hello.client.clone(),
+        local: if valid_client(&local) { local } else { String::new() },
+    };
+    if let Err(kind) = room.join_member(id, info, tx.clone(), media_tx) {
         let _ = sink.send(reply(kind)).await;
         return;
     }
@@ -264,9 +271,9 @@ pub async fn handle_member(socket: WebSocket, ip: String, app: Arc<App>) {
             Ok(FromMember::Unwatch { sid }) => room.unwatch(id, sid),
             Ok(FromMember::Signal { sid, payload }) => room.member_signal(id, sid, &payload),
             Ok(FromMember::Keyframe { sid }) => room.member_keyframe(id, sid),
-            Ok(FromMember::Log { text }) => println!("  #{id} {}", text.chars().take(500).collect::<String>()),
+            Ok(FromMember::Log { text }) => println!("  #{id} {}", viewers::one_line(&text, 500)),
             Ok(FromMember::Other) => {}
-            Err(e) => eprintln!("espectador #{id}: mensagem inválida: {e}"),
+            Err(e) => eprintln!("espectador #{id}: mensagem inválida: {}", viewers::one_line(&e.to_string(), 200)),
         }
     }
 
@@ -415,14 +422,14 @@ pub async fn handle_presenter(socket: WebSocket, ip: String, app: Arc<App>) {
         match msg {
             Message::Text(text) => match serde_json::from_str::<FromPresenter>(&text) {
                 Ok(FromPresenter::Signal { session, payload }) => room.presenter_signal(id, session, &payload),
-                Ok(FromPresenter::Closed { session, reason }) => room.presenter_closed(id, session, &reason),
+                Ok(FromPresenter::Closed { session, reason }) => room.presenter_closed(id, session, &viewers::one_line(&reason, 100)),
                 Ok(FromPresenter::Share { on }) => {
                     room.set_sharing(id, on);
                     println!("tela #{id} {name} {}", if on { "voltou a compartilhar" } else { "pausou" });
                 }
-                Ok(FromPresenter::Log { text }) => println!("  tela #{id} {}", text.chars().take(500).collect::<String>()),
+                Ok(FromPresenter::Log { text }) => println!("  tela #{id} {}", viewers::one_line(&text, 500)),
                 Ok(FromPresenter::Other) => {}
-                Err(e) => eprintln!("tela #{id}: mensagem inválida: {e}"),
+                Err(e) => eprintln!("tela #{id}: mensagem inválida: {}", viewers::one_line(&e.to_string(), 200)),
             },
             Message::Binary(data) => room.presenter_media(id, &data),
             Message::Close(_) => break,
@@ -521,6 +528,7 @@ pub async fn run_uplink(
     own_page: bool,
 ) -> anyhow::Result<()> {
     use tokio_tungstenite::tungstenite::Message as WsMessage;
+    use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
     let uplink = app.uplink.clone().expect("modo --join");
     let url = uplink_url(&link)?;
@@ -532,7 +540,13 @@ pub async fn run_uplink(
     loop {
         let attempt = tokio::select! {
             _ = shutdown.wait_for(|s| *s) => return Ok(()),
-            r = tokio_tungstenite::connect_async(url.as_str()) => r,
+            // Do anfitrião só vem sinalização: mensagens pequenas. Sem Nagle,
+            // os quadros do relé saem na hora.
+            r = tokio_tungstenite::connect_async_with_config(
+                url.as_str(),
+                Some(WebSocketConfig::default().max_message_size(Some(1 << 20)).max_frame_size(Some(1 << 20))),
+                true,
+            ) => r,
         };
         let ws = match attempt {
             Ok((ws, _)) => ws,
@@ -596,7 +610,7 @@ pub async fn run_uplink(
             let msg = match serde_json::from_str::<FromRoom>(&text) {
                 Ok(msg) => msg,
                 Err(e) => {
-                    eprintln!("mensagem inválida do anfitrião: {e}");
+                    eprintln!("mensagem inválida do anfitrião: {}", viewers::one_line(&e.to_string(), 200));
                     continue;
                 }
             };
@@ -635,7 +649,7 @@ pub async fn run_uplink(
                 FromRoom::Close { session } => uplink.publisher.close(session),
                 FromRoom::Signal { session, payload } => {
                     if let Err(e) = uplink.publisher.signal(session, &payload.to_string()) {
-                        eprintln!("sessão {session}: {e:#}");
+                        eprintln!("sessão {session}: {}", viewers::one_line(&format!("{e:#}"), 200));
                     }
                 }
                 FromRoom::Keyframe { session } => uplink.publisher.keyframe(session),
@@ -648,7 +662,8 @@ pub async fn run_uplink(
                 FromRoom::Kicked => break Ended::Final("você foi removido da jam".into()),
                 FromRoom::Blocked => break Ended::Final("o anfitrião bloqueou você".into()),
                 FromRoom::Ended => break Ended::Final("a jam terminou".into()),
-                FromRoom::Error { text } => break Ended::Final(text),
+                // Texto do anfitrião: numa linha e sem HTML (vai para as interfaces).
+                FromRoom::Error { text } => break Ended::Final(viewers::clean_label(&text, 300)),
                 FromRoom::Other => {}
             }
         };
@@ -664,7 +679,7 @@ pub async fn run_uplink(
             Ended::Final(text) => {
                 if !text.is_empty() {
                     println!("@jam-ended {}", json!({ "reason": text }));
-                    eprintln!("{text}");
+                    eprintln!("jam: {text}");
                 }
                 return Ok(());
             }

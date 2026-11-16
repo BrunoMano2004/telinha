@@ -33,6 +33,10 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use stream::{Layer, Streamer};
 
 const VIEWER_PAGE: &str = include_str!("../web/index.html");
+/// Tamanho máximo de uma mensagem de WebSocket: sem limite, qualquer um com o
+/// link poderia encher a memória de quem transmite.
+const BROWSER_MESSAGE_MAX: usize = 256 * 1024;
+const PRESENTER_MESSAGE_MAX: usize = 8 * 1024 * 1024;
 const JAM_PAGE: &str = include_str!("../web/jam.html");
 const COMMON_JS: &str = include_str!("../web/common.js");
 const FAVICON_SVG: &str = include_str!("../assets/telinha.svg");
@@ -159,7 +163,7 @@ struct Args {
 pub(crate) struct App {
     streamer: Arc<Streamer>,
     max_viewers: usize,
-    /// Chave exigida em `?k=` no modo túnel (o link *.trycloudflare.com é público).
+    /// Chave exigida em `?k=` (falta só escutando apenas em 127.0.0.1).
     key: Option<String>,
     /// Pelo túnel todo mundo chega de 127.0.0.1; o IP real vem do cabeçalho
     /// CF-Connecting-IP, que só é confiável nesse modo.
@@ -240,15 +244,18 @@ async fn main() -> Result<()> {
         let listener = tokio::net::TcpListener::bind(addr)
             .await
             .with_context(|| format!("não foi possível escutar em {addr}"))?;
-        let key = args.tunnel.then(|| {
+        // O link sempre leva uma chave aleatória: sem ela, qualquer um na mesma
+        // rede (ou na tailnet) que achasse a porta veria a tela. Só quem escuta
+        // apenas nesta máquina (testes, 127.0.0.1) dispensa a chave.
+        let key = (args.tunnel || !bind.is_loopback()).then(|| {
             rand::rng().sample_iter(rand::distr::Alphanumeric).take(20).map(char::from).collect::<String>()
         });
-        let (tunnel, link) = match &key {
-            Some(key) => {
-                let (child, url) = start_tunnel(args.port).await?;
-                (Some(child), format!("{url}/?k={key}"))
-            }
-            None => (None, format!("http://{host}:{}", args.port)),
+        let query = key.as_ref().map(|k| format!("/?k={k}")).unwrap_or_default();
+        let (tunnel, link) = if args.tunnel {
+            let (child, url) = start_tunnel(args.port).await?;
+            (Some(child), format!("{url}{query}"))
+        } else {
+            (None, format!("http://{host}:{}{query}", args.port))
         };
         (Some(listener), key, tunnel, link)
     };
@@ -582,7 +589,11 @@ async fn jam_presenter_ws(
         return StatusCode::NOT_FOUND.into_response();
     }
     let ip = client_ip(&app, peer, &headers);
-    ws.on_upgrade(move |socket| jam::handle_presenter(socket, ip, app)).into_response()
+    // Quadros do relé passam por aqui: um quadro-chave grande cabe com folga.
+    ws.max_message_size(PRESENTER_MESSAGE_MAX)
+        .max_frame_size(PRESENTER_MESSAGE_MAX)
+        .on_upgrade(move |socket| jam::handle_presenter(socket, ip, app))
+        .into_response()
 }
 
 fn watch_bus(pipeline: &gst::Pipeline) {
@@ -858,8 +869,11 @@ async fn ws_handler(
         return StatusCode::NOT_FOUND.into_response();
     }
     let ip = client_ip(&app, peer, &headers);
+    // O navegador só manda sinalização (SDP, ICE, diagnósticos): pouca coisa.
+    let ws = ws.max_message_size(BROWSER_MESSAGE_MAX).max_frame_size(BROWSER_MESSAGE_MAX);
     if *app.jam_on.borrow() {
-        ws.on_upgrade(move |socket| jam::handle_member(socket, ip, app)).into_response()
+        let local = query.get("local").cloned().unwrap_or_default();
+        ws.on_upgrade(move |socket| jam::handle_member(socket, ip, local, app)).into_response()
     } else {
         ws.on_upgrade(move |socket| handle_viewer(socket, ip, app)).into_response()
     }
@@ -976,7 +990,7 @@ async fn handle_viewer(socket: WebSocket, ip: String, app: Arc<App>) {
         match msg {
             Message::Text(text) => {
                 if let Err(e) = app.streamer.handle_message(id, &text) {
-                    eprintln!("espectador #{id}: {e:#}");
+                    eprintln!("espectador #{id}: {}", viewers::one_line(&format!("{e:#}"), 200));
                 }
             }
             Message::Close(_) => break,

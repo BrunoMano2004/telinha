@@ -163,9 +163,9 @@ let ws = null, me = null, viewerName = '', audioCtx = null, stopped = false, nex
 let presenters = [];
 const tiles = new Map();     // id da tela → tile
 const sessions = new Map();  // sid → conexão
-// Seleção pelo `client` de quem compartilha: continua valendo se a pessoa reconectar.
+// Seleção pelo apelido (`tag`) de quem compartilha: continua valendo se a pessoa reconectar.
 // `auto`: escolhido pela página (uma tela só aparece inteira, com som), não pela pessoa.
-let view = { mode: 'grid', client: null, auto: true };
+let view = { mode: 'grid', tag: null, auto: true };
 // A tela deste computador está na jam (entrou pelo botão "Compartilhar minha tela").
 let sharingHere = false, shareTimer = null;
 let userMuted = localClient !== '';
@@ -229,12 +229,13 @@ function end(text, canRejoin) {
 }
 
 // A sua própria tela não aparece: nem na página aberta pelo telinha
-// (`?local=`), nem nesta, quando ela entrou pelo botão de compartilhar.
-const isOwn = (p) => (localClient && p.client === localClient) || p.client === clientId;
+// (`?local=`), nem nesta, quando ela entrou pelo botão de compartilhar. Quem
+// sabe disso é a sala (`own`); cada tela vem só com um apelido (`tag`).
+const isOwn = (p) => p.own;
 
 function onRoom(msg) {
   me = msg.you;
-  const own = msg.presenters.find((p) => p.client === clientId);
+  const own = !localClient && msg.presenters.find((p) => p.own);
   if (own && !sharingHere) {
     clearTimeout(shareTimer);
     document.getElementById('share-help').hidden = true;
@@ -255,17 +256,17 @@ function onRoom(msg) {
     tile.update(p);
   }
   // A tela selecionada saiu: volta para a grade.
-  if (view.client && !presenters.some((p) => p.client === view.client)) {
+  if (view.tag && !presenters.some((p) => p.tag === view.tag)) {
     if (view.mode !== 'grid' && !view.auto) hint('A tela que você estava vendo saiu da jam.');
-    view = { mode: 'grid', client: null, auto: view.auto };
+    view = { mode: 'grid', tag: null, auto: view.auto };
   }
   // Uma tela só: inteira e com som, como numa transmissão normal. Chegou
   // mais alguém: as outras aparecem ao lado.
   const only = tiles.size === 1 ? [...tiles.values()][0] : null;
-  if (only && view.mode === 'grid') view = { mode: 'solo', client: only.p.client, auto: true };
+  if (only && view.mode === 'grid') view = { mode: 'solo', tag: only.p.tag, auto: true };
   else if (tiles.size > 1 && view.auto && view.mode === 'solo') {
-    view = { mode: 'focus', client: view.client, auto: true };
-    const added = presenters.find((p) => p.client !== view.client);
+    view = { mode: 'focus', tag: view.tag, auto: true };
+    const added = presenters.find((p) => p.tag !== view.tag);
     if (added) hint(`${added.name} entrou na jam. Clique numa tela para vê-la grande.`, 5000);
   }
   render();
@@ -297,8 +298,8 @@ class Tile {
     this.canvas = this.el.querySelector('canvas');
     this.stateEl = this.el.querySelector('.state');
     this.statsEl = this.el.querySelector('.tstats');
-    this.el.onclick = () => select(this.p.client, view.mode === 'solo' ? 'solo' : 'focus');
-    this.el.ondblclick = (e) => { e.stopPropagation(); select(this.p.client, 'solo'); toggleFull(true); };
+    this.el.onclick = () => select(this.p.tag, view.mode === 'solo' ? 'solo' : 'focus');
+    this.el.ondblclick = (e) => { e.stopPropagation(); select(this.p.tag, 'solo'); toggleFull(true); };
     this.setState('Conectando…');
     stage.appendChild(this.el);
   }
@@ -313,7 +314,7 @@ class Tile {
 
   // Camada que esta tela deve receber agora (null = nenhuma).
   wanted() {
-    const selected = view.client === this.p.client;
+    const selected = view.tag === this.p.tag;
     if (view.mode === 'grid') return 'low';
     if (selected) return 'high';
     return view.mode === 'solo' ? null : 'low';
@@ -321,7 +322,7 @@ class Tile {
 
   sync() {
     const layer = this.wanted();
-    this.el.classList.toggle('selected', view.mode !== 'grid' && view.client === this.p.client);
+    this.el.classList.toggle('selected', view.mode !== 'grid' && view.tag === this.p.tag);
     if (!layer) {
       clearTimeout(this.retryTimer);
       this.pending?.close(true);
@@ -478,11 +479,11 @@ class Conn {
 
 // --- Seleção, layout e som -------------------------------------------------------
 
-function select(client, mode) {
+function select(tag, mode) {
   // Com uma tela só não há grade nem faixa lateral: ela fica inteira.
-  if (tiles.size === 1) { client = [...tiles.values()][0].p.client; mode = 'solo'; }
-  if (view.mode === mode && view.client === client) return;
-  view = { mode, client, auto: false };
+  if (tiles.size === 1) { tag = [...tiles.values()][0].p.tag; mode = 'solo'; }
+  if (view.mode === mode && view.tag === tag) return;
+  view = { mode, tag, auto: false };
   // O clique conta como gesto: a partir daqui o navegador deixa tocar som.
   audioCtx?.resume();
   render();
@@ -513,7 +514,7 @@ function render() {
 
 // Só a tela selecionada toca som; na grade, nenhuma.
 function applySound() {
-  const selected = view.mode !== 'grid' ? [...tiles.values()].find((t) => t.p.client === view.client) : null;
+  const selected = view.mode !== 'grid' ? [...tiles.values()].find((t) => t.p.tag === view.tag) : null;
   const hasAudio = !!selected?.p.audio;
   for (const tile of tiles.values()) {
     const on = tile === selected && !userMuted;
@@ -600,7 +601,7 @@ function toggleFull(on) {
 // --- Controles ----------------------------------------------------------------
 
 document.getElementById('btn-grid').onclick = () => select(null, 'grid');
-document.getElementById('btn-solo').onclick = () => select(view.client, view.mode === 'solo' ? 'focus' : 'solo');
+document.getElementById('btn-solo').onclick = () => select(view.tag, view.mode === 'solo' ? 'focus' : 'solo');
 soundBtn.onclick = toggleSound;
 document.getElementById('btn-stats').onclick = toggleStats;
 document.getElementById('btn-full').onclick = () => toggleFull();
@@ -610,12 +611,12 @@ document.onkeydown = (e) => {
   const k = e.key;
   if (k >= '1' && k <= '9') {
     const tile = [...tiles.values()][Number(k) - 1];
-    if (tile) select(tile.p.client, view.mode === 'solo' ? 'solo' : 'focus');
+    if (tile) select(tile.p.tag, view.mode === 'solo' ? 'solo' : 'focus');
   } else if (k === 'Escape' || k === 'g' || k === 'G') {
     if (k === 'Escape' && document.fullscreenElement) return;
     select(null, 'grid');
   } else if ((k === 'v' || k === 'V') && view.mode !== 'grid') {
-    select(view.client, view.mode === 'solo' ? 'focus' : 'solo');
+    select(view.tag, view.mode === 'solo' ? 'focus' : 'solo');
   } else if (k === 's' || k === 'S') toggleStats();
   else if (k === 'f' || k === 'F') toggleFull();
   else if (k === 'm' || k === 'M') toggleSound();

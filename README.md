@@ -134,8 +134,10 @@ Pelo terminal, o equivalente é:
 telinha            # abre o seletor de tela do sistema
 ```
 
-O terminal mostra o link (ex.: `http://desktop.tailXXXX.ts.net:8080`). Quem estiver
-na sua tailnet abre o link no navegador. Na página: **F** ou duplo clique abre a
+O terminal mostra o link (ex.: `http://desktop.tailXXXX.ts.net:8080/?k=…`). Quem
+estiver na sua tailnet abre o link no navegador. A chave `k` vem sempre no link:
+sem ela a página não abre, então achar a porta não basta para ver a sua tela
+(só `--bind 127.0.0.1`, que escuta apenas nesta máquina, dispensa a chave). Na página: **F** ou duplo clique abre a
 tela cheia, e **S** mostra as estatísticas (fps, bitrate, RTT, buffer e decodificador).
 
 | Opção | Padrão | |

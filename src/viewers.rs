@@ -12,6 +12,23 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::oneshot;
 
+/// Texto de fora (página, outro telinha) numa linha só, para imprimir.
+///
+/// A saída do telinha é lida pelas interfaces (Caelestia, app do Windows), que
+/// tratam as linhas começando com `@` como eventos. Uma quebra de linha num
+/// texto de fora criaria um evento falso (abrir um link, trocar a área de
+/// transferência), então todo caractere de controle vira espaço.
+pub fn one_line(text: &str, max: usize) -> String {
+    text.chars().take(max).map(|c| if c.is_control() { ' ' } else { c }).collect()
+}
+
+/// Nome ou aparelho que aparece nas interfaces: sem controle e sem `<`/`>`
+/// (os textos do Caelestia interpretam HTML, que poderia carregar uma imagem
+/// de fora e revelar o seu IP).
+pub fn clean_label(text: &str, max: usize) -> String {
+    text.chars().filter(|c| !c.is_control() && *c != '<' && *c != '>').take(max).collect::<String>().trim().to_string()
+}
+
 /// O que a página informa ao entrar.
 pub struct Hello {
     pub name: String,
@@ -32,10 +49,7 @@ impl Hello {
         if v["type"] != "hello" {
             return None;
         }
-        let field = |key: &str, max: usize| -> String {
-            let raw = v[key].as_str().unwrap_or_default();
-            raw.chars().filter(|c| !c.is_control()).take(max).collect::<String>().trim().to_string()
-        };
+        let field = |key: &str, max: usize| clean_label(v[key].as_str().unwrap_or_default(), max);
         let client: String = field("client", 64).chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').collect();
         let name = field("name", 40);
         Some(Self {
@@ -207,6 +221,9 @@ mod tests {
     fn hello_is_sanitized() {
         let h = Hello::parse(r#"{"type":"hello","name":"  A\u0007na  ","device":"x","client":"ab$c-1"}"#).unwrap();
         assert_eq!((h.name.as_str(), h.client.as_str()), ("Ana", "abc-1"));
+        let h = Hello::parse(r#"{"type":"hello","name":"<img src=x>Bia\n@jam {}"}"#).unwrap();
+        assert_eq!(h.name, "img src=xBia@jam {}");
+        assert_eq!(one_line("oi\n@jam {\"watch\":1}\r", 100), "oi @jam {\"watch\":1} ");
         assert_eq!(Hello::parse(r#"{"type":"hello"}"#).unwrap().name, "Anônimo");
         assert!(Hello::parse(r#"{"type":"answer"}"#).is_none());
     }

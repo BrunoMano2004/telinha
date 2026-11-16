@@ -52,9 +52,18 @@ struct Presenter {
     link: Link,
 }
 
+/// Um navegador na sala.
+pub struct MemberInfo {
+    pub name: String,
+    pub device: String,
+    /// Id do navegador (o mesmo do bloqueio). Nunca vai para outros navegadores.
+    pub client: String,
+    /// `?local=` da página aberta pelo próprio telinha: o id daquele telinha.
+    pub local: String,
+}
+
 struct Member {
-    name: String,
-    device: String,
+    info: MemberInfo,
     tx: mpsc::UnboundedSender<String>,
     media: mpsc::Sender<Vec<u8>>,
 }
@@ -98,6 +107,9 @@ pub struct Room {
     max_presenters: usize,
     max_members: usize,
     locked: AtomicBool,
+    /// Gera o apelido (`tag`) de cada tela a partir do id dela, com chaves
+    /// aleatórias deste processo: estável enquanto a jam dura e sem revelar o id.
+    tags: std::hash::RandomState,
 }
 
 fn signal_json(key: &str, id: u64, payload: &str) -> String {
@@ -112,6 +124,7 @@ impl Room {
             max_presenters: max_presenters.max(1),
             max_members,
             locked: AtomicBool::new(false),
+            tags: std::hash::RandomState::new(),
         }
     }
 
@@ -135,8 +148,7 @@ impl Room {
     pub fn join_member(
         &self,
         id: u64,
-        name: String,
-        device: String,
+        info: MemberInfo,
         tx: mpsc::UnboundedSender<String>,
         media: mpsc::Sender<Vec<u8>>,
     ) -> Result<(), &'static str> {
@@ -147,7 +159,7 @@ impl Room {
         if inner.members.len() >= self.max_members {
             return Err("full");
         }
-        inner.members.insert(id, Member { name, device, tx, media });
+        inner.members.insert(id, Member { info, tx, media });
         drop(inner);
         self.broadcast();
         Ok(())
@@ -231,7 +243,7 @@ impl Room {
                 let publisher = publisher.clone();
                 drop(inner);
                 if let Err(e) = publisher.signal(session, &payload.to_string()) {
-                    eprintln!("sessão {session}: {e:#}");
+                    eprintln!("sessão {session}: {}", crate::viewers::one_line(&format!("{e:#}"), 200));
                 }
             }
         }
@@ -396,17 +408,27 @@ impl Room {
         }
     }
 
-    fn presenters_json(inner: &Inner) -> Vec<Value> {
+    /// Telas da sala. Para um navegador (`member`), cada uma vem com um
+    /// apelido (`tag`) e `own` (é a tela deste navegador ou do telinha que abriu
+    /// esta página), sem o id real de ninguém.
+    fn presenters_json(&self, inner: &Inner, member: Option<&MemberInfo>) -> Vec<Value> {
+        use std::hash::BuildHasher;
         let mut ids: Vec<&u64> = inner.presenters.keys().collect();
         ids.sort();
         ids.into_iter()
             .map(|id| {
                 let p = &inner.presenters[id];
                 let watchers = inner.sessions.values().filter(|s| s.presenter == *id).count();
-                json!({
-                    "id": id, "name": p.info.name, "os": p.info.os, "client": p.info.client,
+                let mut v = json!({
+                    "id": id, "name": p.info.name, "os": p.info.os,
                     "audio": p.info.audio, "sharing": p.sharing, "host": p.local, "sessions": watchers,
-                })
+                });
+                if let Some(m) = member {
+                    let client = &p.info.client;
+                    v["tag"] = format!("{:016x}", self.tags.hash_one(client)).into();
+                    v["own"] = (!client.is_empty() && (*client == m.client || *client == m.local)).into();
+                }
+                v
             })
             .collect()
     }
@@ -423,7 +445,7 @@ impl Room {
 
     fn publish(&self, to_members: bool) {
         let inner = self.inner.lock().unwrap();
-        let presenters = Self::presenters_json(&inner);
+        let presenters = self.presenters_json(&inner, None);
         let mut members: Vec<(&u64, &Member)> = inner.members.iter().collect();
         members.sort_by_key(|(id, _)| **id);
         // Quem está vendo o quê (a tela e a camada), para as interfaces.
@@ -434,12 +456,15 @@ impl Room {
                     inner.sessions.values().filter(|s| s.member == **id).map(|s| (s.presenter, s.layer)).collect();
                 watching.sort_by_key(|(p, _)| *p);
                 let watching: Vec<Value> = watching.into_iter().map(|(p, l)| json!({ "pub": p, "layer": l })).collect();
-                json!({ "id": id, "name": m.name, "device": m.device, "watching": watching })
+                json!({ "id": id, "name": m.info.name, "device": m.info.device, "watching": watching })
             })
             .collect();
         let locked = self.is_locked();
+        // Cada navegador recebe só o que a página usa: as telas (com apelido)
+        // e se a sala está trancada. Quem mais assiste fica só com o anfitrião.
         for (id, m) in members.iter().filter(|_| to_members) {
-            let msg = json!({ "type": "room", "you": id, "locked": locked, "presenters": presenters, "viewers": viewers });
+            let presenters = self.presenters_json(&inner, Some(&m.info));
+            let msg = json!({ "type": "room", "you": id, "locked": locked, "presenters": presenters });
             let _ = m.tx.send(msg.to_string());
         }
         println!("@room {}", json!({ "locked": locked, "presenters": presenters, "viewers": viewers }));
@@ -456,12 +481,49 @@ mod tests {
 
     type Rx = mpsc::UnboundedReceiver<String>;
 
+    fn minfo(name: &str) -> MemberInfo {
+        MemberInfo { name: name.into(), device: "Firefox".into(), client: format!("b-{name}"), local: String::new() }
+    }
+
     fn member(room: &Room) -> (u64, Rx, mpsc::Receiver<Vec<u8>>) {
         let id = room.next_id();
         let (tx, rx) = mpsc::unbounded_channel();
         let (media_tx, media_rx) = mpsc::channel(2);
-        room.join_member(id, "Ana".into(), "Firefox".into(), tx, media_tx).unwrap();
+        room.join_member(id, minfo("Ana"), tx, media_tx).unwrap();
         (id, rx, media_rx)
+    }
+
+    fn last_room(rx: &mut Rx) -> Value {
+        let mut last = Value::Null;
+        while let Ok(text) = rx.try_recv() {
+            let v: Value = serde_json::from_str(&text).unwrap();
+            if v["type"] == "room" {
+                last = v;
+            }
+        }
+        last
+    }
+
+    /// O navegador não recebe o id de ninguém nem a lista de quem assiste;
+    /// só sabe qual tela é a dele (a que entrou pelo botão da página).
+    #[test]
+    fn browsers_get_tags_not_ids() {
+        let room = Room::new(5, 10);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (media, _media_rx) = mpsc::channel(2);
+        let me = MemberInfo { name: "Ana".into(), device: "x".into(), client: "c-Bia".into(), local: String::new() };
+        room.join_member(room.next_id(), me, tx, media).unwrap();
+        let (_other, _orx, _omedia) = member(&room);
+        let (_bia, _brx) = presenter(&room, "Bia");
+        let (_caio, _crx) = presenter(&room, "Caio");
+        let msg = last_room(&mut rx);
+        assert!(msg.get("viewers").is_none(), "{msg}");
+        let text = msg.to_string();
+        assert!(!text.contains("c-Bia") && !text.contains("c-Caio") && !text.contains("b-Ana"), "{text}");
+        let screens = msg["presenters"].as_array().unwrap();
+        let own: Vec<bool> = screens.iter().map(|p| p["own"].as_bool().unwrap()).collect();
+        assert_eq!(own, vec![true, false]);
+        assert_ne!(screens[0]["tag"], screens[1]["tag"]);
     }
 
     fn presenter(room: &Room, name: &str) -> (u64, Rx) {
@@ -569,13 +631,13 @@ mod tests {
         member(&room);
         let (tx, _rx) = mpsc::unbounded_channel();
         let (media, _m) = mpsc::channel(1);
-        assert_eq!(room.join_member(98, "x".into(), String::new(), tx, media), Err("full"));
+        assert_eq!(room.join_member(98, minfo("x"), tx, media), Err("full"));
 
         let room = Room::new(5, 5);
         room.set_locked(true);
         let (tx, _rx) = mpsc::unbounded_channel();
         let (media, _m) = mpsc::channel(1);
-        assert_eq!(room.join_member(1, "x".into(), String::new(), tx, media), Err("locked"));
+        assert_eq!(room.join_member(1, minfo("x"), tx, media), Err("locked"));
         let (tx, _rx) = mpsc::unbounded_channel();
         assert!(room.add_presenter(2, info("c"), Link::Remote(tx), false).is_err());
     }

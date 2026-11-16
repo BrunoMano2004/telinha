@@ -96,6 +96,38 @@ pub struct Streamer {
     /// Quadros de vídeo enviados/descartados no modo túnel.
     tunnel_sent: Arc<std::sync::atomic::AtomicU64>,
     tunnel_dropped: Arc<std::sync::atomic::AtomicU64>,
+    key_requests: Arc<KeyThrottle>,
+}
+
+/// Intervalo mínimo entre pedidos de quadro-chave vindos de quem assiste.
+const KEY_REQUEST_GAP_MS: u64 = 1000;
+
+/// Pedidos de quadro-chave de quem assiste (fila cheia no túnel ou no relé,
+/// página pedindo para recomeçar): no máximo um por intervalo em cada camada,
+/// venham de quantas pessoas vierem. Cada quadro-chave é grande e vai para
+/// todos; sem esse limite, uma conexão ruim (ou alguém de propósito) estragaria
+/// a imagem de todo mundo.
+#[derive(Default)]
+struct KeyThrottle {
+    last_ms: [std::sync::atomic::AtomicU64; 2],
+}
+
+impl KeyThrottle {
+    fn allow(&self, layer: Layer) -> bool {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let slot = &self.last_ms[layer as usize];
+        let last = slot.load(Ordering::Relaxed);
+        now.saturating_sub(last) >= KEY_REQUEST_GAP_MS
+            && slot.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+    }
+}
+
+fn force_key_unit(encoder: &gst::Element) {
+    let event = gst_video::UpstreamForceKeyUnitEvent::builder().all_headers(true).build();
+    encoder.static_pad("src").unwrap().send_event(event);
 }
 
 /// Sem ninguém assistindo, espera isto antes de parar captura e encoder.
@@ -179,6 +211,7 @@ impl Streamer {
             max_fps,
             tunnel_sent: Arc::default(),
             tunnel_dropped: Arc::default(),
+            key_requests: Arc::default(),
             pipeline,
         })
     }
@@ -434,16 +467,13 @@ impl Streamer {
                 (Arc::default(), Arc::default())
             };
             let encoder = self.video(layer).encoder.clone();
-            let last_request = Mutex::new(std::time::Instant::now() - std::time::Duration::from_secs(10));
+            let throttle = self.key_requests.clone();
             out.connect("handoff", false, move |values| {
                 let Ok(buffer) = values[1].get::<gst::Buffer>() else { return None };
                 let key = video && !buffer.flags().contains(gst::BufferFlags::DELTA_UNIT);
                 let request_key = || {
-                    let mut last = last_request.lock().unwrap();
-                    if last.elapsed() > std::time::Duration::from_millis(500) {
-                        *last = std::time::Instant::now();
-                        let event = gst_video::UpstreamForceKeyUnitEvent::builder().all_headers(true).build();
-                        encoder.static_pad("src").unwrap().send_event(event);
+                    if throttle.allow(layer) {
+                        force_key_unit(&encoder);
                     }
                 };
                 if video && !key && need_key.load(Ordering::Relaxed) {
@@ -513,8 +543,8 @@ impl Streamer {
         // No modo túnel só os diagnósticos da página interessam.
         let Some(webrtc) = webrtc else {
             match signal {
-                Signal::Log { text } => println!("  #{id} {text}"),
-                Signal::Keyframe => self.request_keyframe(),
+                Signal::Log { text } => println!("  #{id} {}", crate::viewers::one_line(&text, 500)),
+                Signal::Keyframe => self.request_keyframe_of(id),
                 _ => {}
             }
             return Ok(());
@@ -533,7 +563,7 @@ impl Streamer {
                     webrtc.emit_by_name::<()>("add-ice-candidate", &[&sdp_mline_index, &candidate]);
                 }
             }
-            Signal::Log { text } => println!("  #{id} {text}"),
+            Signal::Log { text } => println!("  #{id} {}", crate::viewers::one_line(&text, 500)),
             Signal::Keyframe | Signal::Other => {}
             Signal::Offer { .. } => bail!("o servidor é quem envia a oferta"),
         }
@@ -653,8 +683,7 @@ impl Streamer {
 
     /// Pede um keyframe (IDR) ao encoder da camada — usado quando alguém entra.
     pub fn request_keyframe_for(&self, layer: Layer) {
-        let event = gst_video::UpstreamForceKeyUnitEvent::builder().all_headers(true).build();
-        self.video(self.layer(layer)).encoder.static_pad("src").unwrap().send_event(event);
+        force_key_unit(&self.video(self.layer(layer)).encoder);
     }
 
     /// Encoder da miniatura (jam), para configurar na partida.
@@ -662,10 +691,13 @@ impl Streamer {
         self.low.as_ref().map(|l| &l.encoder)
     }
 
-    /// Pede um keyframe da camada que o espectador `id` recebe.
+    /// Pedido de keyframe de quem assiste (o espectador `id`), na camada
+    /// dele e respeitando o limite de um por segundo.
     pub fn request_keyframe_of(&self, id: u64) {
         let layer = self.state.lock().unwrap().viewers.get(&id).map(|v| v.layer);
-        if let Some(layer) = layer {
+        if let Some(layer) = layer
+            && self.key_requests.allow(layer)
+        {
             self.request_keyframe_for(layer);
         }
     }
@@ -706,6 +738,16 @@ mod tests {
         streamer.pipeline.set_state(gst::State::Null).unwrap();
         assert!((26..=34).contains(&at30), "limite 30 fps deixou passar {at30}");
         assert!((54..=66).contains(&at60), "limite 60 fps deixou passar {at60}");
+    }
+
+    #[test]
+    fn viewer_key_requests_are_throttled_per_layer() {
+        let throttle = KeyThrottle::default();
+        assert!(throttle.allow(Layer::High));
+        assert!(!throttle.allow(Layer::High), "segundo pedido no mesmo segundo");
+        assert!(throttle.allow(Layer::Low), "a outra camada tem o próprio limite");
+        throttle.last_ms[0].store(0, Ordering::Relaxed);
+        assert!(throttle.allow(Layer::High));
     }
 
     /// Contador de buffers que chegam a um elemento nomeado.

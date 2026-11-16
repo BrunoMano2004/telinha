@@ -96,8 +96,13 @@ Singleton {
             paste.running = true;
     }
 
+    // Só links da web: nada que venha do telinha pode abrir outro tipo de endereço.
+    function isWebLink(link: string): bool {
+        return /^https?:\/\/[^\s]+$/.test(link ?? "");
+    }
+
     function openJam(): void {
-        if (jam?.watch)
+        if (isWebLink(jam?.watch))
             Qt.openUrlExternally(jam.watch);
     }
 
@@ -336,7 +341,7 @@ Singleton {
                             Toaster.toast(Tr.tr("Jam started"), Tr.tr("Link copied: %1").arg(data.link), "groups", Toast.Success);
                         else
                             Toaster.toast(Tr.tr("You joined the jam"), Tr.tr("Your screen is shared; opening the other screens"), "groups", Toast.Success);
-                        Qt.openUrlExternally(data.watch);
+                        root.openJam();
                     } else if (event[1] === "jam-off") {
                         root.mode = "";
                         root.jam = null;

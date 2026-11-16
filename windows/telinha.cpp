@@ -135,6 +135,13 @@ static std::wstring Quote(const std::wstring& value) {
     return result + L"\"";
 }
 
+// Só links da web abrem no navegador: nada vindo do telinha (ou de quem
+// conversa com ele) pode abrir outro tipo de endereço ou programa.
+static bool WebLink(const std::wstring& url) {
+    std::wstring lower = Lower(url.substr(0, 8));
+    return lower.rfind(L"http://", 0) == 0 || lower.rfind(L"https://", 0) == 0;
+}
+
 // --- Link telinha://join?link=<link da jam>&viewer=<id do navegador>
 static std::wstring PercentDecode(const std::wstring& text, bool& ok) {
     std::string bytes;
@@ -467,7 +474,7 @@ static void HandleLine(const std::wstring& line) {
             CopyLink();
             Status(L"Telinha - na jam (link copiado)");
         }
-        if (watch.compare(0, 4, L"http") == 0) {
+        if (WebLink(watch)) {
             jamWatch = watch;
             ShellExecuteW(window, L"open", watch.c_str(), NULL, NULL, SW_SHOWNORMAL);
         }
@@ -513,9 +520,9 @@ static void HandleUi(const std::wstring& message) {
     else if (cmd == L"join-cancel") { pendingJoinLink.clear(); pendingJoinViewer.clear(); }
     else if (cmd == L"stop") Stop();
     else if (cmd == L"copy") CopyLink();
-    else if (cmd == L"open" && !link.empty()) ShellExecuteW(window, L"open", link.c_str(), NULL, NULL, SW_SHOWNORMAL);
+    else if (cmd == L"open" && WebLink(link)) ShellExecuteW(window, L"open", link.c_str(), NULL, NULL, SW_SHOWNORMAL);
     else if (cmd == L"send") Send(arg(1));
-    else if (cmd == L"jam-open" && !jamWatch.empty()) ShellExecuteW(window, L"open", jamWatch.c_str(), NULL, NULL, SW_SHOWNORMAL);
+    else if (cmd == L"jam-open" && WebLink(jamWatch)) ShellExecuteW(window, L"open", jamWatch.c_str(), NULL, NULL, SW_SHOWNORMAL);
     else if (cmd == L"screen") {
         int monitor = _wtoi(arg(1).c_str());
         if (monitor >= 0 && monitor < (int)monitors.size())
@@ -530,7 +537,7 @@ static void HandleUi(const std::wstring& message) {
     else if (cmd == L"update") DownloadUpdate();
     else if (cmd == L"release") {
         std::lock_guard<std::mutex> lock(updateMutex);
-        if (!available.page.empty()) ShellExecuteW(window, L"open", available.page.c_str(), NULL, NULL, SW_SHOWNORMAL);
+        if (WebLink(available.page)) ShellExecuteW(window, L"open", available.page.c_str(), NULL, NULL, SW_SHOWNORMAL);
     }
     else if (cmd == L"save" && (arg(1) == L"monitor" || arg(1) == L"qualidade" || arg(1) == L"audio" || arg(1) == L"publico" || arg(1) == L"auto")) {
         IniSet(L"geral", arg(1), arg(2));
@@ -819,7 +826,7 @@ static void CreateWebView() {
                                     args->get_Uri(&uri);
                                     if (!LocalUri(sender, uri)) {
                                         args->put_Cancel(TRUE);
-                                        if (uri) ShellExecuteW(window, L"open", uri, NULL, NULL, SW_SHOWNORMAL);
+                                        if (uri && WebLink(uri)) ShellExecuteW(window, L"open", uri, NULL, NULL, SW_SHOWNORMAL);
                                     }
                                     if (uri) CoTaskMemFree(uri);
                                     return S_OK;
@@ -829,7 +836,7 @@ static void CreateWebView() {
                                     LPWSTR uri = NULL;
                                     args->get_Uri(&uri);
                                     args->put_Handled(TRUE);
-                                    if (uri) { ShellExecuteW(window, L"open", uri, NULL, NULL, SW_SHOWNORMAL); CoTaskMemFree(uri); }
+                                    if (uri) { if (WebLink(uri)) ShellExecuteW(window, L"open", uri, NULL, NULL, SW_SHOWNORMAL); CoTaskMemFree(uri); }
                                     return S_OK;
                                 }).Get(), &token);
                             Resize();

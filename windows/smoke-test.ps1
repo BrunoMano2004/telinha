@@ -170,12 +170,14 @@ try {
         if ($response.Content -notmatch 'Compartilhar minha tela') { throw 'Com a jam ligada, o link deveria servir a pagina da jam.' }
         $guest = Start-Telinha '--join http://127.0.0.1:18082 --test --encoder x264enc --name Convidado --viewer-id smoke-page'
         $socket.ConnectAsync([uri]'ws://127.0.0.1:18082/ws', $cancel.Token).GetAwaiter().GetResult()
-        Send-Json $socket $cancel.Token '{"type":"hello","name":"Smoke test","device":"CI","client":"smoke-toggle","page":"jam"}'
+        # Esta "pagina" e a que chamou o convidado (mesmo id): a sala marca a tela dele como own.
+        Send-Json $socket $cancel.Token '{"type":"hello","name":"Smoke test","device":"CI","client":"smoke-page","page":"jam"}'
         while ($true) {
             $msg = Receive-Json $socket $cancel.Token
             if ($msg -and $msg.type -eq 'room' -and @($msg.presenters).Count -ge 2) { break }
         }
-        if (-not (@($msg.presenters) | Where-Object { $_.client -eq 'smoke-page' })) { throw 'O convidado deveria usar o id da pagina que o chamou.' }
+        if (-not (@($msg.presenters) | Where-Object { $_.own -and -not $_.host })) { throw 'A sala deveria marcar a tela do convidado como a desta pagina.' }
+        if (($msg | ConvertTo-Json -Depth 5) -match 'smoke-page') { throw 'A sala nao pode mandar o id de ninguem para os navegadores.' }
         $soloHost.StandardInput.WriteLine('jam off')
         while ($true) {
             $msg = Receive-Json $socket $cancel.Token

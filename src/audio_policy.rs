@@ -25,9 +25,16 @@ pub fn select(
     blocked_name: impl Fn(&str) -> bool,
     own_pid: u32,
 ) -> HashSet<u32> {
+    // O app do Telinha (pai do telinha.exe) também fica de fora, com tudo o
+    // que ele abre: a janela da jam (WebView2) toca o som das outras telas,
+    // que não pode voltar para a transmissão.
+    let app_pid = processes
+        .get(&own_pid)
+        .map(|p| p.parent)
+        .filter(|parent| processes.get(parent).is_some_and(|p| p.name.to_lowercase().starts_with("telinha")));
     let blocked: HashSet<_> = processes
         .iter()
-        .filter_map(|(&pid, p)| (pid == own_pid || blocked_name(&p.name)).then_some(pid))
+        .filter_map(|(&pid, p)| (pid == own_pid || Some(pid) == app_pid || blocked_name(&p.name)).then_some(pid))
         .collect();
     let trees: HashMap<_, _> = processes
         .keys()
@@ -96,6 +103,26 @@ mod tests {
             ),
             HashSet::from([4])
         );
+    }
+
+    /// A janela da jam (WebView2, filha do app) não entra no som; outro app
+    /// que também usa WebView2 continua entrando.
+    #[test]
+    fn excludes_the_telinha_app_and_its_jam_window() {
+        let processes: HashMap<_, _> = [
+            (1, 0, "explorer.exe"),
+            (2, 1, "Telinha Desktop.exe"),
+            (3, 2, "telinha.exe"),
+            (4, 2, "msedgewebview2.exe"),
+            (5, 4, "msedgewebview2.exe"),
+            (6, 1, "outroapp.exe"),
+            (7, 6, "msedgewebview2.exe"),
+        ]
+        .into_iter()
+        .map(|(pid, parent, name)| (pid, Process { parent, name: name.into() }))
+        .collect();
+        let sessions = HashSet::from([4, 5, 6, 7]);
+        assert_eq!(select(&sessions, &processes, |_| false, 3), HashSet::from([6]));
     }
 
     #[test]

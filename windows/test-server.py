@@ -68,19 +68,31 @@ def main():
             assert len(data) == size, "websocket encerrado antes da oferta"
             return data
 
+        def receive_json():
+            while True:
+                first, length = exact(2)
+                length &= 127
+                if length == 126:
+                    length = struct.unpack("!H", exact(2))[0]
+                elif length == 127:
+                    length = struct.unpack("!Q", exact(8))[0]
+                data = exact(length)
+                if first & 15 == 1:
+                    return json.loads(data)
+
+        # A sala manda as telas (aqui só a de quem transmite); pede a dela na
+        # qualidade cheia, que vem com som.
+        room = receive_json()
+        while room["type"] != "room":
+            room = receive_json()
+        send_text(json.dumps({"type": "watch", "sid": 1, "pub": room["presenters"][0]["id"],
+                              "layer": "high", "mode": "webrtc"}))
         for _ in range(10):
-            first, length = exact(2)
-            length &= 127
-            if length == 126:
-                length = struct.unpack("!H", exact(2))[0]
-            elif length == 127:
-                length = struct.unpack("!Q", exact(8))[0]
-            data = exact(length)
-            if first & 15 == 1:
-                message = json.loads(data)
-                if message["type"] == "offer":
-                    assert "m=audio" in message["sdp"] and "m=video" in message["sdp"]
-                    break
+            message = receive_json()
+            if message["type"] == "signal" and message["payload"]["type"] == "offer":
+                sdp = message["payload"]["sdp"]
+                assert "m=audio" in sdp and "m=video" in sdp
+                break
         else:
             raise RuntimeError("oferta WebRTC ausente")
         server.stdin.write("q\n")

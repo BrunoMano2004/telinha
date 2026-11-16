@@ -116,7 +116,7 @@ pub struct Room {
     inner: Mutex<Inner>,
     next: AtomicU64,
     max_presenters: usize,
-    max_members: usize,
+    max_members: std::sync::atomic::AtomicUsize,
     locked: AtomicBool,
     /// Pedir para entrar: cada tela nova espera o anfitrião aceitar.
     approve: AtomicBool,
@@ -138,7 +138,7 @@ impl Room {
             inner: Mutex::default(),
             next: AtomicU64::new(1),
             max_presenters: max_presenters.max(1),
-            max_members,
+            max_members: max_members.into(),
             locked: AtomicBool::new(false),
             approve: AtomicBool::new(false),
             active: AtomicBool::new(true),
@@ -216,12 +216,16 @@ impl Room {
         self.inner.lock().unwrap().requests.get(&id).map(|r| r.info.name.clone())
     }
 
-    /// Liga ou desliga o `@room` (a jam do anfitrião ligou ou desligou).
+    /// Quantos navegadores cabem (muda quando a jam liga ou desliga).
+    pub fn set_max_members(&self, max: usize) {
+        self.max_members.store(max, Ordering::Relaxed);
+    }
+
+    /// A jam do anfitrião ligou ou desligou: as páginas mostram ou escondem
+    /// o "Compartilhar minha tela", e as interfaces recebem ou não o `@room`.
     pub fn set_active(&self, active: bool) {
         self.active.store(active, Ordering::Relaxed);
-        if active {
-            self.emit();
-        }
+        self.broadcast();
     }
 
     pub fn is_locked(&self) -> bool {
@@ -242,7 +246,7 @@ impl Room {
         if self.is_locked() {
             return Err("locked");
         }
-        if inner.members.len() >= self.max_members {
+        if inner.members.len() >= self.max_members.load(Ordering::Relaxed) {
             return Err("full");
         }
         inner.members.insert(id, Member { info, tx, media });
@@ -552,7 +556,10 @@ impl Room {
         for (id, m) in members.iter().filter(|_| to_members) {
             let presenters = self.presenters_json(&inner, Some(&m.info));
             let waiting = !m.info.client.is_empty() && inner.requests.values().any(|r| r.info.client == m.info.client);
-            let msg = json!({ "type": "room", "you": id, "locked": locked, "presenters": presenters, "waiting": waiting });
+            let msg = json!({
+                "type": "room", "you": id, "jam": self.active.load(Ordering::Relaxed),
+                "locked": locked, "presenters": presenters, "waiting": waiting,
+            });
             let _ = m.tx.send(msg.to_string());
         }
         if self.active.load(Ordering::Relaxed) {

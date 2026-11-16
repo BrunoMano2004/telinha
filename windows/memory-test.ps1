@@ -50,6 +50,9 @@ foreach ($scenario in $Scenarios) {
         $socket.ConnectAsync([uri]'ws://127.0.0.1:18090/ws', [Threading.CancellationToken]::None).GetAwaiter().GetResult()
         $hello = [Text.Encoding]::UTF8.GetBytes('{"type":"hello","name":"Memoria","device":"CI","client":"mem"}')
         $socket.SendAsync((New-Object 'ArraySegment[byte]' -ArgumentList @(,$hello)), 'Text', $true, [Threading.CancellationToken]::None).GetAwaiter().GetResult()
+        # A tela de quem transmite é sempre a primeira da sala (id 1), na qualidade cheia.
+        $watch = [Text.Encoding]::UTF8.GetBytes('{"type":"watch","sid":1,"pub":1,"layer":"high","mode":"webrtc"}')
+        $socket.SendAsync((New-Object 'ArraySegment[byte]' -ArgumentList @(,$watch)), 'Text', $true, [Threading.CancellationToken]::None).GetAwaiter().GetResult()
         Start-Sleep 5; Show-Memory $server 'com espectador, 5 s'
         Start-Sleep 10; Show-Memory $server 'com espectador, 15 s'
         Start-Sleep 15; Show-Memory $server 'com espectador, 30 s'

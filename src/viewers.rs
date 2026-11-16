@@ -34,12 +34,8 @@ pub struct Hello {
     pub name: String,
     pub device: String,
     pub client: String,
-    /// A página pediu o modo túnel (a conexão direta não fechou).
-    pub tunnel: bool,
     /// Jam: é um telinha que entrou para compartilhar a tela, não um navegador.
     pub presenter: bool,
-    /// Página que o navegador tem aberta: "jam" ou "solo" (vazio nas antigas).
-    pub page: String,
 }
 
 impl Hello {
@@ -56,9 +52,7 @@ impl Hello {
             name: if name.is_empty() { "Anônimo".into() } else { name },
             device: field("device", 60),
             client,
-            tunnel: v["mode"] == "tunnel",
             presenter: v["role"] == "presenter",
-            page: field("page", 10),
         })
     }
 }
@@ -214,7 +208,7 @@ mod tests {
     use super::*;
 
     fn hello(client: &str) -> Hello {
-        Hello { name: "Ana".into(), device: "Firefox · Linux".into(), client: client.into(), tunnel: false, presenter: false, page: String::new() }
+        Hello { name: "Ana".into(), device: "Firefox · Linux".into(), client: client.into(), presenter: false }
     }
 
     #[test]

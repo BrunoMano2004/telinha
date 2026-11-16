@@ -198,9 +198,10 @@ telinha --join "https://….trycloudflare.com/?k=…"   # entra compartilhando a
 
 **Qualquer transmissão vira jam sem parar.** Quem transmite liga a jam quando
 quiser: comando `jam on`, o ícone de grupo no card do Caelestia, ou **Deixar quem
-assiste compartilhar a tela** no app do Windows. As páginas abertas recarregam
-sozinhas e passam a ter o botão **Compartilhar minha tela**. Com `jam off`, o
-link volta a mostrar só a tela de quem transmite, e quem entrou sai.
+assiste compartilhar a tela** no app do Windows. A página é a mesma nos dois
+casos: quem já está assistindo continua, e ela ganha na hora o botão
+**Compartilhar minha tela**. Com `jam off`, o link volta a mostrar só a tela de
+quem transmite, e quem entrou sai.
 
 **Entrar pela página.** Quem assiste e tem o telinha instalado clica em
 **Compartilhar minha tela**. O navegador abre o telinha pelo link

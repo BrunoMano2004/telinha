@@ -15,13 +15,12 @@ mod capture;
 mod stream;
 
 use anyhow::{Context, Result};
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::WebSocketUpgrade;
 use axum::extract::{ConnectInfo, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use clap::Parser;
-use futures_util::{SinkExt, StreamExt};
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use rand::Rng;
@@ -30,14 +29,14 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use stream::{Layer, Streamer};
+use stream::Streamer;
 
-const VIEWER_PAGE: &str = include_str!("../web/index.html");
 /// Tamanho máximo de uma mensagem de WebSocket: sem limite, qualquer um com o
 /// link poderia encher a memória de quem transmite.
 const BROWSER_MESSAGE_MAX: usize = 256 * 1024;
 const PRESENTER_MESSAGE_MAX: usize = 8 * 1024 * 1024;
-const JAM_PAGE: &str = include_str!("../web/jam.html");
+/// A página de quem assiste (transmissão normal e jam são a mesma página).
+const PAGE: &str = include_str!("../web/index.html");
 const COMMON_JS: &str = include_str!("../web/common.js");
 const FAVICON_SVG: &str = include_str!("../assets/telinha.svg");
 const FAVICON_ICO: &[u8] = include_bytes!("../assets/telinha.ico");
@@ -85,7 +84,7 @@ struct Args {
     #[arg(long)]
     encoder: Option<String>,
 
-    /// Número máximo de espectadores simultâneos (padrão: 4; na jam, 12).
+    /// Número máximo de espectadores simultâneos (padrão: 4; com a jam ligada, 12).
     #[arg(long)]
     max_viewers: Option<usize>,
 
@@ -167,7 +166,8 @@ struct Args {
 
 pub(crate) struct App {
     streamer: Arc<Streamer>,
-    max_viewers: usize,
+    /// `--max-viewers`, se dado; senão o limite muda com a jam (ver `viewer_limit`).
+    max_viewers: Option<usize>,
     /// Chave exigida em `?k=` (falta só escutando apenas em 127.0.0.1).
     key: Option<String>,
     /// Pelo túnel todo mundo chega de 127.0.0.1; o IP real vem do cabeçalho
@@ -233,8 +233,6 @@ async fn main() -> Result<()> {
     };
     let encoder = capture::pick_encoder(settings.encoder.as_deref())?;
     // Na jam cada navegador é um participante; o padrão de 4 seria apertado.
-    let max_viewers = args.max_viewers.unwrap_or(4);
-    let max_members = args.max_viewers.unwrap_or(12);
 
     // Quem entra numa jam não escuta nada: só abre uma conexão de saída.
     // Os outros abrem a porta antes de pedir a tela, para falhar cedo se ela
@@ -327,7 +325,7 @@ async fn main() -> Result<()> {
     let name = args.name.clone().unwrap_or_else(jam::default_name);
     let publisher = Arc::new(publisher::Publisher::new(streamer.clone()));
     // Quem transmite sempre tem a sala: a jam pode ser ligada a qualquer momento.
-    let room = joining.is_none().then(|| Arc::new(room::Room::new(args.max_presenters, max_members)));
+    let room = joining.is_none().then(|| Arc::new(room::Room::new(args.max_presenters, viewer_limit(args.max_viewers, args.jam))));
     if let Some(room) = &room {
         room.set_approve(args.jam_approve);
         room.set_active(args.jam);
@@ -335,7 +333,7 @@ async fn main() -> Result<()> {
     let watch_link = jam::with_param(&link, "local", &client);
     let app = Arc::new(App {
         streamer,
-        max_viewers,
+        max_viewers: args.max_viewers,
         key,
         tunnel: args.tunnel,
         viewers: viewers::Registry::default(),
@@ -552,9 +550,14 @@ async fn page(Query(query): Query<HashMap<String, String>>, State(app): State<Ar
     if !authorized(&app, &query) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    // Sem cache: a mesma URL vira a outra página quando a jam liga ou desliga.
-    let page = if *app.jam_on.borrow() { JAM_PAGE } else { VIEWER_PAGE };
-    ([(header::CACHE_CONTROL, "no-store")], Html(page)).into_response()
+    ([(header::CACHE_CONTROL, "no-store")], Html(PAGE)).into_response()
+}
+
+/// Quantos navegadores cabem: `--max-viewers`, ou 4 numa transmissão normal
+/// (cada um recebe a qualidade cheia do seu upload) e 12 na jam (a grade usa
+/// miniaturas).
+fn viewer_limit(explicit: Option<usize>, jam: bool) -> usize {
+    explicit.unwrap_or(if jam { 12 } else { 4 })
 }
 
 impl App {
@@ -566,6 +569,7 @@ impl App {
             return;
         }
         if let Some(room) = &self.room {
+            room.set_max_members(viewer_limit(self.max_viewers, on));
             room.set_active(on);
         }
         if on {
@@ -900,143 +904,8 @@ async fn ws_handler(
     let ip = client_ip(&app, peer, &headers);
     // O navegador só manda sinalização (SDP, ICE, diagnósticos): pouca coisa.
     let ws = ws.max_message_size(BROWSER_MESSAGE_MAX).max_frame_size(BROWSER_MESSAGE_MAX);
-    if *app.jam_on.borrow() {
-        let local = query.get("local").cloned().unwrap_or_default();
-        ws.on_upgrade(move |socket| jam::handle_member(socket, ip, local, app)).into_response()
-    } else {
-        ws.on_upgrade(move |socket| handle_viewer(socket, ip, app)).into_response()
-    }
-}
-
-async fn handle_viewer(socket: WebSocket, ip: String, app: Arc<App>) {
-    let (mut sink, mut incoming) = socket.split();
-    let reply = |kind: &str| Message::Text(format!(r#"{{"type":"{kind}"}}"#).into());
-
-    // A página se apresenta antes de qualquer vídeo: nome, aparelho e o id do
-    // navegador, que permitem bloquear alguém.
-    let hello = loop {
-        match tokio::time::timeout(HELLO_TIMEOUT, incoming.next()).await {
-            Ok(Some(Ok(Message::Text(text)))) => {
-                if let Some(hello) = viewers::Hello::parse(&text) {
-                    break hello;
-                }
-            }
-            Ok(Some(Ok(_))) => {}
-            _ => return,
-        }
-    };
-    // Página da jam aberta de antes, e a jam foi desligada: recarrega.
-    if hello.page == "jam" {
-        let _ = sink.send(reply("reload")).await;
-        return;
-    }
-    if app.viewers.is_blocked(&hello.client, &ip) {
-        let _ = sink.send(reply("blocked")).await;
-        return;
-    }
-    if app.streamer.viewer_count() >= app.max_viewers {
-        let _ = sink.send(reply("full")).await;
-        return;
-    }
-
-    // Os ids vêm da sala: as telas da jam também são espectadores do Streamer.
-    let id = app.room.as_ref().expect("anfitrião").next_id();
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    let notify = tx.clone();
-    // Modo túnel: quadros binários com fila limitada (~2 s de vídeo); fila cheia
-    // = conexão lenta, e o streamer descarta até o próximo quadro-chave.
-    let (media_tx, mut media_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(300);
-    let tunnel = hello.tunnel;
-    let added = if tunnel {
-        let _ = notify.send(r#"{"type":"tunnel"}"#.into());
-        app.streamer.add_tunnel_viewer(id, media_tx, Layer::High, Vec::new())
-    } else {
-        drop(media_tx);
-        app.streamer.add_viewer(id, tx, Layer::High)
-    };
-    if let Err(e) = added {
-        eprintln!("falha ao adicionar espectador: {e:#}");
-        return;
-    }
-    let label = format!("{} · {}", hello.name, if hello.device.is_empty() { "?" } else { &hello.device });
-    let mut removal = app.viewers.add(id, hello, ip.clone());
-    println!(
-        "+ espectador #{id} {label}{}{} · total {}",
-        if ip.is_empty() { String::new() } else { format!(" ({ip})") },
-        if tunnel { " · pelo túnel" } else { "" },
-        app.streamer.viewer_count()
-    );
-
-    // Depois da negociação o WebSocket fica mudo, e o proxy do túnel da Cloudflare (e NATs
-    // no caminho) derrubam conexões TCP ociosas — o que derrubava o vídeo junto.
-    // O ping mantém o caminho vivo; o pong do navegador prova que ele segue lá.
-    let mut sender = tokio::spawn(async move {
-        let mut ping = tokio::time::interval(WS_PING_INTERVAL);
-        let mut media_open = true;
-        loop {
-            let msg = tokio::select! {
-                text = rx.recv() => match text {
-                    Some(text) => Message::Text(text.into()),
-                    None => break,
-                },
-                media = media_rx.recv(), if media_open => match media {
-                    Some(data) => Message::Binary(data.into()),
-                    None => { media_open = false; continue; }
-                },
-                _ = ping.tick() => Message::Ping(Default::default()),
-            };
-            if sink.send(msg).await.is_err() {
-                break;
-            }
-        }
-        let _ = sink.close().await;
-    });
-
-    // Sem nada (nem pong) por tempo demais = conexão morta pela metade; libera a vaga.
-    let mut shutdown = app.shutdown.subscribe();
-    let mut jam_on = app.jam_on.subscribe();
-    loop {
-        let msg = tokio::select! {
-            _ = shutdown.wait_for(|stopping| *stopping) => break,
-            // A jam foi liberada: a página recarrega já como página da jam.
-            _ = jam_on.wait_for(|on| *on) => {
-                let _ = notify.send(r#"{"type":"reload"}"#.into());
-                break;
-            }
-            why = &mut removal => {
-                // Avisa a página (ela não tenta reconectar) e encerra.
-                if let Ok(why) = why {
-                    let kind = if why == viewers::Removal::Blocked { "blocked" } else { "kicked" };
-                    let _ = notify.send(format!(r#"{{"type":"{kind}"}}"#));
-                }
-                break;
-            }
-            msg = tokio::time::timeout(WS_DEAD_AFTER, incoming.next()) => match msg {
-                Ok(Some(Ok(msg))) => msg,
-                _ => break,
-            },
-        };
-        match msg {
-            Message::Text(text) => {
-                if let Err(e) = app.streamer.handle_message(id, &text) {
-                    eprintln!("espectador #{id}: {}", viewers::one_line(&format!("{e:#}"), 200));
-                }
-            }
-            Message::Close(_) => break,
-            _ => {}
-        }
-    }
-
-    if let Some(generation) = app.streamer.remove_viewer(id) {
-        stream::schedule_idle_stop(app.streamer.clone(), generation);
-    }
-    app.viewers.remove(id);
-    // Sem remetentes, o envio termina depois de entregar o último aviso.
-    drop(notify);
-    if tokio::time::timeout(std::time::Duration::from_secs(2), &mut sender).await.is_err() {
-        sender.abort();
-    }
-    println!("- espectador #{id} saiu · total {}", app.streamer.viewer_count());
+    let local = query.get("local").cloned().unwrap_or_default();
+    ws.on_upgrade(move |socket| jam::handle_member(socket, ip, local, app)).into_response()
 }
 
 #[cfg(test)]

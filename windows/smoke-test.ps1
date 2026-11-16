@@ -46,13 +46,24 @@ try {
         $socket.SendAsync($helloSegment, [Net.WebSockets.WebSocketMessageType]::Text, $true, $cancel.Token).GetAwaiter().GetResult()
         $buffer = New-Object byte[] 65536
         $segment = New-Object 'ArraySegment[byte]' -ArgumentList @(,$buffer)
-        $sdp = ''
-        do {
-            $received = $socket.ReceiveAsync($segment, $cancel.Token).GetAwaiter().GetResult()
-            $sdp += [Text.Encoding]::UTF8.GetString($buffer, 0, $received.Count)
-        } while (!$received.EndOfMessage)
-        $offer = $sdp | ConvertFrom-Json
-        if ($offer.type -ne 'offer' -or $offer.sdp -notmatch 'm=video' -or $offer.sdp -notmatch 'm=audio') {
+        $read = {
+            $text = ''
+            do {
+                $received = $socket.ReceiveAsync($segment, $cancel.Token).GetAwaiter().GetResult()
+                $text += [Text.Encoding]::UTF8.GetString($buffer, 0, $received.Count)
+            } while (!$received.EndOfMessage)
+            $text | ConvertFrom-Json
+        }
+        # A sala manda as telas (aqui só a de quem transmite); a pagina pede a
+        # dela na qualidade cheia, que vem com som.
+        do { $room = & $read } while ($room.type -ne 'room')
+        if ($room.jam) { throw 'Sem --jam, a sala deveria comecar com a jam desligada.' }
+        $hostId = @($room.presenters)[0].id
+        $watch = [Text.Encoding]::UTF8.GetBytes("{""type"":""watch"",""sid"":1,""pub"":$hostId,""layer"":""high"",""mode"":""webrtc""}")
+        $socket.SendAsync((New-Object 'ArraySegment[byte]' -ArgumentList @(,$watch)), [Net.WebSockets.WebSocketMessageType]::Text, $true, $cancel.Token).GetAwaiter().GetResult()
+        do { $msg = & $read } while ($msg.type -ne 'signal' -or $msg.payload.type -ne 'offer')
+        $offer = $msg.payload
+        if ($offer.sdp -notmatch 'm=video' -or $offer.sdp -notmatch 'm=audio') {
             throw 'Oferta WebRTC sem trilhas de video e audio.'
         }
         $server.StandardInput.WriteLine('q')
@@ -147,7 +158,7 @@ try {
 
     # Jam ligada durante a transmissão (`jam on`), com um convidado que entrou
     # pelo botão da página (--viewer-id). Ao desligar (`jam off`), o convidado
-    # sai sozinho e a página recebe "reload" (volta a ser a transmissão normal).
+    # sai sozinho e a página continua aberta, só com a tela de quem transmite.
     $soloHost = Start-Telinha '--test --encoder x264enc --bind 127.0.0.1 --port 18082 --name Anfitriao'
     $guest = $null
     $socket = New-Object Net.WebSockets.ClientWebSocket
@@ -163,15 +174,14 @@ try {
             } catch { Start-Sleep -Milliseconds 250 }
         }
         if (!$ready) { throw 'A transmissao nao respondeu.' }
-        if ($response.Content -match 'Compartilhar minha tela') { throw 'Sem jam, o link deveria servir a pagina normal.' }
-        $soloHost.StandardInput.WriteLine('jam on')
-        Start-Sleep -Milliseconds 500
-        $response = Invoke-WebRequest -UseBasicParsing 'http://127.0.0.1:18082' -TimeoutSec 5
-        if ($response.Content -notmatch 'Compartilhar minha tela') { throw 'Com a jam ligada, o link deveria servir a pagina da jam.' }
-        $guest = Start-Telinha '--join http://127.0.0.1:18082 --test --encoder x264enc --name Convidado --viewer-id smoke-page'
+        # Esta "pagina" e a que vai chamar o convidado (mesmo id): a sala marca a tela dele como own.
         $socket.ConnectAsync([uri]'ws://127.0.0.1:18082/ws', $cancel.Token).GetAwaiter().GetResult()
-        # Esta "pagina" e a que chamou o convidado (mesmo id): a sala marca a tela dele como own.
-        Send-Json $socket $cancel.Token '{"type":"hello","name":"Smoke test","device":"CI","client":"smoke-page","page":"jam"}'
+        Send-Json $socket $cancel.Token '{"type":"hello","name":"Smoke test","device":"CI","client":"smoke-page"}'
+        do { $msg = Receive-Json $socket $cancel.Token } while (-not $msg -or $msg.type -ne 'room')
+        if ($msg.jam) { throw 'Sem jam, a pagina nao deveria oferecer o compartilhamento.' }
+        $soloHost.StandardInput.WriteLine('jam on')
+        do { $msg = Receive-Json $socket $cancel.Token } while (-not $msg -or $msg.type -ne 'room' -or -not $msg.jam)
+        $guest = Start-Telinha '--join http://127.0.0.1:18082 --test --encoder x264enc --name Convidado --viewer-id smoke-page'
         while ($true) {
             $msg = Receive-Json $socket $cancel.Token
             if ($msg -and $msg.type -eq 'room' -and @($msg.presenters).Count -ge 2) { break }
@@ -181,7 +191,7 @@ try {
         $soloHost.StandardInput.WriteLine('jam off')
         while ($true) {
             $msg = Receive-Json $socket $cancel.Token
-            if ($msg -and $msg.type -eq 'reload') { break }
+            if ($msg -and $msg.type -eq 'room' -and -not $msg.jam -and @($msg.presenters).Count -eq 1) { break }
         }
         if (!$guest.WaitForExit(8000)) { throw 'O convidado nao saiu quando a jam foi desligada.' }
         if ($guest.ExitCode -ne 0) { throw "Convidado falhou ao sair da jam desligada ($($guest.ExitCode))." }

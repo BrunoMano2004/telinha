@@ -185,11 +185,6 @@ pub async fn handle_member(socket: WebSocket, ip: String, local: String, app: Ar
             _ => return,
         }
     };
-    // Página da transmissão normal aberta de antes da jam: recarrega.
-    if hello.page == "solo" {
-        let _ = sink.send(reply("reload")).await;
-        return;
-    }
     if app.viewers.is_blocked(&hello.client, &ip) {
         let _ = sink.send(reply("blocked")).await;
         return;
@@ -235,17 +230,11 @@ pub async fn handle_member(socket: WebSocket, ip: String, local: String, app: Ar
     });
 
     let mut shutdown = app.shutdown.subscribe();
-    let mut jam_on = app.jam_on.subscribe();
     loop {
         let msg = tokio::select! {
             _ = shutdown.wait_for(|stopping| *stopping) => {
                 // O anfitrião está saindo: avisa antes de fechar (sem tentar reconectar).
                 let _ = tx.send(r#"{"type":"ended"}"#.into());
-                break;
-            }
-            // Jam desligada: a página recarrega como transmissão normal.
-            _ = jam_on.wait_for(|on| !*on) => {
-                let _ = tx.send(r#"{"type":"reload"}"#.into());
                 break;
             }
             why = &mut removal => {

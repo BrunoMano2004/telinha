@@ -1,4 +1,4 @@
-// Partes comuns às páginas do telinha (transmissão e jam): identificação de
+// Partes da página do telinha que ficam num arquivo à parte: identificação de
 // quem assiste e o decodificador do modo túnel/relé (WebCodecs).
 
 // localStorage pode não existir (janela anônima, armazenamento bloqueado).
@@ -7,20 +7,6 @@ function stored(key, fallback) {
 }
 function store(key, value) {
   try { localStorage.setItem(key, value); } catch {}
-}
-
-// O anfitrião ligou ou desligou a jam: a mesma URL agora serve a outra
-// página. Recarrega e entra sozinho de novo (o nome já está guardado).
-function reloadPage() {
-  try { sessionStorage.setItem('telinha-auto', '1'); } catch {}
-  location.reload();
-}
-function takeAutoJoin() {
-  try {
-    const auto = sessionStorage.getItem('telinha-auto') === '1';
-    sessionStorage.removeItem('telinha-auto');
-    return auto;
-  } catch { return false; }
 }
 
 // Id aleatório deste navegador: permite que quem transmite bloqueie alguém.

@@ -65,6 +65,16 @@ static std::vector<std::wstring> logLines;
 static bool webviewStarting = false;
 static void CreateWebView();
 static void ReleaseWebView();
+// Janela da jam (as telas dos outros) dentro do app: o som dela fica fora da
+// transmissão (src/audio_policy.rs exclui o app e o que ele abre).
+static HWND jamWindow;
+static ComPtr<ICoreWebView2Controller> jamController;
+static ComPtr<ICoreWebView2> jamView;
+static bool jamStarting = false, jamFull = false;
+static RECT jamRestore;
+static void OpenJamWindow(const std::wstring& url);
+static void CloseJamWindow();
+static int Scale(int value, HWND hwnd);
 // Escolhas de som por app (nome em minúsculas -> entra?), salvas no .ini.
 static std::map<std::wstring, bool> appChoices;
 // Última qualidade escolhida (para o "Iniciar" pela bandeja).
@@ -324,6 +334,7 @@ static void CloseChild() {
     link.clear();
     jamWatch.clear();
     seenRequests.clear();
+    CloseJamWindow();
     lastViewers = lastBlocked = lastApps = L"[]";
     PostState();
     Status(L"Telinha - parado");
@@ -488,6 +499,7 @@ static void HandleLine(const std::wstring& line) {
     if (event(L"jam-ended", data)) { Post(L"{\"type\":\"jam-ended\",\"data\":" + data + L"}"); return; }
     if (event(L"jam-off", data)) {
         jamWatch.clear();
+        CloseJamWindow();
         Post(L"{\"type\":\"jam-off\"}");
         Status(L"Telinha - ao vivo");
         return;
@@ -511,7 +523,7 @@ static void HandleLine(const std::wstring& line) {
         }
         if (WebLink(watch)) {
             jamWatch = watch;
-            ShellExecuteW(window, L"open", watch.c_str(), NULL, NULL, SW_SHOWNORMAL);
+            OpenJamWindow(watch);
         }
         return;
     }
@@ -557,7 +569,7 @@ static void HandleUi(const std::wstring& message) {
     else if (cmd == L"copy") CopyLink();
     else if (cmd == L"open" && WebLink(link)) ShellExecuteW(window, L"open", link.c_str(), NULL, NULL, SW_SHOWNORMAL);
     else if (cmd == L"send") Send(arg(1));
-    else if (cmd == L"jam-open" && WebLink(jamWatch)) ShellExecuteW(window, L"open", jamWatch.c_str(), NULL, NULL, SW_SHOWNORMAL);
+    else if (cmd == L"jam-open" && WebLink(jamWatch)) OpenJamWindow(jamWatch);
     else if (cmd == L"screen") {
         int monitor = _wtoi(arg(1).c_str());
         if (monitor >= 0 && monitor < (int)monitors.size())
@@ -881,6 +893,136 @@ static void CreateWebView() {
             }).Get());
     if (FAILED(started)) WebViewFailed(started);
 }
+// --- Janela da jam
+// Origem (esquema://host:porta) de um link, para manter a janela na página da jam.
+static std::wstring Origin(const std::wstring& url) {
+    size_t scheme = url.find(L"://");
+    if (scheme == std::wstring::npos) return L"";
+    size_t end = url.find_first_of(L"/?#", scheme + 3);
+    return Lower(url.substr(0, end));
+}
+static void ResizeJam() {
+    if (!jamController || !jamWindow) return;
+    RECT bounds; GetClientRect(jamWindow, &bounds);
+    jamController->put_Bounds(bounds);
+}
+// Tela cheia da página (F ou duplo clique): a janela ocupa o monitor inteiro.
+static void SetJamFullScreen(bool on) {
+    if (!jamWindow || on == jamFull) return;
+    jamFull = on;
+    if (on) {
+        GetWindowRect(jamWindow, &jamRestore);
+        MONITORINFO info = {}; info.cbSize = sizeof(info);
+        GetMonitorInfoW(MonitorFromWindow(jamWindow, MONITOR_DEFAULTTONEAREST), &info);
+        SetWindowLongPtrW(jamWindow, GWL_STYLE, WS_POPUP | WS_VISIBLE);
+        SetWindowPos(jamWindow, HWND_TOP, info.rcMonitor.left, info.rcMonitor.top, info.rcMonitor.right - info.rcMonitor.left,
+            info.rcMonitor.bottom - info.rcMonitor.top, SWP_FRAMECHANGED);
+    } else {
+        SetWindowLongPtrW(jamWindow, GWL_STYLE, WS_OVERLAPPEDWINDOW | WS_VISIBLE);
+        SetWindowPos(jamWindow, NULL, jamRestore.left, jamRestore.top, jamRestore.right - jamRestore.left,
+            jamRestore.bottom - jamRestore.top, SWP_FRAMECHANGED | SWP_NOZORDER);
+    }
+}
+static void CloseJamWindow() {
+    if (jamWindow) DestroyWindow(jamWindow);
+}
+// Sem WebView2 para a jam: abre no navegador (o link sem "app", que começa sem som).
+static void JamInBrowser(const std::wstring& url) {
+    CloseJamWindow();
+    if (WebLink(url)) ShellExecuteW(window, L"open", url.c_str(), NULL, NULL, SW_SHOWNORMAL);
+}
+static LRESULT CALLBACK JamProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
+    switch (message) {
+    case WM_SIZE:
+        ResizeJam();
+        if (jamController) jamController->put_IsVisible(wp != SIZE_MINIMIZED);
+        return 0;
+    case WM_DESTROY:
+        if (jamController) jamController->Close();
+        jamController = nullptr; jamView = nullptr;
+        jamWindow = NULL; jamFull = false;
+        return 0;
+    }
+    return DefWindowProcW(hwnd, message, wp, lp);
+}
+static void OpenJamWindow(const std::wstring& url) {
+    if (!WebLink(url)) return;
+    // "app=1": a página sabe que o som dela não volta para a transmissão.
+    std::wstring target = url.find(L'?') != std::wstring::npos ? url + L"&app=1"
+        : url + (!url.empty() && url.back() == L'/' ? L"?app=1" : L"/?app=1");
+    if (jamWindow) {
+        if (jamView) jamView->Navigate(target.c_str());
+        ShowWindow(jamWindow, IsIconic(jamWindow) ? SW_RESTORE : SW_SHOW);
+        SetForegroundWindow(jamWindow);
+        return;
+    }
+    if (jamStarting) return;
+    jamWindow = CreateWindowExW(0, L"TelinhaJam", L"Telinha - Jam", WS_OVERLAPPEDWINDOW,
+        CW_USEDEFAULT, CW_USEDEFAULT, 1280, 760, NULL, NULL, GetModuleHandleW(NULL), NULL);
+    if (!jamWindow) return JamInBrowser(url);
+    BOOL dark = TRUE;
+    DwmSetWindowAttribute(jamWindow, 20 /* DWMWA_USE_IMMERSIVE_DARK_MODE */, &dark, sizeof(dark));
+    SetWindowPos(jamWindow, NULL, 0, 0, Scale(1280, jamWindow), Scale(760, jamWindow), SWP_NOMOVE | SWP_NOZORDER);
+    ShowWindow(jamWindow, SW_SHOWNORMAL);
+    jamStarting = true;
+    // Pasta e opções próprias: a interface roda sem GPU, e a jam precisa dela
+    // para decodificar o vídeo.
+    std::wstring dataDir = KnownDir(L"LOCALAPPDATA") + L"\\WebView2Jam";
+    SetEnvironmentVariableW(L"WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", NULL);
+    std::wstring origin = Origin(url);
+    HRESULT started = CreateCoreWebView2EnvironmentWithOptions(NULL, dataDir.c_str(), NULL,
+        Callback<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler>(
+            [url, target, origin](HRESULT result, ICoreWebView2Environment* environment) -> HRESULT {
+                if (FAILED(result) || !environment || !jamWindow) { jamStarting = false; JamInBrowser(url); return S_OK; }
+                return environment->CreateCoreWebView2Controller(jamWindow,
+                    Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
+                        [url, target, origin](HRESULT result, ICoreWebView2Controller* created) -> HRESULT {
+                            jamStarting = false;
+                            if (FAILED(result) || !created) { JamInBrowser(url); return S_OK; }
+                            if (!jamWindow) { created->Close(); return S_OK; }
+                            jamController = created;
+                            jamController->get_CoreWebView2(&jamView);
+                            ComPtr<ICoreWebView2Settings> settings;
+                            jamView->get_Settings(&settings);
+                            settings->put_AreDevToolsEnabled(FALSE);
+                            settings->put_IsStatusBarEnabled(FALSE);
+                            EventRegistrationToken token;
+                            // Só a página da jam fica aqui; qualquer outro link vai para o navegador.
+                            jamView->add_NavigationStarting(Callback<ICoreWebView2NavigationStartingEventHandler>(
+                                [origin](ICoreWebView2*, ICoreWebView2NavigationStartingEventArgs* args) -> HRESULT {
+                                    LPWSTR uri = NULL;
+                                    args->get_Uri(&uri);
+                                    std::wstring value = uri ? uri : L"";
+                                    if (uri) CoTaskMemFree(uri);
+                                    if (Origin(value) != origin) {
+                                        args->put_Cancel(TRUE);
+                                        if (WebLink(value)) ShellExecuteW(window, L"open", value.c_str(), NULL, NULL, SW_SHOWNORMAL);
+                                    }
+                                    return S_OK;
+                                }).Get(), &token);
+                            jamView->add_NewWindowRequested(Callback<ICoreWebView2NewWindowRequestedEventHandler>(
+                                [](ICoreWebView2*, ICoreWebView2NewWindowRequestedEventArgs* args) -> HRESULT {
+                                    LPWSTR uri = NULL;
+                                    args->get_Uri(&uri);
+                                    args->put_Handled(TRUE);
+                                    if (uri) { if (WebLink(uri)) ShellExecuteW(window, L"open", uri, NULL, NULL, SW_SHOWNORMAL); CoTaskMemFree(uri); }
+                                    return S_OK;
+                                }).Get(), &token);
+                            jamView->add_ContainsFullScreenElementChanged(Callback<ICoreWebView2ContainsFullScreenElementChangedEventHandler>(
+                                [](ICoreWebView2* sender, IUnknown*) -> HRESULT {
+                                    BOOL full = FALSE;
+                                    sender->get_ContainsFullScreenElement(&full);
+                                    SetJamFullScreen(full != FALSE);
+                                    return S_OK;
+                                }).Get(), &token);
+                            ResizeJam();
+                            jamView->Navigate(target.c_str());
+                            return S_OK;
+                        }).Get());
+            }).Get());
+    if (FAILED(started)) { jamStarting = false; JamInBrowser(url); }
+}
+
 // Link telinha:// (da linha de comando ou repassado por outra instância):
 // nada é compartilhado antes de a pessoa confirmar na janela.
 static void HandleJoinUrl(const std::wstring& url) {
@@ -1051,6 +1193,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command, int) {
     cls.lpszClassName = L"TelinhaDesktop"; cls.hCursor = LoadCursor(NULL, IDC_ARROW);
     cls.hIcon = bigIcon; cls.hIconSm = smallIcon;
     RegisterClassExW(&cls);
+    WNDCLASSEXW jamClass = cls;
+    jamClass.lpfnWndProc = JamProc;
+    jamClass.lpszClassName = L"TelinhaJam";
+    jamClass.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
+    RegisterClassExW(&jamClass);
     window = CreateWindowExW(0, cls.lpszClassName, L"Telinha", WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, CW_USEDEFAULT, 1000, 760, NULL, NULL, instance, NULL);
     // Tamanho inicial em pixels lógicos, convertido para a escala do monitor.

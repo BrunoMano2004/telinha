@@ -7,50 +7,112 @@
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <link rel="icon" href="/favicon.ico" sizes="any">
 <style>
-  :root { color-scheme: dark; }
+  :root { color-scheme: dark; --accent: #6d5dfc; --line: #2c2c2c; --muted: #9a9a9a; }
   html, body { margin: 0; height: 100%; background: #000; overflow: hidden;
     font: 13px/1.4 system-ui, sans-serif; color: #e6e6e6; }
-  video, canvas { width: 100vw; height: 100vh; object-fit: contain; display: block; background: #000; }
-  canvas[hidden], video[hidden] { display: none; }
-  #mode { padding: 6px 10px; border-radius: 6px; background: rgba(30,30,30,.85); border: 1px solid #3a3a3a;
-    color: #b8b8b8; font-size: 12px; }
-  #mode[hidden] { display: none; }
-  #status { position: fixed; inset: 0; display: grid; place-items: center; pointer-events: none;
-    font-size: 15px; color: #9a9a9a; }
-  #status:empty { display: none; }
-  #bar { position: fixed; top: 12px; right: 12px; display: flex; align-items: center; gap: 6px; opacity: 0;
-    transition: opacity .2s; }
-  body:hover #bar, body.idle-off #bar, body.needs-unmute #bar { opacity: 1; }
-  #volume { width: 110px; accent-color: #6d5dfc; cursor: pointer; }
-  #volume[hidden] { display: none; }
   button { background: rgba(30,30,30,.85); color: #e6e6e6; border: 1px solid #3a3a3a;
     border-radius: 6px; padding: 6px 10px; font: inherit; cursor: pointer; }
   button:hover { background: rgba(60,60,60,.9); }
-  #stats { position: fixed; top: 12px; left: 12px; background: rgba(0,0,0,.7);
-    border: 1px solid #333; border-radius: 6px; padding: 8px 10px; white-space: pre;
-    font: 12px/1.5 ui-monospace, monospace; display: none; }
-  #stats.on { display: block; }
-  .overlay { position: fixed; inset: 0; display: grid; place-items: center; padding: 16px;
-    background: rgba(0,0,0,.82); }
+  button[hidden], input[hidden] { display: none; }
+
+  /* Grade: todas as telas em miniatura. Foco: uma grande e as outras numa faixa. */
+  #stage { position: fixed; inset: 0; display: grid; gap: 6px; padding: 6px; box-sizing: border-box;
+    grid-template-columns: repeat(var(--cols, 1), minmax(0, 1fr));
+    grid-auto-rows: minmax(0, 1fr); }
+  body.focus #stage { grid-template-columns: minmax(0, 1fr) min(22vw, 300px);
+    grid-template-rows: repeat(var(--others, 1), minmax(0, 1fr)); grid-auto-rows: unset; }
+  body.focus .tile.selected { grid-column: 1; grid-row: 1 / -1; }
+  body.focus .tile:not(.selected) { grid-column: 2; }
+  body.solo #stage { grid-template-columns: 1fr; grid-template-rows: 1fr; padding: 0; }
+  body.solo .tile:not(.selected) { display: none; }
+  body.solo .tile.selected { border-radius: 0; border: 0; }
+  @media (max-width: 700px) {
+    body.focus #stage { grid-template-columns: repeat(var(--others, 1), minmax(0, 1fr));
+      grid-template-rows: minmax(0, 1fr) 22vh; }
+    body.focus .tile.selected { grid-column: 1 / -1; grid-row: 1; }
+    body.focus .tile:not(.selected) { grid-column: auto; grid-row: 2; }
+  }
+
+  .tile { position: relative; min-width: 0; min-height: 0; background: #0b0b0b; border: 1px solid #1d1d1d;
+    border-radius: 10px; overflow: hidden; cursor: pointer; }
+  .tile:hover { border-color: #3a3a3a; }
+  .tile.selected { border-color: var(--accent); cursor: default; }
+  .tile video, .tile canvas { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; background: #000; }
+  .tile canvas[hidden], .tile video[hidden] { display: none; }
+  .label { position: absolute; left: 8px; bottom: 8px; display: flex; gap: 6px; align-items: center;
+    max-width: calc(100% - 16px); padding: 3px 8px; border-radius: 6px; background: rgba(0,0,0,.65);
+    font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; pointer-events: none; }
+  .label .os { color: var(--muted); }
+  .label .sound { color: #c9c2ff; }
+  .label .key { color: var(--muted); font: 11px ui-monospace, monospace; }
+  .state { position: absolute; inset: 0; display: grid; place-items: center; padding: 12px; text-align: center;
+    color: var(--muted); font-size: 13px; pointer-events: none; }
+  .state:empty { display: none; }
+  .tstats { position: absolute; top: 8px; left: 8px; padding: 6px 8px; border-radius: 6px; background: rgba(0,0,0,.7);
+    white-space: pre; font: 11px/1.45 ui-monospace, monospace; display: none; pointer-events: none; }
+  body.stats .tstats { display: block; }
+  body.solo .tile.selected .label { opacity: 0; transition: opacity .3s; }
+  body.solo:hover .tile.selected .label { opacity: 1; }
+
+  #empty { position: fixed; inset: 0; display: grid; place-items: center; padding: 24px; text-align: center; color: var(--muted); }
+  #empty[hidden] { display: none; }
+  #empty code { display: inline-block; margin-top: 8px; padding: 6px 10px; border-radius: 6px; background: #161616;
+    border: 1px solid var(--line); color: #ddd; user-select: all; word-break: break-all; }
+
+  #bar { position: fixed; top: 12px; right: 12px; display: flex; align-items: center; gap: 6px; opacity: 0;
+    transition: opacity .2s; z-index: 2; }
+  body:hover #bar, body.grid #bar, body.intro #bar { opacity: 1; }
+  #volume { width: 110px; accent-color: var(--accent); cursor: pointer; }
+  #hint { position: fixed; left: 50%; bottom: 14px; transform: translateX(-50%); padding: 6px 12px; border-radius: 8px;
+    background: rgba(20,20,20,.9); border: 1px solid var(--line); color: #bbb; font-size: 12px; z-index: 2;
+    pointer-events: none; transition: opacity .4s; }
+  #hint.off { opacity: 0; }
+
+  .overlay { position: fixed; inset: 0; display: grid; place-items: center; padding: 16px; background: rgba(0,0,0,.82); z-index: 3; }
   .overlay[hidden] { display: none; }
-  .card { width: min(360px, 100%); box-sizing: border-box; background: #161616; border: 1px solid #2c2c2c;
+  .card { width: min(360px, 100%); box-sizing: border-box; background: #161616; border: 1px solid var(--line);
     border-radius: 14px; padding: 22px; display: grid; gap: 12px; text-align: center; }
   .card img { width: 56px; height: 56px; margin: 0 auto; }
   .card h1 { margin: 0; font-size: 18px; font-weight: 600; }
   .card p { margin: 0; color: #a8a8a8; font-size: 14px; }
   .card input { box-sizing: border-box; width: 100%; padding: 10px 12px; border-radius: 8px;
     border: 1px solid #3a3a3a; background: #0d0d0d; color: #eee; font: 15px system-ui, sans-serif; }
-  .card input:focus { outline: 2px solid #6d5dfc; border-color: transparent; }
-  .card button { padding: 10px; font-size: 15px; background: #6d5dfc; border: 0; color: #fff; }
+  .card input:focus { outline: 2px solid var(--accent); border-color: transparent; }
+  .card button { padding: 10px; font-size: 15px; background: var(--accent); border: 0; color: #fff; }
   .card button:hover { background: #5a4ae6; }
+  .card button.secondary { background: transparent; border: 1px solid #3a3a3a; color: #ddd; }
+  .card button.secondary:hover { background: #222; }
+  .card a { color: #b3a9ff; }
+  .card .small { font-size: 12.5px; line-height: 1.5; }
+  .card code { display: block; margin-top: 6px; padding: 6px 8px; border-radius: 6px; background: #0d0d0d;
+    border: 1px solid var(--line); color: #ddd; font-size: 11.5px; user-select: all; word-break: break-all; text-align: left; }
+  #btn-share { background: var(--accent); border-color: transparent; color: #fff; }
+  #btn-share:hover { background: #5a4ae6; }
+  #empty button { margin-top: 14px; }
 </style>
 </head>
-<body>
-<video id="video" autoplay playsinline muted></video>
-<!-- Modo túnel: o vídeo é decodificado com WebCodecs e desenhado aqui. -->
-<canvas id="canvas" hidden></canvas>
-<div id="status"></div>
-<pre id="stats"></pre>
+<body class="grid">
+<div id="stage"></div>
+<div id="empty" hidden>
+  <div>
+    <p id="empty-text">Ninguém está compartilhando a tela ainda.</p>
+    <div id="empty-jam">
+      <p>Quem tiver o telinha entra na jam com:</p>
+      <code id="join-cmd"></code>
+      <div><button id="empty-share" class="share" hidden>Compartilhar minha tela</button></div>
+    </div>
+  </div>
+</div>
+<div id="bar">
+  <button id="btn-share" class="share" title="Entrar na jam com o telinha deste computador e mostrar a sua tela" hidden>Compartilhar minha tela</button>
+  <button id="btn-grid" title="Voltar para a grade (G ou Esc)" hidden>Grade</button>
+  <button id="btn-solo" title="Mostrar só esta tela e parar de receber as outras (V)" hidden>Ver só esta</button>
+  <button id="btn-sound" title="Som da tela selecionada (M)" hidden>Ativar som</button>
+  <input id="volume" type="range" min="0" max="1" step="0.05" title="Volume (↑/↓)" aria-label="Volume" hidden>
+  <button id="btn-stats" title="Estatísticas (S)">Estatísticas</button>
+  <button id="btn-full" title="Tela cheia (F)">Tela cheia</button>
+</div>
+<div id="hint" class="off"></div>
 <form id="join" class="overlay">
   <div class="card">
     <img src="/favicon.svg" alt="">
@@ -60,6 +122,19 @@
     <button type="submit">Assistir</button>
   </div>
 </form>
+<div id="share-help" class="overlay" hidden>
+  <div class="card">
+    <img src="/favicon.svg" alt="">
+    <h1>Compartilhar sua tela</h1>
+    <p>Abrimos o telinha deste computador: confirme lá para a sua tela entrar na jam.</p>
+    <p class="small">Nada aconteceu? O telinha precisa estar instalado:
+      <a href="https://github.com/BrunoMano2004/telinha/releases/latest" target="_blank" rel="noopener">instalador para Windows</a>;
+      no Linux, o pacote <b>telinha-git</b> (AUR) ou o <b>install.sh</b>. Ou rode no terminal:
+      <code id="share-cmd"></code></p>
+    <button id="share-retry" type="button">Abrir o telinha de novo</button>
+    <button id="share-close" type="button" class="secondary">Fechar</button>
+  </div>
+</div>
 <div id="ended" class="overlay" hidden>
   <div class="card">
     <img src="/favicon.svg" alt="">
@@ -67,447 +142,584 @@
     <button id="rejoin" type="button">Entrar de novo</button>
   </div>
 </div>
-<div id="bar">
-  <span id="mode" hidden title="A conexão direta não fechou nesta rede; o vídeo vem pela Cloudflare, com um pouco mais de atraso">pelo túnel</span>
-  <button id="btn-sound" title="Som (M)" hidden>Ativar som</button>
-  <input id="volume" type="range" min="0" max="1" step="0.05" title="Volume (↑/↓)" aria-label="Volume" hidden>
-  <button id="btn-stats" title="Estatísticas (S)">Estatísticas</button>
-  <button id="btn-full" title="Tela cheia (F ou duplo clique)">Tela cheia</button>
-</div>
 <script src="/common.js"></script>
 <script>
-// stored/store, clientId, deviceName, candidateKind, tunnelSupported, nalTypes,
-// cleanAccessUnit e pickVideoCodec vêm de /common.js (comuns à página da jam).
-const video = document.getElementById('video');
-const statusEl = document.getElementById('status');
-const statsEl = document.getElementById('stats');
+// Página da jam: uma conexão WebRTC por tela assistida, sinalizada pela sala
+// (o WebSocket com o anfitrião). Na grade cada tela vem em miniatura e sem som;
+// a tela selecionada vem na qualidade cheia e é a única com som.
+const stage = document.getElementById('stage');
 const soundBtn = document.getElementById('btn-sound');
 const volumeEl = document.getElementById('volume');
-// Conexão que está mostrando vídeo agora (a nova só a substitui ao conectar).
-let activePc, statsTimer, last;
+const hintEl = document.getElementById('hint');
+const params = new URLSearchParams(location.search);
+// Página aberta pelo próprio telinha: não mostra a própria tela e começa muda
+// (o som desta página voltaria para a transmissão dele).
+const localClient = params.get('local') || '';
+// Aberta na janela da jam do app do Windows: o som dela não entra na
+// transmissão, então pode começar ligado.
+const inApp = params.has('app');
+// Força o vídeo pelo WebSocket (sem WebRTC); "tunel" é o nome antigo.
+const forceRelay = params.has('relay') || params.has('tunel');
+const remote = location.protocol === 'https:';
+const CONNECT_TIMEOUT_MS = 20000;
+// Celular não roda o telinha: lá a página só assiste.
+const canShare = !localClient && !/Android|iPhone|iPad/.test(navigator.userAgent);
 
-function setStatus(text) { statusEl.textContent = text; }
+let ws = null, me = null, viewerName = '', audioCtx = null, stopped = false, nextSid = 1;
+let presenters = [];
+const tiles = new Map();     // id da tela → tile
+const sessions = new Map();  // sid → conexão
+// Seleção pelo apelido (`tag`) de quem compartilha: continua valendo se a pessoa reconectar.
+// `auto`: escolhido pela página (uma tela só aparece inteira, com som), não pela pessoa.
+let view = { mode: 'grid', tag: null, auto: true };
+// A tela deste computador está na jam (entrou pelo botão "Compartilhar minha tela").
+let sharingHere = false, shareTimer = null;
+// Pedido para entrar esperando o anfitrião aceitar (com "pedir para entrar" ligado).
+let waitingHere = false;
+// O som foi desligado automaticamente quando a sua tela entrou na jam.
+let autoMuted = false;
+// Jam ligada pelo anfitrião (senão é uma transmissão normal: só a tela dele).
+// `null` até a primeira mensagem da sala.
+let jamOn = null;
+let userMuted = localClient !== '' && !inApp;
+let volume = Math.min(1, Number(stored('telinha-volume', '1')) || 1);
 
-let viewerName = '';
+function send(msg) { if (ws?.readyState === 1) ws.send(JSON.stringify(msg)); }
+function log(text) { send({ type: 'log', text: String(text).slice(0, 500) }); }
 
-// Expulso ou bloqueado: para de reconectar e mostra o aviso.
-function ended(text, canRejoin) {
-  if (activePc) { activePc.close(); activePc = null; }
-  if (tunnel) tunnel.close();
-  video.srcObject = null;
-  setStatus('');
+let hintTimer;
+function hint(text, ms = 3500) {
+  hintEl.textContent = text;
+  hintEl.classList.remove('off');
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => hintEl.classList.add('off'), ms);
+}
+
+// --- Sala ------------------------------------------------------------------------
+
+function connectRoom() {
+  ws = new WebSocket(`${remote ? 'wss' : 'ws'}://${location.host}/ws${location.search}`);
+  ws.binaryType = 'arraybuffer';
+  ws.onopen = () => send({ type: 'hello', name: viewerName, device: deviceName(), client: clientId, page: 'jam' });
+  ws.onmessage = (e) => {
+    if (typeof e.data !== 'string') return onMedia(e.data);
+    const msg = JSON.parse(e.data);
+    switch (msg.type) {
+      case 'room': return onRoom(msg);
+      case 'signal': return sessions.get(msg.sid)?.onSignal(msg.payload);
+      case 'closed': return sessions.get(msg.sid)?.onClosed(msg.reason || '');
+      case 'ended': return end('A jam terminou.', false);
+      case 'kicked': return end('Você foi removido da jam.', true);
+      case 'blocked': return end('O anfitrião bloqueou você.', false);
+      case 'full': return end('A jam está cheia.', true);
+      case 'locked': return end('A jam está trancada: ninguém novo entra agora.', true);
+    }
+  };
+  ws.onclose = () => {
+    // As sessões dependem da sala: todas recomeçam quando ela voltar.
+    for (const conn of [...sessions.values()]) conn.close(false);
+    for (const tile of tiles.values()) {
+      clearTimeout(tile.retryTimer);
+      tile.retryTimer = null;
+      tile.conn = tile.pending = null;
+    }
+    if (stopped) return;
+    for (const tile of tiles.values()) tile.setState('Reconectando com a jam…');
+    setTimeout(() => { if (!stopped) connectRoom(); }, 2000);
+  };
+}
+
+function end(text, canRejoin) {
+  stopped = true;
+  for (const conn of [...sessions.values()]) conn.close(false);
+  if (ws) { ws.onclose = null; try { ws.close(); } catch {} }
+  for (const tile of tiles.values()) tile.remove();
+  tiles.clear();
   document.getElementById('ended-text').textContent = text;
   document.getElementById('rejoin').hidden = !canRejoin;
   document.getElementById('ended').hidden = false;
 }
 
-// Tempo máximo para uma tentativa chegar ao vídeo; depois disso, recomeça do zero.
-const CONNECT_TIMEOUT_MS = 20000;
-// Tentativas seguidas sem vídeo; a partir de 2, explica o que está acontecendo.
-let failedAttempts = 0;
-const BLOCKED_TEXT = 'Não foi possível ligar o vídeo direto entre você e quem transmite: a rede de um ' +
-  'dos lados (roteador, firewall ou operadora) bloqueia esse tipo de conexão. Tentando de novo… ' +
-  'Se continuar, tente outra rede (por exemplo, o 4G/5G do celular).';
+// A sua própria tela não aparece: nem na página aberta pelo telinha
+// (`?local=`), nem nesta, quando ela entrou pelo botão de compartilhar. Quem
+// sabe disso é a sala (`own`); cada tela vem só com um apelido (`tag`).
+const isOwn = (p) => p.own;
 
-function connect() {
-  if (tunnelMode) return connectTunnel();
-  // Variáveis locais: handlers de uma tentativa antiga nunca mexem na nova.
-  const prevPc = activePc;
-  let done = false;
-  // HTTPS = aberto pelo túnel da Cloudflare, de fora da tailnet: precisa de STUN
-  // para o vídeo achar um caminho até a máquina que transmite.
-  const remote = location.protocol === 'https:';
-  const ws = new WebSocket(`${remote ? 'wss' : 'ws'}://${location.host}/ws${location.search}`);
-  const pc = new RTCPeerConnection({
-    bundlePolicy: 'max-bundle',
-    iceServers: remote ? [{ urls: 'stun:stun.l.google.com:19302' }] : [],
-  });
-  if (!prevPc) setStatus(failedAttempts >= 2 ? BLOCKED_TEXT : 'Conectando…');
-  const kinds = { local: {}, remote: {} };
-  const count = (side, line) => { const k = candidateKind(line); kinds[side][k] = (kinds[side][k] || 0) + 1; };
-  const summary = (side) => Object.entries(kinds[side]).map(([k, n]) => `${k}×${n}`).join(' ') || 'nenhum';
-  ws.onopen = () => ws.send(JSON.stringify({ type: 'hello', name: viewerName, device: deviceName(), client: clientId, page: 'solo' }));
-  // Fim definitivo (sem nova tentativa).
-  const stop = (text, canRejoin) => {
-    done = true;
-    clearTimeout(timer);
-    ws.onclose = null;
-    try { ws.close(); } catch {}
-    pc.close();
-    ended(text, canRejoin);
-  };
-  // Diagnóstico: o que acontece no navegador aparece no terminal de quem transmite.
-  const log = (text) => {
-    if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'log', text: String(text).slice(0, 500) }));
-  };
+function onRoom(msg) {
+  me = msg.you;
+  const jam = !!msg.jam;
+  if (jamOn === null) welcomeHint(jam);
+  else if (jam && !jamOn) hint(canShare ? 'O anfitrião liberou a jam: quem tem o telinha pode compartilhar a tela também.'
+    : 'O anfitrião liberou a jam: mais gente pode mostrar a tela.', 7000);
+  const jamEnded = !jam && jamOn;
+  if (jamEnded) hint('O anfitrião desligou a jam.', 5000);
+  jamOn = jam;
+  document.title = jam ? 'Telinha · Jam' : 'Telinha';
+  const own = !localClient && msg.presenters.find((p) => p.own);
+  if (own && !sharingHere) {
+    clearTimeout(shareTimer);
+    document.getElementById('share-help').hidden = true;
+    // O som desta página voltaria para a jam junto com o seu.
+    if (own.audio && !userMuted) { userMuted = true; autoMuted = true; }
+    hint(own.audio ? 'Sua tela está na jam. O som desta página foi desligado para não voltar para a jam (M liga).'
+      : 'Sua tela está na jam.', 6000);
+  } else if (!own && sharingHere) {
+    if (jam) hint('Sua tela saiu da jam.');
+    // Desligado só por causa da sua tela: volta o som.
+    if (autoMuted) { userMuted = false; autoMuted = false; }
+  }
+  const waiting = !!msg.waiting && !localClient;
+  if (waiting && !waitingHere) {
+    clearTimeout(shareTimer);
+    document.getElementById('share-help').hidden = true;
+    hint('Esperando o anfitrião aceitar a sua tela…', 120000);
+  } else if (!waiting && waitingHere && !own) {
+    hint('O anfitrião não aceitou a sua tela (ou não respondeu).', 6000);
+  }
+  waitingHere = waiting;
+  sharingHere = !!own;
+  presenters = msg.presenters.filter((p) => p.sharing && !isOwn(p));
+  const ids = new Set(presenters.map((p) => p.id));
+  for (const [id, tile] of tiles) {
+    if (!ids.has(id)) { tile.remove(); tiles.delete(id); }
+  }
+  for (const p of presenters) {
+    const tile = tiles.get(p.id) || new Tile(p);
+    tiles.set(p.id, tile);
+    tile.update(p);
+  }
+  // A tela selecionada saiu: volta para a grade.
+  if (view.tag && !presenters.some((p) => p.tag === view.tag)) {
+    if (view.mode !== 'grid' && !view.auto) hint('A tela que você estava vendo saiu da jam.');
+    view = { mode: 'grid', tag: null, auto: view.auto };
+  }
+  // Uma tela só: inteira e com som, como numa transmissão normal. Chegou
+  // mais alguém: as outras aparecem ao lado.
+  const only = tiles.size === 1 ? [...tiles.values()][0] : null;
+  if (only && view.mode !== 'solo') view = { mode: 'solo', tag: only.p.tag, auto: true };
+  else if (tiles.size > 1 && view.auto && view.mode === 'solo') {
+    view = { mode: 'focus', tag: view.tag, auto: true };
+    const added = presenters.find((p) => p.tag !== view.tag);
+    if (added) hint(`${added.name} entrou na jam. Clique numa tela para vê-la grande.`, 5000);
+  }
+  render();
+}
 
-  // Encerra esta tentativa (uma vez só) e agenda a próxima.
-  const retry = (text, delay = 2000) => {
-    if (done) return;
-    done = true;
-    clearTimeout(timer);
-    // Antes de fechar o WebSocket, que é por onde o diagnóstico chega a quem transmite.
-    if (pc !== activePc) log(`sem vídeo nesta tentativa · ICE ${pc.iceConnectionState} · caminhos daqui: ${summary('local')} · de lá: ${summary('remote')}`);
-    ws.onclose = null;
-    try { ws.close(); } catch {}
-    // A conexão em uso fica aberta: mantém a última imagem até a próxima conectar.
-    if (pc !== activePc) {
-      pc.close();
-      failedAttempts++;
-    }
-    // Duas tentativas diretas sem vídeo: passa a receber pelo túnel da Cloudflare.
-    if (failedAttempts >= 2 && !activePc && remote && tunnelSupported()) {
-      tunnelMode = true;
-      setTimeout(connectTunnel, 0);
+// Relé: [sid u32][tipo][pts µs u64][dados].
+function onMedia(buffer) {
+  const v = new DataView(buffer);
+  const conn = sessions.get(v.getUint32(0));
+  conn?.player?.feed(v.getUint8(4), Number(v.getBigUint64(5)), new Uint8Array(buffer, 13), buffer.byteLength);
+}
+
+// --- Telas ---------------------------------------------------------------------
+
+class Tile {
+  constructor(p) {
+    this.p = p;
+    this.conn = null;      // conexão mostrando imagem agora
+    this.pending = null;   // conexão nova (outra camada) ainda conectando
+    this.failures = 0;
+    this.relay = forceRelay;
+    this.retryTimer = null;
+    this.el = document.createElement('div');
+    this.el.className = 'tile';
+    this.el.innerHTML = '<video autoplay playsinline muted></video><canvas hidden></canvas>' +
+      '<div class="state"></div><div class="tstats"></div>' +
+      '<div class="label"><span class="key"></span><span class="name"></span><span class="os"></span><span class="sound" hidden>🔊</span></div>';
+    this.video = this.el.querySelector('video');
+    this.canvas = this.el.querySelector('canvas');
+    this.stateEl = this.el.querySelector('.state');
+    this.statsEl = this.el.querySelector('.tstats');
+    this.el.onclick = () => select(this.p.tag, view.mode === 'solo' ? 'solo' : 'focus');
+    this.el.ondblclick = (e) => { e.stopPropagation(); select(this.p.tag, 'solo'); toggleFull(true); };
+    this.setState('Conectando…');
+    stage.appendChild(this.el);
+  }
+
+  update(p) {
+    this.p = p;
+    this.el.querySelector('.name').textContent = p.name + (p.host && jamOn ? ' · anfitrião' : '');
+    this.el.querySelector('.os').textContent = p.os === 'windows' ? 'Windows' : 'Linux';
+  }
+
+  setState(text) { this.stateEl.textContent = text; }
+
+  // Camada que esta tela deve receber agora (null = nenhuma).
+  wanted() {
+    const selected = view.tag === this.p.tag;
+    if (view.mode === 'grid') return 'low';
+    if (selected) return 'high';
+    return view.mode === 'solo' ? null : 'low';
+  }
+
+  sync() {
+    const layer = this.wanted();
+    this.el.classList.toggle('selected', view.mode !== 'grid' && view.tag === this.p.tag);
+    if (!layer) {
+      clearTimeout(this.retryTimer);
+      this.pending?.close(true);
+      this.conn?.close(true);
+      this.pending = this.conn = null;
       return;
     }
-    setStatus(failedAttempts >= 2 && !activePc ? BLOCKED_TEXT : text);
-    setTimeout(connect, delay);
-  };
-  const timer = setTimeout(() => retry('Reconectando…', 0), CONNECT_TIMEOUT_MS);
+    if (this.conn?.layer === layer) {
+      if (this.pending) { this.pending.close(true); this.pending = null; }
+    } else if (this.pending?.layer !== layer && !this.retryTimer) {
+      this.pending?.close(true);
+      this.pending = new Conn(this, layer, this.relay);
+    }
+    applySound();
+  }
 
-  pc.ontrack = (e) => {
-    // Pede ao navegador o menor buffer de reprodução possível.
-    try { e.receiver.jitterBufferTarget = 0; } catch {}
-    try { e.receiver.playoutDelayHint = 0; } catch {}
-    if (e.track.kind === 'audio') {
-      soundBtn.hidden = false;
-      volumeEl.hidden = false;
-      updateSound();
+  // A conexão nova mostrou imagem: assume o lugar da anterior.
+  promote(conn) {
+    if (conn !== this.pending) return;
+    const old = this.conn;
+    this.conn = conn;
+    this.pending = null;
+    this.failures = 0;
+    this.setState('');
+    if (conn.player) {
+      if (!old) log(`tela #${this.p.id}: vídeo pelo relé (sem conexão direta) · ${conn.player.codec}`);
+      this.video.hidden = true;
+      this.canvas.hidden = false;
+    } else {
+      this.video.srcObject = conn.stream;
+      this.video.hidden = false;
+      this.canvas.hidden = true;
+      this.video.play().catch(() => {});
     }
-  };
-  pc.onicecandidate = (e) => {
-    if (e.candidate?.candidate) count('local', e.candidate.candidate);
-    if (e.candidate && ws.readyState === 1) {
-      ws.send(JSON.stringify({ type: 'ice', candidate: e.candidate.candidate,
-                               sdpMLineIndex: e.candidate.sdpMLineIndex ?? 0 }));
-    }
-  };
-  pc.oniceconnectionstatechange = () => log(`ICE ${pc.iceConnectionState}`);
-  pc.onicegatheringstatechange = () => {
-    log(`coleta ICE ${pc.iceGatheringState}${pc.iceGatheringState === 'complete' ? ` · caminhos daqui: ${summary('local')}` : ''}`);
-  };
-  pc.onconnectionstatechange = () => {
-    log(`conexão ${pc.connectionState}`);
-    if (pc.connectionState === 'connected') {
-      clearTimeout(timer);
-      failedAttempts = 0;
-      // Qual caminho funcionou (direto, via NAT, IPv4/IPv6): ajuda a entender redes difíceis.
-      pc.getStats().then((report) => {
-        let pair;
-        report.forEach((r) => { if (r.type === 'candidate-pair' && r.nominated && r.state === 'succeeded') pair = r; });
-        const side = (id) => { const c = id && report.get(id); return c ? `${c.candidateType}/${(c.address || c.ip || '').includes(':') ? 'IPv6' : 'IPv4'}` : '?'; };
-        if (pair) log(`caminho em uso: daqui ${side(pair.localCandidateId)} → lá ${side(pair.remoteCandidateId)}`);
-      }).catch(() => {});
-      // Só agora larga a conexão anterior: a última imagem fica na tela até aqui.
-      // Vídeo e áudio chegam em eventos separados; o elemento recebe as duas trilhas.
-      video.srcObject = new MediaStream(pc.getReceivers().map((r) => r.track));
-      // Com som, se o navegador deixar (o clique em "Assistir" costuma bastar).
-      video.play().catch(() => { video.muted = true; video.play().catch(() => {}); updateSound(); });
-      video.onplaying = () => log(`reproduzindo ${video.videoWidth}x${video.videoHeight}`);
-      // Confirma que as trilhas recebem dados (ajuda a diagnosticar "sem som").
-      setTimeout(async () => {
-        const got = [];
-        (await pc.getStats()).forEach((r) => {
-          if (r.type === 'inbound-rtp') got.push(`${r.kind} ${r.packetsReceived} pacotes`);
-        });
-        log(`recebendo: ${got.join(' · ') || 'nada'}`);
-      }, 3000);
-      activePc = pc;
-      if (prevPc) prevPc.close();
-      setStatus('');
-    }
-    if (pc.connectionState === 'failed') retry(remote
-      ? 'Falha na conexão de vídeo (a rede de alguma das pontas bloqueia conexões diretas). Tentando de novo…'
-      : 'Falha na conexão de vídeo (verifique o Tailscale). Tentando de novo…', 3000);
-  };
+    old?.close(true);
+    applySound();
+  }
 
-  ws.onmessage = async (e) => {
-    const msg = JSON.parse(e.data);
+  // Uma conexão não vingou (ou caiu): tenta de novo, pelo relé depois de 2 falhas.
+  failed(conn, reason) {
+    const wasShowing = conn === this.conn;
+    if (conn === this.pending) this.pending = null;
+    if (wasShowing) this.conn = null;
+    if (reason === 'pausada' || reason === 'saiu da jam') return;
+    this.failures++;
+    if (!this.relay && this.failures >= 2 && remote && tunnelSupported()) {
+      this.relay = true;
+      log(`tela #${this.p.id}: sem conexão direta, passando para o relé`);
+    }
+    if (!this.conn) this.setState(this.failures >= 2 && !this.relay
+      ? 'Não foi possível ligar o vídeo direto com esta pessoa (a rede de um dos lados bloqueia). Tentando de novo…'
+      : reason ? `Sem vídeo (${reason}). Tentando de novo…` : 'Reconectando…');
+    clearTimeout(this.retryTimer);
+    this.retryTimer = setTimeout(() => { this.retryTimer = null; if (tiles.get(this.p.id) === this) this.sync(); }, 2000);
+  }
+
+  remove() {
+    clearTimeout(this.retryTimer);
+    this.pending?.close(true);
+    this.conn?.close(true);
+    this.el.remove();
+  }
+}
+
+// Uma sessão com uma tela, numa camada: WebRTC direto ou relé pela sala.
+class Conn {
+  constructor(tile, layer, relay) {
+    this.tile = tile;
+    this.layer = layer;
+    this.relay = relay;
+    this.sid = nextSid++;
+    this.done = false;
+    this.stream = null;
+    this.player = null;
+    this.pc = null;
+    sessions.set(this.sid, this);
+    this.timer = setTimeout(() => this.fail('tempo esgotado'), CONNECT_TIMEOUT_MS);
+    if (relay) {
+      this.player = new RelayPlayer(tile.canvas, audioCtx, {
+        onFrame: (first) => { if (first) { clearTimeout(this.timer); tile.promote(this); } },
+        requestKey: () => send({ type: 'keyframe', sid: this.sid }),
+        log,
+      });
+      this.player.ready.then(() => {
+        if (!this.done) send({ type: 'watch', sid: this.sid, pub: tile.p.id, layer, mode: 'relay' });
+      });
+      return;
+    }
+    const pc = this.pc = new RTCPeerConnection({
+      bundlePolicy: 'max-bundle',
+      iceServers: remote ? [{ urls: 'stun:stun.l.google.com:19302' }] : [],
+    });
+    pc.ontrack = (e) => {
+      try { e.receiver.jitterBufferTarget = 0; } catch {}
+      try { e.receiver.playoutDelayHint = 0; } catch {}
+    };
+    pc.onicecandidate = (e) => {
+      if (e.candidate) this.signal({ type: 'ice', candidate: e.candidate.candidate, sdpMLineIndex: e.candidate.sdpMLineIndex ?? 0 });
+    };
+    pc.onconnectionstatechange = () => {
+      if (pc.connectionState === 'connected') {
+        clearTimeout(this.timer);
+        this.stream = new MediaStream(pc.getReceivers().map((r) => r.track));
+        tile.promote(this);
+        this.logPath();
+      } else if (pc.connectionState === 'failed') {
+        this.fail('a conexão falhou');
+      }
+    };
+    send({ type: 'watch', sid: this.sid, pub: tile.p.id, layer, mode: 'webrtc' });
+  }
+
+  signal(payload) { send({ type: 'signal', sid: this.sid, payload }); }
+
+  // Diagnóstico para quem transmite: por onde o vídeo passou (direto, NAT, IPv6...).
+  async logPath() {
+    try {
+      const stats = await this.pc.getStats();
+      let pair;
+      const candidates = {};
+      stats.forEach((s) => {
+        if (s.type === 'candidate-pair' && s.nominated && s.state === 'succeeded') pair = s;
+        if (s.type === 'local-candidate' || s.type === 'remote-candidate') candidates[s.id] = s;
+      });
+      const side = (id) => {
+        const c = candidates[id];
+        return c ? `${c.candidateType}/${String(c.address || c.ip || '').includes(':') ? 'IPv6' : 'IPv4'}` : '?';
+      };
+      const layer = this.layer === 'high' ? 'qualidade cheia' : 'miniatura';
+      log(`tela #${this.tile.p.id}: ${layer} conectada · ${navigator.userAgent.match(/(Firefox|Edg|OPR|Chrome|Safari)\/[\d.]+/)?.[0] ?? ''}` +
+        (pair ? ` · caminho daqui ${side(pair.localCandidateId)} → lá ${side(pair.remoteCandidateId)}` : ''));
+    } catch {}
+  }
+
+  async onSignal(msg) {
+    if (!this.pc || this.done) return;
     if (msg.type === 'offer') {
       try {
-        await pc.setRemoteDescription({ type: 'offer', sdp: msg.sdp });
-        const answer = await pc.createAnswer();
-        await pc.setLocalDescription(answer);
-        ws.send(JSON.stringify({ type: 'answer', sdp: answer.sdp }));
-        // Porta 0 numa linha m= = o navegador recusou aquela trilha (ex.: codec).
-        const media = answer.sdp.split(/\r?\n/).filter((l) => l.startsWith('m='));
-        log(`${navigator.userAgent} · resposta: ${media.join(' | ')}`);
+        await this.pc.setRemoteDescription({ type: 'offer', sdp: msg.sdp });
+        const answer = await this.pc.createAnswer();
+        await this.pc.setLocalDescription(answer);
+        this.signal({ type: 'answer', sdp: answer.sdp });
       } catch (err) {
-        log(`erro na negociação: ${err.name}: ${err.message}`);
-        setStatus(`Erro na negociação do vídeo: ${err.message}`);
+        log(`tela #${this.tile.p.id}: erro na negociação: ${err.name}: ${err.message}`);
+        this.fail('erro na negociação');
       }
-    } else if (msg.type === 'ice') {
-      if (msg.candidate) count('remote', msg.candidate);
-      try { await pc.addIceCandidate({ candidate: msg.candidate, sdpMLineIndex: msg.sdpMLineIndex }); } catch {}
-    } else if (msg.type === 'reload') {
-      reloadPage();
-    } else if (msg.type === 'full') {
-      retry('A transmissão está cheia. Tentando de novo em instantes…', 5000);
-    } else if (msg.type === 'kicked') {
-      stop('Você foi removido da transmissão.', true);
-    } else if (msg.type === 'blocked') {
-      stop('Quem está transmitindo bloqueou você.', false);
+    } else if (msg.type === 'ice' && msg.candidate) {
+      try { await this.pc.addIceCandidate({ candidate: msg.candidate, sdpMLineIndex: msg.sdpMLineIndex }); } catch {}
     }
-  };
-  ws.onclose = () => retry('Conexão perdida. Reconectando…');
+  }
+
+  onClosed(reason) {
+    if (this.done) return;
+    this.close(false);
+    this.tile.failed(this, reason);
+  }
+
+  fail(reason) {
+    if (this.done) return;
+    if (this.pc) log(`tela #${this.tile.p.id}: sem vídeo (${reason}) · ICE ${this.pc.iceConnectionState}`);
+    this.close(true);
+    this.tile.failed(this, reason);
+  }
+
+  // `tell`: avisa a sala (quando quem fecha somos nós).
+  close(tell) {
+    if (this.done) return;
+    this.done = true;
+    clearTimeout(this.timer);
+    sessions.delete(this.sid);
+    if (tell) send({ type: 'unwatch', sid: this.sid });
+    try { this.pc?.close(); } catch {}
+    this.player?.close();
+  }
 }
 
-// --- Modo túnel ---------------------------------------------------------------
-// Quando a conexão direta (WebRTC) não fecha, o vídeo H.264 e o áudio Opus já
-// codificados vêm pelo próprio WebSocket, que passa pela Cloudflare. Cada
-// mensagem binária: [tipo][pts em µs, u64][dados]; tipo 1 = quadro-chave,
-// 2 = quadro, 3 = áudio. Decodificação com WebCodecs; som pelo Web Audio.
-// "?tunel" no link força o modo túnel (para redes que sabidamente bloqueiam).
-let tunnelMode = new URLSearchParams(location.search).has('tunel'), tunnel = null, audioCtx = null;
-const canvas = document.getElementById('canvas');
+// --- Seleção, layout e som -------------------------------------------------------
 
-function connectTunnel() {
-  const ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws${location.search}`);
-  ws.binaryType = 'arraybuffer';
-  const ctx2d = canvas.getContext('2d');
-  const log = (text) => {
-    if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'log', text: String(text).slice(0, 500) }));
-  };
-  const state = { ws, closed: false, decoder: null, audio: null, playhead: 0, waitingKey: true, shown: false,
-    frames: 0, bytes: 0, skipped: 0, codec: '' };
-  tunnel = state;
-  let stopped = false;
-  state.close = () => {
-    state.closed = true;
-    ws.onclose = null;
-    try { ws.close(); } catch {}
-    try { state.decoder?.close(); } catch {}
-    try { state.audio?.close(); } catch {}
-  };
-  const stop = (text, canRejoin) => { stopped = true; state.close(); ended(text, canRejoin); };
-  if (!state.shown) setStatus('Conectando pelo túnel…');
-  document.getElementById('mode').hidden = false;
-
-  const newDecoder = () => new VideoDecoder({
-    output: (frame) => {
-      if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
-        canvas.width = frame.displayWidth;
-        canvas.height = frame.displayHeight;
-      }
-      ctx2d.drawImage(frame, 0, 0);
-      frame.close();
-      state.frames++;
-      if (!state.shown) {
-        state.shown = true;
-        video.hidden = true;
-        canvas.hidden = false;
-        setStatus('');
-        log(`reproduzindo pelo túnel ${canvas.width}x${canvas.height} (${state.codec})`);
-      }
-    },
-    error: (err) => {
-      log(`erro no decodificador (quadro ${state.chunks}, ${state.lastKind}, NALs ${state.lastNals}): ${err.message}`);
-      state.waitingKey = true;
-      state.decoder = null;
-    },
-  });
-
-  const onVideo = (key, ts, data) => {
-    data = withHeaders(state, data);
-    if (!data) return;
-    if (!state.decoder || state.decoder.state === 'closed') {
-      if (!state.codec) return;
-      state.decoder = newDecoder();
-      state.decoder.configure({ codec: state.codec, optimizeForLatency: true });
-      state.waitingKey = true;
-    }
-    // Computador sem fôlego para decodificar: pula até o próximo quadro-chave.
-    if (state.decoder.decodeQueueSize > 8) state.waitingKey = true;
-    if (state.waitingKey && !key) {
-      state.skipped++;
-      // O telinha só gera quadro-chave quando alguém pede: pede (no máximo 1/s).
-      const now = performance.now();
-      if (!state.lastKeyRequest || now - state.lastKeyRequest > 1000) {
-        state.lastKeyRequest = now;
-        if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'keyframe' }));
-      }
-      return;
-    }
-    data = cleanAccessUnit(data);
-    state.waitingKey = false;
-    state.chunks = (state.chunks || 0) + 1;
-    state.lastKind = key ? 'chave' : 'delta';
-    state.lastNals = nalTypes(data).join(',');
-    state.decoder.decode(new EncodedVideoChunk({ type: key ? 'key' : 'delta', timestamp: ts, data }));
-  };
-
-  const onAudio = (ts, data) => {
-    if (!audioCtx || !('AudioDecoder' in window)) return;
-    if (!state.audio) {
-      const gain = audioCtx.createGain();
-      gain.connect(audioCtx.destination);
-      state.gain = gain;
-      state.audio = new AudioDecoder({
-        output: (audioData) => {
-          const buffer = audioCtx.createBuffer(audioData.numberOfChannels, audioData.numberOfFrames, audioData.sampleRate);
-          for (let ch = 0; ch < audioData.numberOfChannels; ch++) {
-            const plane = new Float32Array(audioData.numberOfFrames);
-            audioData.copyTo(plane, { planeIndex: ch, format: 'f32-planar' });
-            buffer.copyToChannel(plane, ch);
-          }
-          audioData.close();
-          // Pequena reserva (80 ms) contra engasgos; se acumular atraso, recomeça.
-          const now = audioCtx.currentTime;
-          if (state.playhead < now + 0.02 || state.playhead > now + 0.4) state.playhead = now + 0.08;
-          const source = audioCtx.createBufferSource();
-          source.buffer = buffer;
-          source.connect(state.gain);
-          source.start(state.playhead);
-          state.playhead += buffer.duration;
-        },
-        error: (err) => { log(`erro no áudio: ${err.message}`); state.audio = null; },
-      });
-      state.audio.configure({ codec: 'opus', sampleRate: 48000, numberOfChannels: 2 });
-      soundBtn.hidden = false;
-      volumeEl.hidden = false;
-      applyTunnelVolume();
-      updateSound();
-    }
-    if (state.audio.state === 'configured') state.audio.decode(new EncodedAudioChunk({ type: 'key', timestamp: ts, data }));
-  };
-
-  ws.onopen = () => ws.send(JSON.stringify({ type: 'hello', name: viewerName, device: deviceName(), client: clientId, mode: 'tunnel', page: 'solo' }));
-  ws.onmessage = async (e) => {
-    if (typeof e.data === 'string') {
-      const msg = JSON.parse(e.data);
-      if (msg.type === 'tunnel') {
-        state.codec = await pickVideoCodec();
-        log(`modo túnel · ${navigator.userAgent} · codec ${state.codec || 'nenhum H.264 suportado'}`);
-        if (!state.codec) setStatus('Este navegador não decodifica H.264 pelo WebCodecs. Tente o Chrome, o Edge ou o Firefox atualizado.');
-      } else if (msg.type === 'reload') {
-        reloadPage();
-      } else if (msg.type === 'full') {
-        setStatus('A transmissão está cheia. Tentando de novo em instantes…');
-      } else if (msg.type === 'kicked') {
-        stop('Você foi removido da transmissão.', true);
-      } else if (msg.type === 'blocked') {
-        stop('Quem está transmitindo bloqueou você.', false);
-      }
-      return;
-    }
-    const view = new DataView(e.data);
-    const kind = view.getUint8(0);
-    const ts = Number(view.getBigUint64(1));
-    const data = new Uint8Array(e.data, 9);
-    state.bytes += e.data.byteLength;
-    if (kind === 3) onAudio(ts, data);
-    else onVideo(kind === 1, ts, data);
-  };
-  ws.onclose = () => {
-    state.close();
-    if (stopped) return;
-    if (!state.shown) setStatus('Conexão pelo túnel perdida. Reconectando…');
-    setTimeout(connectTunnel, 2000);
-  };
+function select(tag, mode) {
+  // Com uma tela só não há grade nem faixa lateral: ela fica inteira.
+  if (tiles.size === 1) { tag = [...tiles.values()][0].p.tag; mode = 'solo'; }
+  if (view.mode === mode && view.tag === tag) return;
+  view = { mode, tag, auto: false };
+  // O clique conta como gesto: a partir daqui o navegador deixa tocar som.
+  audioCtx?.resume();
+  render();
 }
 
-// No túnel o som sai pelo Web Audio; o <video> (escondido) continua sendo a
-// referência de volume e mudo, então os mesmos controles servem.
-function applyTunnelVolume() {
-  if (tunnel?.gain) tunnel.gain.gain.value = video.muted ? 0 : video.volume;
-}
-video.addEventListener('volumechange', applyTunnelVolume);
-
-function tunnelStats() {
-  const now = performance.now();
-  const t = tunnel;
-  const kbps = last ? ((t.bytes - last.bytes) * 8 / (now - last.t)).toFixed(0) : '–';
-  const fps = last?.frames !== undefined ? ((t.frames - last.frames) * 1000 / (now - last.t)).toFixed(0) : '–';
-  last = { bytes: t.bytes, frames: t.frames, t: now };
-  statsEl.textContent =
-    `modo        túnel (pela Cloudflare)\n` +
-    `resolução   ${canvas.width}x${canvas.height} @ ${fps} fps\n` +
-    `bitrate     ${kbps} kbps\n` +
-    `decodific.  ${t.codec || '–'} · fila ${t.decoder?.decodeQueueSize ?? 0}\n` +
-    `pulados     ${t.skipped} quadros`;
-}
-
-async function updateStats() {
-  if (tunnel && !tunnel.closed) return tunnelStats();
-  const pc = activePc;
-  if (!pc || pc.connectionState !== 'connected') return;
-  const report = await pc.getStats();
-  let v, pair;
-  report.forEach((s) => {
-    if (s.type === 'inbound-rtp' && s.kind === 'video') v = s;
-    if (s.type === 'candidate-pair' && s.nominated && s.state === 'succeeded') pair = s;
-  });
-  if (!v) return;
-  const now = performance.now();
-  const kbps = last ? ((v.bytesReceived - last.bytes) * 8 / (now - last.t)).toFixed(0) : '–';
-  const jb = v.jitterBufferEmittedCount ? (1000 * v.jitterBufferDelay / v.jitterBufferEmittedCount).toFixed(0) : '–';
-  const dec = v.framesDecoded ? (1000 * v.totalDecodeTime / v.framesDecoded).toFixed(1) : '–';
-  const rtt = pair?.currentRoundTripTime != null ? (pair.currentRoundTripTime * 1000).toFixed(0) : '–';
-  last = { bytes: v.bytesReceived, t: now };
-  statsEl.textContent =
-    `resolução   ${v.frameWidth ?? '–'}x${v.frameHeight ?? '–'} @ ${v.framesPerSecond ?? 0} fps\n` +
-    `bitrate     ${kbps} kbps\n` +
-    `rede (RTT)  ${rtt} ms\n` +
-    `buffer      ${jb} ms\n` +
-    `decodific.  ${dec} ms  ${v.decoderImplementation ?? ''}${v.powerEfficientDecoder ? ' (hardware)' : ''}\n` +
-    `perdidos    ${v.packetsLost ?? 0} pacotes · ${v.framesDropped ?? 0} quadros`;
+function render() {
+  const n = tiles.size;
+  document.getElementById('empty').hidden = n > 0;
+  const mode = n === 0 ? 'grid' : view.mode;
+  document.body.classList.toggle('grid', mode === 'grid');
+  document.body.classList.toggle('focus', mode === 'focus');
+  document.body.classList.toggle('solo', mode === 'solo');
+  // Grade o mais quadrada possível; no foco, as outras telas empilhadas ao lado.
+  stage.style.setProperty('--cols', String(Math.max(1, Math.ceil(Math.sqrt(n)))));
+  stage.style.setProperty('--others', String(Math.max(1, n - 1)));
+  let i = 0;
+  for (const tile of tiles.values()) {
+    tile.el.querySelector('.key').textContent = ++i <= 9 ? String(i) : '';
+    tile.sync();
+  }
+  document.getElementById('btn-grid').hidden = mode === 'grid' || n < 2;
+  for (const b of document.querySelectorAll('.share')) b.hidden = !canShare || !jamOn || sharingHere || waitingHere;
+  document.getElementById('empty-text').textContent = jamOn ? 'Ninguém está compartilhando a tela ainda.' : 'A transmissão está pausada.';
+  document.getElementById('empty-jam').hidden = !jamOn;
+  for (const tile of tiles.values()) tile.update(tile.p);
+  const solo = document.getElementById('btn-solo');
+  solo.hidden = mode === 'grid' || n < 2;
+  solo.textContent = mode === 'solo' ? 'Mostrar todas' : 'Ver só esta';
+  applySound();
 }
 
-// O navegador só toca áudio depois de um clique; o "Assistir" já conta como um.
-function updateSound() {
-  soundBtn.textContent = video.muted ? 'Ativar som' : 'Silenciar';
-  volumeEl.value = video.muted ? 0 : video.volume;
-  volumeEl.title = `Volume ${video.muted ? 0 : Math.round(video.volume * 100)}% (↑/↓)`;
-  document.body.classList.toggle('needs-unmute', !soundBtn.hidden && video.muted);
+// Só a tela selecionada toca som; na grade, nenhuma.
+function applySound() {
+  const selected = view.mode !== 'grid' ? [...tiles.values()].find((t) => t.p.tag === view.tag) : null;
+  const hasAudio = !!selected?.p.audio;
+  for (const tile of tiles.values()) {
+    const on = tile === selected && !userMuted;
+    tile.video.muted = !on;
+    tile.video.volume = volume;
+    tile.conn?.player?.setVolume(on ? volume : 0);
+    tile.el.querySelector('.sound').hidden = !(tile === selected && hasAudio && !userMuted);
+    if (tile.video.hidden) continue;
+    // Sem um clique antes (página recarregada sozinha), o navegador não deixa
+    // tocar com som: segue sem som, e o botão "Ativar som" resolve.
+    tile.video.play().catch(() => {
+      if (!on || userMuted) return;
+      userMuted = true;
+      applySound();
+      hint('Clique em "Ativar som" para ouvir esta tela.', 5000);
+    });
+  }
+  soundBtn.hidden = !hasAudio;
+  volumeEl.hidden = !hasAudio;
+  soundBtn.textContent = userMuted ? 'Ativar som' : 'Silenciar';
+  volumeEl.value = userMuted ? 0 : volume;
 }
+
 function toggleSound() {
   if (soundBtn.hidden) return;
-  video.muted = !video.muted;
-  // Voltar do mudo com o volume no zero não faria som nenhum.
-  if (!video.muted && video.volume === 0) {
-    video.volume = 0.5;
-    store('telinha-volume', '0.5');
-  }
-  updateSound();
+  userMuted = !userMuted;
+  autoMuted = false;
+  if (!userMuted && localClient && !inApp) hint('Cuidado: você também compartilha som; o som desta página pode voltar para a jam.', 5000);
+  if (!userMuted && volume === 0) volume = 0.5;
+  audioCtx?.resume();
+  applySound();
 }
-// Volume de 0 a 1, lembrado neste navegador; zero equivale a mudo.
-function setVolume(value) {
-  const v = Math.min(1, Math.max(0, Math.round(value * 100) / 100));
-  video.volume = v;
-  video.muted = v === 0;
-  store('telinha-volume', String(v));
-  updateSound();
+
+function setVolume(v) {
+  volume = Math.min(1, Math.max(0, Math.round(v * 100) / 100));
+  userMuted = volume === 0;
+  autoMuted = false;
+  if (volume > 0) store('telinha-volume', String(volume));
+  applySound();
 }
-// Um volume salvo em zero não volta: a página abriria sem som e sem o botão de ativar.
-video.volume = Math.min(1, Number(stored('telinha-volume', '1')) || 1);
 volumeEl.oninput = () => setVolume(Number(volumeEl.value));
 
-function toggleStats() {
-  statsEl.classList.toggle('on');
-  clearInterval(statsTimer);
-  if (statsEl.classList.contains('on')) { last = null; updateStats(); statsTimer = setInterval(updateStats, 1000); }
+// --- Estatísticas ---------------------------------------------------------------
+
+let statsTimer;
+const lastBytes = new Map();
+async function updateStats() {
+  for (const tile of tiles.values()) {
+    const conn = tile.conn;
+    if (!conn) { tile.statsEl.textContent = 'sem vídeo'; continue; }
+    const now = performance.now();
+    const prev = lastBytes.get(conn);
+    const layer = conn.layer === 'high' ? 'alta' : 'miniatura';
+    if (conn.player) {
+      const p = conn.player;
+      const kbps = prev ? ((p.bytes - prev.bytes) * 8 / (now - prev.t)).toFixed(0) : '–';
+      const fps = prev ? ((p.frames - prev.frames) * 1000 / (now - prev.t)).toFixed(0) : '–';
+      lastBytes.set(conn, { bytes: p.bytes, frames: p.frames, t: now });
+      tile.statsEl.textContent = `${layer} · relé\n${tile.canvas.width}x${tile.canvas.height} @ ${fps} fps\n${kbps} kbps · pulados ${p.skipped}`;
+      continue;
+    }
+    let v, pair;
+    (await conn.pc.getStats()).forEach((s) => {
+      if (s.type === 'inbound-rtp' && s.kind === 'video') v = s;
+      if (s.type === 'candidate-pair' && s.nominated && s.state === 'succeeded') pair = s;
+    });
+    if (!v) continue;
+    const kbps = prev ? ((v.bytesReceived - prev.bytes) * 8 / (now - prev.t)).toFixed(0) : '–';
+    lastBytes.set(conn, { bytes: v.bytesReceived, t: now });
+    const rtt = pair?.currentRoundTripTime != null ? (pair.currentRoundTripTime * 1000).toFixed(0) : '–';
+    tile.statsEl.textContent =
+      `${layer} · direto\n${v.frameWidth ?? '–'}x${v.frameHeight ?? '–'} @ ${v.framesPerSecond ?? 0} fps\n` +
+      `${kbps} kbps · RTT ${rtt} ms\nperdidos ${v.packetsLost ?? 0}`;
+  }
 }
-function toggleFull() {
-  document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen();
+function toggleStats() {
+  document.body.classList.toggle('stats');
+  clearInterval(statsTimer);
+  if (document.body.classList.contains('stats')) { updateStats(); statsTimer = setInterval(updateStats, 1000); }
+}
+function toggleFull(on) {
+  if (on === true && document.fullscreenElement) return;
+  document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen().catch(() => {});
 }
 
+// --- Controles ----------------------------------------------------------------
+
+document.getElementById('btn-grid').onclick = () => select(null, 'grid');
+document.getElementById('btn-solo').onclick = () => select(view.tag, view.mode === 'solo' ? 'focus' : 'solo');
 soundBtn.onclick = toggleSound;
 document.getElementById('btn-stats').onclick = toggleStats;
-document.getElementById('btn-full').onclick = toggleFull;
-video.ondblclick = toggleFull;
-canvas.ondblclick = toggleFull;
+document.getElementById('btn-full').onclick = () => toggleFull();
 document.onkeydown = (e) => {
-  // No campo de nome as teclas são texto; no controle de volume as setas já são dele.
   if (e.target instanceof HTMLInputElement && e.target.type !== 'range') return;
-  if ((e.key === 'ArrowUp' || e.key === 'ArrowDown') && e.target !== volumeEl && !soundBtn.hidden) {
+  if (!document.getElementById('join').hidden) return;
+  const k = e.key;
+  if (k >= '1' && k <= '9') {
+    const tile = [...tiles.values()][Number(k) - 1];
+    if (tile) select(tile.p.tag, view.mode === 'solo' ? 'solo' : 'focus');
+  } else if (k === 'Escape' || k === 'g' || k === 'G') {
+    if (k === 'Escape' && document.fullscreenElement) return;
+    select(null, 'grid');
+  } else if ((k === 'v' || k === 'V') && view.mode !== 'grid') {
+    select(view.tag, view.mode === 'solo' ? 'focus' : 'solo');
+  } else if (k === 's' || k === 'S') toggleStats();
+  else if (k === 'f' || k === 'F') toggleFull();
+  else if (k === 'm' || k === 'M') toggleSound();
+  else if ((k === 'ArrowUp' || k === 'ArrowDown') && e.target !== volumeEl && !soundBtn.hidden) {
     e.preventDefault();
-    setVolume((video.muted ? 0 : video.volume) + (e.key === 'ArrowUp' ? 0.1 : -0.1));
+    setVolume((userMuted ? 0 : volume) + (k === 'ArrowUp' ? 0.1 : -0.1));
   }
-  if (e.key === 's' || e.key === 'S') toggleStats();
-  if (e.key === 'f' || e.key === 'F') toggleFull();
-  if (e.key === 'm' || e.key === 'M') toggleSound();
 };
+
+// Link da jam para quem vai compartilhar: sem os parâmetros desta página.
+function jamLink() {
+  const link = new URL(location.href);
+  for (const key of ['local', 'relay', 'codec', 'app']) link.searchParams.delete(key);
+  return link.toString();
+}
+document.getElementById('join-cmd').textContent = document.getElementById('share-cmd').textContent =
+  `telinha --join "${jamLink()}"`;
+
+// "Compartilhar minha tela": abre o telinha instalado neste computador pelo
+// link telinha:// (ele pede confirmação antes de mostrar qualquer coisa). O
+// id deste navegador vai junto: a sua tela não aparece aqui, e esta aba já é
+// a sua página da jam.
+function shareScreen() {
+  const url = `telinha://join?link=${encodeURIComponent(jamLink())}&viewer=${encodeURIComponent(clientId)}`;
+  if (/Firefox\//.test(navigator.userAgent)) {
+    // Sem o telinha instalado, o Firefox trocaria esta página por uma de erro.
+    const frame = document.createElement('iframe');
+    frame.style.display = 'none';
+    frame.src = url;
+    document.body.appendChild(frame);
+    setTimeout(() => frame.remove(), 10000);
+  } else {
+    location.href = url;
+  }
+  hint('Abrindo o telinha… confirme lá para a sua tela entrar na jam.', 8000);
+  clearTimeout(shareTimer);
+  shareTimer = setTimeout(() => { if (!sharingHere && !waitingHere) document.getElementById('share-help').hidden = false; }, 9000);
+}
+for (const b of document.querySelectorAll('.share')) b.onclick = shareScreen;
+document.getElementById('share-retry').onclick = () => { document.getElementById('share-help').hidden = true; shareScreen(); };
+document.getElementById('share-close').onclick = () => { clearTimeout(shareTimer); document.getElementById('share-help').hidden = true; };
+// O navegador libera o som depois de qualquer clique (relé, página recarregada).
+document.addEventListener('pointerdown', () => audioCtx?.resume());
 
 const nameInput = document.getElementById('name');
 nameInput.value = stored('telinha-name', '');
@@ -516,19 +728,28 @@ document.getElementById('join').onsubmit = (e) => {
   viewerName = nameInput.value.trim();
   store('telinha-name', viewerName);
   document.getElementById('join').hidden = true;
-  video.muted = false;
-  // Criado no clique: o navegador só deixa tocar som depois de um gesto (modo túnel).
+  // Criado no clique: o navegador só deixa tocar som depois de um gesto (relé).
   try { audioCtx = new AudioContext({ latencyHint: 'interactive' }); } catch {}
-  connect();
+  connectRoom();
 };
 document.getElementById('rejoin').onclick = () => {
   document.getElementById('ended').hidden = true;
-  video.muted = false;
+  stopped = false;
   audioCtx?.resume();
-  connect();
+  connectRoom();
 };
-// Vindo da página da jam (o anfitrião a desligou): entra direto.
-if (takeAutoJoin()) document.getElementById('join').requestSubmit();
+
+// Primeira mensagem da sala: a dica e os botões por alguns segundos (para o
+// de compartilhar, se houver, ser visto).
+function welcomeHint(jam) {
+  if (localClient && inApp) hint('Estas são as telas dos outros. O som desta janela não vai para a sua transmissão.', 6000);
+  else if (localClient) hint('Esta é a sua página da jam: a sua tela fica de fora e o som começa desligado.', 6000);
+  else if (jam && canShare) hint('Tem o telinha neste computador? "Compartilhar minha tela" (no canto) mostra a sua também.', 7000);
+  else if (jam) hint('Clique numa tela para vê-la grande e ouvir o som dela.', 5000);
+  else hint('F ou duplo clique: tela cheia · M: som · S: estatísticas', 4000);
+  document.body.classList.add('intro');
+  setTimeout(() => document.body.classList.remove('intro'), jam ? 8000 : 4000);
+}
 </script>
 </body>
 </html>

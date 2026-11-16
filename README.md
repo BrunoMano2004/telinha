@@ -160,6 +160,7 @@ tela cheia, e **S** mostra as estatísticas (fps, bitrate, RTT, buffer e decodif
 | `--join <link>` | | Entra na jam do link e compartilha a sua tela nela |
 | `--name <nome>` | nome do PC | Seu nome na jam |
 | `--max-presenters <n>` | 5 | Jam: máximo de telas ao mesmo tempo |
+| `--jam-approve` | | Jam: cada tela nova espera você aceitar |
 | `--open-url <url>` | | Linux: abre um link `telinha://join?…` (o botão da página da jam) |
 
 Comandos pelo stdin enquanto roda (é assim que o Caelestia e o app do Windows
@@ -172,6 +173,7 @@ controlam o telinha):
 | `screen` | Linux: abre o seletor e troca a tela; Windows: `screen <monitor-handle>` |
 | `app on\|off <nome>` | Liga ou desliga o som de um app |
 | `jam on\|off` | Libera ou desliga a jam na transmissão em andamento |
+| `approve on\|off` · `accept <id>` · `deny <id>` | Jam: pedir para entrar; aceita ou recusa um pedido |
 | `share on\|off` | Jam: retoma ou pausa a sua tela (sem sair) |
 | `stop-share <id>` · `lock on\|off` | Jam (anfitrião): para a tela de alguém · tranca a jam |
 | `k` · `s` · `q` | Keyframe, status, sair |
@@ -179,7 +181,8 @@ controlam o telinha):
 Eventos na saída, uma linha JSON cada: `@viewers [...]`, `@blocked [...]`,
 `@apps [...]`, `@quality {...}` e `@screen switched|cancelled`. Na jam também:
 `@jam {...}` (link e página; `toggled` quando liberada com `jam on`),
-`@jam-off {}`, `@room {...}` (telas e quem vê o quê), `@share on|off` e
+`@jam-off {}`, `@room {...}` (telas, quem vê o quê e os pedidos para entrar),
+`@share on|off`, `@jam-waiting {}` (o seu pedido espera o anfitrião) e
 `@jam-ended {...}`.
 
 ### Jam: várias telas num link só
@@ -208,6 +211,13 @@ Windows a pergunta aparece na janela do app. No Linux ela vem numa notificação
 com botões, ou pelo zenity, e depois o card do Caelestia assume (sem o
 Caelestia, a notificação fica com o botão **Parar**). A sua tela some da página
 de onde você clicou, e o som dela é desligado para não voltar para a jam.
+
+**Pedir para entrar.** Com a opção ligada (**Ask before someone shares** no
+Caelestia, **Pedir antes de alguém compartilhar** no app do Windows,
+`--jam-approve` ou `approve on`), cada tela nova espera você aceitar: o pedido
+aparece no painel (e num aviso perto do relógio no Windows) com **Aceitar** e
+**Recusar**. Quem já foi aceito volta sem pedir de novo se a conexão cair. Sem
+resposta em 2 minutos, o pedido expira.
 
 Também dá para entrar sem a página. No Caelestia, use **Create jam** e **Join
 copied jam** no card (copie antes o link que você recebeu). No Windows, use o

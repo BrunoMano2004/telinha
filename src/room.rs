@@ -12,10 +12,10 @@ use crate::publisher::Publisher;
 use crate::stream::Layer;
 use serde::Serialize;
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 /// Versão do protocolo entre o anfitrião e quem entra com `--join`.
 pub const PROTO: u64 = 1;
@@ -78,12 +78,23 @@ struct Session {
     dropping: bool,
 }
 
+/// Alguém pedindo para compartilhar a tela (com "pedir para entrar" ligado).
+struct Request {
+    info: PresenterInfo,
+    ip: String,
+    decide: Option<oneshot::Sender<bool>>,
+}
+
 #[derive(Default)]
 struct Inner {
     members: HashMap<u64, Member>,
     presenters: HashMap<u64, Presenter>,
     sessions: HashMap<u64, Session>,
     by_sid: HashMap<(u64, u32), u64>,
+    requests: HashMap<u64, Request>,
+    /// Quem já foi aceito (id do telinha): volta sem pedir de novo se a
+    /// conexão cair.
+    approved: HashSet<String>,
 }
 
 /// O que fazer com um apresentador depois de soltar o lock da sala (a tela
@@ -107,6 +118,8 @@ pub struct Room {
     max_presenters: usize,
     max_members: usize,
     locked: AtomicBool,
+    /// Pedir para entrar: cada tela nova espera o anfitrião aceitar.
+    approve: AtomicBool,
     /// Jam ligada? Desligada, a sala existe (a tela do anfitrião está nela),
     /// mas as interfaces não recebem `@room`.
     active: AtomicBool,
@@ -127,6 +140,7 @@ impl Room {
             max_presenters: max_presenters.max(1),
             max_members,
             locked: AtomicBool::new(false),
+            approve: AtomicBool::new(false),
             active: AtomicBool::new(true),
             tags: std::hash::RandomState::new(),
         }
@@ -140,6 +154,66 @@ impl Room {
     pub fn set_locked(&self, locked: bool) {
         self.locked.store(locked, Ordering::Relaxed);
         self.broadcast();
+    }
+
+    // --- Pedir para entrar -----------------------------------------------------
+
+    /// Liga ou desliga o "pedir para entrar". Desligar aceita quem estava esperando.
+    pub fn set_approve(&self, on: bool) {
+        self.approve.store(on, Ordering::Relaxed);
+        if !on {
+            let ids: Vec<u64> = self.inner.lock().unwrap().requests.keys().copied().collect();
+            for id in ids {
+                self.decide(id, true);
+            }
+        }
+        self.emit();
+    }
+
+    /// Esta tela precisa esperar o anfitrião? (Quem já foi aceito volta direto.)
+    pub fn needs_approval(&self, client: &str) -> bool {
+        self.approve.load(Ordering::Relaxed) && !self.inner.lock().unwrap().approved.contains(client)
+    }
+
+    /// Registra o pedido; a resposta chega pelo receptor (`true` = aceito).
+    /// Erro já na hora se a sala estiver trancada ou cheia.
+    pub fn ask(&self, id: u64, info: PresenterInfo, ip: String) -> Result<oneshot::Receiver<bool>, String> {
+        let mut inner = self.inner.lock().unwrap();
+        if self.is_locked() {
+            return Err("a jam está trancada".into());
+        }
+        if inner.presenters.len() >= self.max_presenters {
+            return Err(format!("a jam já tem {} telas (o máximo)", self.max_presenters));
+        }
+        let (tx, rx) = oneshot::channel();
+        inner.requests.insert(id, Request { info, ip, decide: Some(tx) });
+        drop(inner);
+        self.broadcast();
+        Ok(rx)
+    }
+
+    /// `accept <id>` / `deny <id>`. Falso se não há esse pedido.
+    pub fn decide(&self, id: u64, accept: bool) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        let Some(request) = inner.requests.get_mut(&id) else { return false };
+        let decide = request.decide.take();
+        let client = request.info.client.clone();
+        if accept && !client.is_empty() {
+            inner.approved.insert(client);
+        }
+        drop(inner);
+        decide.is_some_and(|tx| tx.send(accept).is_ok())
+    }
+
+    /// O pedido acabou (aceito, recusado, desistiu ou expirou).
+    pub fn forget_request(&self, id: u64) {
+        if self.inner.lock().unwrap().requests.remove(&id).is_some() {
+            self.broadcast();
+        }
+    }
+
+    pub fn request_name(&self, id: u64) -> Option<String> {
+        self.inner.lock().unwrap().requests.get(&id).map(|r| r.info.name.clone())
     }
 
     /// Liga ou desliga o `@room` (a jam do anfitrião ligou ou desligou).
@@ -472,15 +546,27 @@ impl Room {
             })
             .collect();
         let locked = self.is_locked();
-        // Cada navegador recebe só o que a página usa: as telas (com apelido)
-        // e se a sala está trancada. Quem mais assiste fica só com o anfitrião.
+        // Cada navegador recebe só o que a página usa: as telas (com apelido),
+        // se a sala está trancada e se a tela dele espera ser aceita. Quem
+        // mais assiste fica só com o anfitrião.
         for (id, m) in members.iter().filter(|_| to_members) {
             let presenters = self.presenters_json(&inner, Some(&m.info));
-            let msg = json!({ "type": "room", "you": id, "locked": locked, "presenters": presenters });
+            let waiting = !m.info.client.is_empty() && inner.requests.values().any(|r| r.info.client == m.info.client);
+            let msg = json!({ "type": "room", "you": id, "locked": locked, "presenters": presenters, "waiting": waiting });
             let _ = m.tx.send(msg.to_string());
         }
         if self.active.load(Ordering::Relaxed) {
-            println!("@room {}", json!({ "locked": locked, "presenters": presenters, "viewers": viewers }));
+            let mut requests: Vec<(&u64, &Request)> = inner.requests.iter().collect();
+            requests.sort_by_key(|(id, _)| **id);
+            let requests: Vec<Value> = requests
+                .into_iter()
+                .map(|(id, r)| json!({ "id": id, "name": r.info.name, "os": r.info.os, "ip": r.ip }))
+                .collect();
+            let approve = self.approve.load(Ordering::Relaxed);
+            println!(
+                "@room {}",
+                json!({ "locked": locked, "approve": approve, "presenters": presenters, "viewers": viewers, "requests": requests })
+            );
         }
     }
 }
@@ -516,6 +602,33 @@ mod tests {
             }
         }
         last
+    }
+
+    /// Com "pedir para entrar", a tela espera; aceita, volta direto se cair.
+    #[test]
+    fn approval_waits_for_the_host() {
+        let room = Room::new(5, 10);
+        room.set_approve(true);
+        assert!(room.needs_approval("c-Bia"));
+        let mut rx = room.ask(7, info("Bia"), "1.2.3.4".into()).unwrap();
+        assert_eq!(room.request_name(7).as_deref(), Some("Bia"));
+        assert!(rx.try_recv().is_err(), "ainda sem resposta");
+        assert!(room.decide(7, true));
+        assert_eq!(rx.try_recv(), Ok(true));
+        room.forget_request(7);
+        assert!(!room.needs_approval("c-Bia"), "aceita uma vez, volta sem pedir");
+        assert!(room.needs_approval("c-Caio"));
+        let mut rx = room.ask(8, info("Caio"), String::new()).unwrap();
+        assert!(room.decide(8, false));
+        assert_eq!(rx.try_recv(), Ok(false));
+        assert!(!room.decide(99, true), "pedido que não existe");
+        // Desligar o "pedir para entrar" aceita quem estava esperando.
+        let mut rx = room.ask(9, info("Duda"), String::new()).unwrap();
+        room.set_approve(false);
+        assert_eq!(rx.try_recv(), Ok(true));
+        room.set_locked(true);
+        room.set_approve(true);
+        assert!(room.ask(10, info("Eva"), String::new()).is_err(), "trancada");
     }
 
     /// O navegador não recebe o id de ninguém nem a lista de quem assiste;

@@ -168,6 +168,8 @@ const sessions = new Map();  // sid → conexão
 let view = { mode: 'grid', tag: null, auto: true };
 // A tela deste computador está na jam (entrou pelo botão "Compartilhar minha tela").
 let sharingHere = false, shareTimer = null;
+// Pedido para entrar esperando o anfitrião aceitar (com "pedir para entrar" ligado).
+let waitingHere = false;
 let userMuted = localClient !== '';
 let volume = Math.min(1, Number(stored('telinha-volume', '1')) || 1);
 
@@ -244,6 +246,15 @@ function onRoom(msg) {
     hint(own.audio ? 'Sua tela está na jam. O som desta página foi desligado para não voltar para a jam (M liga).'
       : 'Sua tela está na jam.', 6000);
   } else if (!own && sharingHere) hint('Sua tela saiu da jam.');
+  const waiting = !!msg.waiting && !localClient;
+  if (waiting && !waitingHere) {
+    clearTimeout(shareTimer);
+    document.getElementById('share-help').hidden = true;
+    hint('Esperando o anfitrião aceitar a sua tela…', 120000);
+  } else if (!waiting && waitingHere && !own) {
+    hint('O anfitrião não aceitou a sua tela (ou não respondeu).', 6000);
+  }
+  waitingHere = waiting;
   sharingHere = !!own;
   presenters = msg.presenters.filter((p) => p.sharing && !isOwn(p));
   const ids = new Set(presenters.map((p) => p.id));
@@ -505,7 +516,7 @@ function render() {
     tile.sync();
   }
   document.getElementById('btn-grid').hidden = mode === 'grid' || n < 2;
-  for (const b of document.querySelectorAll('.share')) b.hidden = !canShare || sharingHere;
+  for (const b of document.querySelectorAll('.share')) b.hidden = !canShare || sharingHere || waitingHere;
   const solo = document.getElementById('btn-solo');
   solo.hidden = mode === 'grid' || n < 2;
   solo.textContent = mode === 'solo' ? 'Mostrar todas' : 'Ver só esta';
@@ -653,7 +664,7 @@ function shareScreen() {
   }
   hint('Abrindo o telinha… confirme lá para a sua tela entrar na jam.', 8000);
   clearTimeout(shareTimer);
-  shareTimer = setTimeout(() => { if (!sharingHere) document.getElementById('share-help').hidden = false; }, 9000);
+  shareTimer = setTimeout(() => { if (!sharingHere && !waitingHere) document.getElementById('share-help').hidden = false; }, 9000);
 }
 for (const b of document.querySelectorAll('.share')) b.onclick = shareScreen;
 document.getElementById('share-retry').onclick = () => { document.getElementById('share-help').hidden = true; shareScreen(); };

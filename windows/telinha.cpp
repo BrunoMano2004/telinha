@@ -18,6 +18,7 @@
 #include <cwctype>
 #include <functional>
 #include <map>
+#include <set>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -42,6 +43,8 @@ static std::wstring jamWatch;
 // Pedido do botão "Compartilhar minha tela" da página (link telinha://),
 // esperando a pessoa confirmar na janela: link da jam e id daquele navegador.
 static std::wstring pendingJoinLink, pendingJoinViewer;
+// Pedidos para entrar na jam já avisados (balão perto do relógio).
+static std::set<std::wstring> seenRequests;
 // Identifica o WM_COPYDATA que repassa um link telinha:// à janela já aberta.
 static const ULONG_PTR copyJoinUrl = 0x544C4E48;
 static std::vector<HMONITOR> monitors;
@@ -260,6 +263,7 @@ static void PostInit() {
         L",\"auto\":" + (IniInt(L"auto", 1) ? L"true" : L"false") +
         L",\"audio\":" + (IniInt(L"audio", 1) ? L"true" : L"false") +
         L",\"public\":" + (IniInt(L"publico", 1) ? L"true" : L"false") +
+        L",\"approve\":" + (IniInt(L"aprovar", 0) ? L"true" : L"false") +
         L",\"apps\":" + apps + L"}");
     PostState();
     Post(L"{\"type\":\"viewers\",\"data\":" + lastViewers + L"}");
@@ -319,6 +323,7 @@ static void CloseChild() {
     { std::lock_guard<std::mutex> lock(linesMutex); lines.clear(); }
     link.clear();
     jamWatch.clear();
+    seenRequests.clear();
     lastViewers = lastBlocked = lastApps = L"[]";
     PostState();
     Status(L"Telinha - parado");
@@ -367,6 +372,8 @@ static void Start(int monitor, int kbps, int fps, bool audio, bool isPublic, boo
     else if (isPublic) args += L" --tunnel";
     else args += L" --require-tailscale";
     if (mode == L"jam") args += L" --jam";
+    // Na jam que você cria (ou liga depois), cada tela nova espera você aceitar.
+    if (mode != L"join" && IniInt(L"aprovar", 0)) args += L" --jam-approve";
     HANDLE outputRead = NULL, outputWrite = NULL, inputRead = NULL;
     SECURITY_ATTRIBUTES security = { sizeof(security), NULL, TRUE };
     bool pipes = CreatePipe(&outputRead, &outputWrite, &security, 0) &&
@@ -448,7 +455,35 @@ static void HandleLine(const std::wstring& line) {
     if (event(L"apps", data)) { lastApps = data; Post(L"{\"type\":\"apps\",\"data\":" + data + L"}"); return; }
     if (event(L"quality", data)) { Post(L"{\"type\":\"quality\",\"data\":" + data + L"}"); return; }
     if (event(L"screen", data)) { Post(L"{\"type\":\"screen\",\"state\":" + JsonText(data) + L"}"); return; }
-    if (event(L"room", data)) { Post(L"{\"type\":\"room\",\"data\":" + data + L"}"); return; }
+    if (event(L"room", data)) {
+        Post(L"{\"type\":\"room\",\"data\":" + data + L"}");
+        // Pedido novo para entrar: balão perto do relógio (a janela pode estar fechada).
+        size_t start = data.find(L"\"requests\":[");
+        size_t end = start == std::wstring::npos ? start : data.find(L']', start);
+        std::set<std::wstring> current;
+        if (end != std::wstring::npos) {
+            std::wstring list = data.substr(start, end - start);
+            for (size_t at = list.find(L'{'); at != std::wstring::npos; at = list.find(L'{', at + 1)) {
+                std::wstring item = list.substr(at, list.find(L'}', at) - at);
+                size_t idAt = item.find(L"\"id\":");
+                if (idAt == std::wstring::npos) continue;
+                std::wstring id = item.substr(idAt + 5, item.find_first_not_of(L"0123456789", idAt + 5) - (idAt + 5));
+                current.insert(id);
+                if (!seenRequests.count(id)) {
+                    NOTIFYICONDATAW balloon = tray;
+                    balloon.uFlags = NIF_INFO;
+                    wcscpy_s(balloon.szInfoTitle, L"Pedido para entrar na jam");
+                    std::wstring text = JsonField(item, L"name") + L" quer compartilhar a tela. Abra o Telinha para aceitar ou recusar.";
+                    wcsncpy_s(balloon.szInfo, text.c_str(), _TRUNCATE);
+                    balloon.dwInfoFlags = NIIF_INFO;
+                    Shell_NotifyIconW(NIM_MODIFY, &balloon);
+                }
+            }
+        }
+        seenRequests = current;
+        return;
+    }
+    if (event(L"jam-waiting", data)) { Post(L"{\"type\":\"jam-waiting\"}"); Status(L"Telinha - esperando o anfitrião aceitar"); return; }
     if (event(L"share", data)) { Post(L"{\"type\":\"share\",\"state\":" + JsonText(data) + L"}"); return; }
     if (event(L"jam-ended", data)) { Post(L"{\"type\":\"jam-ended\",\"data\":" + data + L"}"); return; }
     if (event(L"jam-off", data)) {
@@ -539,7 +574,7 @@ static void HandleUi(const std::wstring& message) {
         std::lock_guard<std::mutex> lock(updateMutex);
         if (WebLink(available.page)) ShellExecuteW(window, L"open", available.page.c_str(), NULL, NULL, SW_SHOWNORMAL);
     }
-    else if (cmd == L"save" && (arg(1) == L"monitor" || arg(1) == L"qualidade" || arg(1) == L"audio" || arg(1) == L"publico" || arg(1) == L"auto")) {
+    else if (cmd == L"save" && (arg(1) == L"monitor" || arg(1) == L"qualidade" || arg(1) == L"audio" || arg(1) == L"publico" || arg(1) == L"auto" || arg(1) == L"aprovar")) {
         IniSet(L"geral", arg(1), arg(2));
         if (arg(1) == L"qualidade" || arg(1) == L"auto") LoadSettings();
     }

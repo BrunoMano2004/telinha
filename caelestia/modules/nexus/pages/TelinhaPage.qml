@@ -186,6 +186,41 @@ PageBase {
 
         ToggleRow {
             visible: Telinha.jamHost
+            text: Tr.tr("Ask before someone shares")
+            subtext: Tr.tr("Each new screen waits for you to accept it here")
+            checked: Telinha.room?.approve ?? Telinha.approve
+            onToggled: Telinha.setApprove(checked)
+        }
+
+        // Pedidos para entrar (com "pedir antes" ligado).
+        Repeater {
+            model: Telinha.jamHost ? Telinha.jamRequests : []
+
+            PersonRow {
+                id: requestRow
+
+                required property var modelData
+
+                icon: "person_add"
+                name: modelData.name
+                detail: [Tr.tr("wants to share their screen"), modelData.os === "windows" ? "Windows" : "Linux", modelData.ip].filter(s => s).join(" · ")
+
+                IconButton {
+                    icon: "check"
+                    type: IconButton.Text
+                    onClicked: Telinha.acceptRequest(requestRow.modelData.id)
+                }
+
+                IconButton {
+                    icon: "close"
+                    type: IconButton.Text
+                    onClicked: Telinha.denyRequest(requestRow.modelData.id)
+                }
+            }
+        }
+
+        ToggleRow {
+            visible: Telinha.jamHost
             last: Telinha.jamScreens.length === 0
             text: Tr.tr("Lock the jam")
             subtext: Tr.tr("Nobody new gets in; who is already in stays")

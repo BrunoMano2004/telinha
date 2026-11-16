@@ -30,6 +30,11 @@ Singleton {
     property var jam: null     // {role, id, link, watch}
     property var room: null    // {locked, presenters: [...], viewers: [...]} (só o anfitrião recebe)
     property bool sharePaused: false
+    // Pedir para entrar: o seu pedido espera o anfitrião (quem entrou) e os
+    // pedidos que chegaram (quem criou), [{id, name, os, ip}].
+    property bool waitingApproval: false
+    readonly property var jamRequests: room?.requests ?? []
+    property var seenRequests: []
     readonly property bool inJam: mode !== ""
     readonly property bool jamHost: mode === "jam"
     // Telas na jam, sem contar a sua.
@@ -57,6 +62,8 @@ Singleton {
     // Qualidade automática: o telinha ajusta bitrate e fps pela rede de quem
     // assiste, pelo encoder e pelo uso de CPU. autoNow = o que ele escolheu agora.
     property bool autoQuality: true
+    // Na jam que você cria, cada tela nova espera você aceitar.
+    property bool approve: false
     property var autoNow: null
     property var appChoices: ({}) // nome em minúsculas → entra no som?
 
@@ -118,6 +125,20 @@ Singleton {
         send(`lock ${on ? "on" : "off"}`);
     }
 
+    function setApprove(on: bool): void {
+        approve = on;
+        save();
+        send(`approve ${on ? "on" : "off"}`);
+    }
+
+    function acceptRequest(id: int): void {
+        send(`accept ${id}`);
+    }
+
+    function denyRequest(id: int): void {
+        send(`deny ${id}`);
+    }
+
     // Liga ou desliga a jam na transmissão em andamento.
     function setJam(on: bool): void {
         send(`jam ${on ? "on" : "off"}`);
@@ -147,6 +168,8 @@ Singleton {
         jam = null;
         room = null;
         sharePaused = false;
+        waitingApproval = false;
+        seenRequests = [];
         url = "";
         lastError = "";
         viewers = [];
@@ -225,6 +248,7 @@ Singleton {
             audio: audio,
             quality: quality,
             auto: autoQuality,
+            approve: approve,
             apps: appChoices
         }));
     }
@@ -271,6 +295,8 @@ Singleton {
                 args.push("--tunnel");
             if (root.mode === "jam")
                 args.push("--jam");
+            if (root.mode !== "join" && root.approve)
+                args.push("--jam-approve");
             if (root.autoQuality)
                 args.push("--auto-quality");
             else
@@ -316,10 +342,19 @@ Singleton {
                         root.liveApps = data;
                     else if (event[1] === "quality")
                         root.autoNow = data.auto ? data : null;
-                    else if (event[1] === "room")
+                    else if (event[1] === "room") {
                         root.room = data;
+                        // Pedido novo: avisa (aceitar e recusar ficam no painel).
+                        const ids = (data.requests ?? []).map(r => r.id);
+                        for (const r of data.requests ?? [])
+                            if (!root.seenRequests.includes(r.id))
+                                Toaster.toast(Tr.tr("%1 wants to share their screen").arg(r.name), Tr.tr("Accept or deny in the Screen share panel"), "person_add", Toast.Info);
+                        root.seenRequests = ids;
+                    } else if (event[1] === "jam-waiting")
+                        root.waitingApproval = true;
                     else if (event[1] === "jam") {
                         root.jam = data;
+                        root.waitingApproval = false;
                         root.url = data.link;
                         if (data.role === "host")
                             root.mode = "jam";
@@ -382,6 +417,8 @@ Singleton {
             root.jam = null;
             root.room = null;
             root.sharePaused = false;
+            root.waitingApproval = false;
+            root.seenRequests = [];
         }
     }
 
@@ -397,6 +434,7 @@ Singleton {
                 if (Number.isInteger(data.quality) && data.quality >= 0 && data.quality < root.qualities.length)
                     root.quality = data.quality;
                 root.autoQuality = data.auto !== false;
+                root.approve = data.approve === true;
                 if (data.apps && typeof data.apps === "object")
                     root.appChoices = data.apps;
             } catch (e) {}

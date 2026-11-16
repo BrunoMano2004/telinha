@@ -26,6 +26,9 @@ use tokio::sync::mpsc;
 /// Fila de quadros do relé por navegador (~2 s de vídeo).
 const MEDIA_QUEUE: usize = 300;
 
+/// Quanto tempo um pedido para entrar espera o anfitrião responder.
+const APPROVAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 const JAM_OFF: &str = "o anfitrião não liberou a jam nesta transmissão (só ele pode compartilhar agora)";
 
 pub fn os_name() -> &'static str {
@@ -364,6 +367,53 @@ pub async fn handle_presenter(socket: WebSocket, ip: String, app: Arc<App>) {
     };
 
     let id = room.next_id();
+    // Pedir para entrar: espera o anfitrião aceitar (com ping, para a conexão
+    // não cair parada), desistindo se a pessoa sair ou o tempo acabar.
+    if room.needs_approval(&info.client) {
+        let decision = match room.ask(id, info.clone(), ip.clone()) {
+            Ok(rx) => rx,
+            Err(text) => {
+                let _ = sink.send(send_now(json!({ "type": "error", "text": text }))).await;
+                return;
+            }
+        };
+        let _ = sink.send(send_now(json!({ "type": "waiting" }))).await;
+        println!("? tela #{id} {} ({}) quer entrar na jam · accept {id} / deny {id}", info.name, info.os);
+        let mut shutdown = app.shutdown.subscribe();
+        let mut jam_on = app.jam_on.subscribe();
+        let mut ping = tokio::time::interval(WS_PING_INTERVAL);
+        let deadline = tokio::time::sleep(APPROVAL_TIMEOUT);
+        tokio::pin!(decision, deadline);
+        let refused = loop {
+            tokio::select! {
+                answer = &mut decision => break match answer {
+                    Ok(true) => None,
+                    _ => Some("o anfitrião não aceitou a sua tela"),
+                },
+                _ = &mut deadline => break Some("o anfitrião não respondeu ao seu pedido"),
+                // O `Ref` do watch não pode atravessar um await: fica dentro do bloco.
+                _ = async { let _ = shutdown.wait_for(|s| *s).await; } => break Some("a jam terminou"),
+                _ = async { let _ = jam_on.wait_for(|on| !*on).await; } => break Some("o anfitrião desligou a jam"),
+                _ = ping.tick() => {
+                    if sink.send(Message::Ping(Default::default())).await.is_err() {
+                        break Some("");
+                    }
+                }
+                msg = incoming.next() => match msg {
+                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break Some(""),
+                    _ => {}
+                },
+            }
+        };
+        room.forget_request(id);
+        if let Some(text) = refused {
+            println!("? tela #{id} {} não entrou{}", info.name, if text.is_empty() { "" } else { " (recusada ou sem resposta)" });
+            if !text.is_empty() {
+                let _ = sink.send(send_now(json!({ "type": "error", "text": text }))).await;
+            }
+            return;
+        }
+    }
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
     if let Err(text) = room.add_presenter(id, info, Link::Remote(tx.clone()), false) {
         let _ = sink.send(send_now(json!({ "type": "error", "text": text }))).await;
@@ -505,6 +555,8 @@ enum FromRoom {
         session: u64,
     },
     StopShare,
+    /// Pedir para entrar: esperando o anfitrião aceitar.
+    Waiting,
     Kicked,
     Blocked,
     Ended,
@@ -658,6 +710,10 @@ pub async fn run_uplink(
                     uplink.sharing.store(false, Ordering::Relaxed);
                     uplink.publisher.close_all();
                     println!("@share off");
+                }
+                FromRoom::Waiting => {
+                    println!("Esperando o anfitrião aceitar a sua tela…");
+                    println!("@jam-waiting {{}}");
                 }
                 FromRoom::Kicked => break Ended::Final("você foi removido da jam".into()),
                 FromRoom::Blocked => break Ended::Final("o anfitrião bloqueou você".into()),

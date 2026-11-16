@@ -137,7 +137,7 @@
   .switch input:disabled:checked + span::after { background: #fff; }
 
   /* Pessoas e apps */
-  .list { display: grid; }
+  .list { display: grid; grid-template-columns: minmax(0, 1fr); }
   .person { display: flex; align-items: center; gap: 12px; padding: 10px 8px; margin: 0 -8px; border-radius: 10px; }
   .person:hover { background: var(--hover); }
   .avatar { width: 36px; height: 36px; border-radius: 50%; flex: none; display: grid; place-items: center;
@@ -147,6 +147,8 @@
   .person .meta { font-size: 12.5px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .person .actions { display: flex; gap: 2px; opacity: .75; transition: opacity .15s; }
   .person:hover .actions { opacity: 1; }
+  .person .actions.request { gap: 6px; opacity: 1; flex-shrink: 0; }
+  .person .actions.request .btn { height: 32px; padding: 0 12px; }
   .tag { display: inline-flex; align-items: center; height: 20px; padding: 0 7px; border-radius: 6px; margin-left: 6px;
     font-size: 11px; font-weight: 700; background: var(--warn-soft); color: var(--warn); vertical-align: 1px; }
   .sub { margin: 14px 0 4px; font-size: 12px; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
@@ -313,6 +315,11 @@
             <div class="text"><div class="name">Minha tela</div><div class="meta" id="share-meta"></div></div>
             <button class="btn" id="jam-pause">Pausar</button>
           </div>
+          <div class="row" id="approve-row">
+            <div class="text"><div class="name">Pedir antes de alguém compartilhar</div><div class="meta">Cada tela nova espera você aceitar aqui.</div></div>
+            <label class="switch"><input type="checkbox" id="jam-approve" aria-label="Pedir antes de alguém compartilhar"><span></span></label>
+          </div>
+          <div class="list" id="jam-requests"></div>
           <div class="row" id="lock-row">
             <div class="text"><div class="name">Trancar a jam</div><div class="meta">Ninguém novo entra; quem já está continua.</div></div>
             <label class="switch"><input type="checkbox" id="jam-lock" aria-label="Trancar a jam"><span></span></label>
@@ -380,7 +387,7 @@ const state = {
   version: '', update: null, // {version, page, progress (null|-1|0..100), error}
   // Jam: mode '' (transmissão), 'jam' (você criou) ou 'join' (entrou); jam = {role, id, link, watch};
   // room = estado da sala (só no anfitrião); paused = sua tela pausada.
-  mode: '', jam: null, room: null, paused: false,
+  mode: '', jam: null, room: null, paused: false, approve: false, waiting: false,
   ask: null, // pedido da página da jam: {link, host}
 };
 
@@ -393,17 +400,19 @@ function onMessage(msg) {
     case 'init':
       state.version = msg.version || '';
       Object.assign(state, { monitors: msg.monitors, monitor: msg.monitor ?? 0, quality: msg.quality ?? 2,
-        audio: msg.audio !== false, public: msg.public !== false, choices: msg.apps || {}, auto: msg.auto !== false });
+        audio: msg.audio !== false, public: msg.public !== false, choices: msg.apps || {}, auto: msg.auto !== false,
+        approve: msg.approve === true });
       break;
     case 'state':
       state.running = msg.running; state.starting = msg.running && !msg.link; state.link = msg.link || '';
       if (!msg.running) {
         state.viewers = []; state.blocked = []; state.liveApps = []; state.autoNow = null;
-        state.jam = null; state.room = null; state.paused = false;
+        state.jam = null; state.room = null; state.paused = false; state.waiting = false;
       }
       break;
+    case 'jam-waiting': state.waiting = true; break;
     case 'jam':
-      state.jam = msg.data;
+      state.jam = msg.data; state.waiting = false;
       if (msg.data.role === 'host') state.mode = 'jam';
       toast(msg.data.toggled ? 'Jam liberada: quem assiste pode compartilhar a tela'
         : msg.data.role === 'host' ? 'Jam criada · link copiado'
@@ -451,6 +460,11 @@ $('jam-open').onclick = () => send('jam-open');
 $('jam-pause').onclick = () => send('send', `share ${state.paused ? 'on' : 'off'}`);
 $('jam-lock').onchange = (e) => send('send', `lock ${e.target.checked ? 'on' : 'off'}`);
 $('jam-allow').onchange = (e) => send('send', `jam ${e.target.checked ? 'on' : 'off'}`);
+$('jam-approve').onchange = (e) => {
+  state.approve = e.target.checked;
+  send('save', 'aprovar', state.approve ? 1 : 0);
+  send('send', `approve ${state.approve ? 'on' : 'off'}`);
+};
 $('ask-yes').onclick = () => {
   state.ask = null; state.mode = 'join'; state.starting = true; render();
   // O app usa o monitor, o som e a qualidade escolhidos aqui.
@@ -536,7 +550,10 @@ function render() {
   const n = state.viewers.length;
   const inJam = state.running && state.mode !== '';
   const others = state.room ? state.room.presenters.filter((p) => !p.host) : [];
-  $('status').textContent = state.starting ? (state.mode === 'join' ? 'Entrando na jam…' : 'Preparando a transmissão…')
+  const asking = state.room?.requests?.length || 0;
+  $('status').textContent = state.waiting && !live ? 'Esperando o anfitrião aceitar a sua tela…'
+    : state.starting ? (state.mode === 'join' ? 'Entrando na jam…' : 'Preparando a transmissão…')
+    : live && inJam && state.mode === 'jam' && asking ? `Jam ao vivo · ${asking} ${asking === 1 ? 'pedido para entrar' : 'pedidos para entrar'}`
     : live && inJam ? (state.mode === 'jam' ? `Jam ao vivo · ${others.length} ${others.length === 1 ? 'outra tela' : 'outras telas'}` : 'Na jam · compartilhando sua tela')
     : live ? (n ? `Ao vivo · ${n} ${n === 1 ? 'pessoa assistindo' : 'pessoas assistindo'}` : 'Ao vivo · esperando quem vai assistir')
     : 'Pronto para compartilhar';
@@ -600,6 +617,17 @@ function render() {
     $('jam-pause').textContent = state.paused ? 'Retomar' : 'Pausar';
     $('share-meta').textContent = state.paused ? 'Pausada: sumiu da jam.' : 'Na jam. Pausar esconde sem sair.';
     $('lock-row').hidden = state.mode !== 'jam';
+    $('approve-row').hidden = state.mode !== 'jam';
+    $('jam-approve').checked = state.room?.approve ?? state.approve;
+    const requests = state.mode === 'jam' ? (state.room?.requests || []) : [];
+    $('jam-requests').innerHTML = requests.map((r) => `
+      <div class="person">${avatar(r.name)}
+        <div class="text"><div class="name">${esc(r.name)}</div>
+          <div class="meta">${esc(['quer compartilhar a tela', r.os === 'windows' ? 'Windows' : 'Linux', r.ip].filter(Boolean).join(' · '))}</div></div>
+        <div class="actions request"><button class="btn primary" data-accept="${Number(r.id)}">Aceitar</button>
+          <button class="btn ghost" data-deny="${Number(r.id)}">Recusar</button></div></div>`).join('');
+    $('jam-requests').querySelectorAll('[data-accept]').forEach((b) => b.onclick = () => send('send', `accept ${b.dataset.accept}`));
+    $('jam-requests').querySelectorAll('[data-deny]').forEach((b) => b.onclick = () => send('send', `deny ${b.dataset.deny}`));
     $('jam-lock').checked = !!state.room?.locked;
     $('jam-live').querySelector('.row').classList.toggle('first', state.mode !== 'jam');
     $('jam-screens').innerHTML = state.mode !== 'jam' ? '' : others.length ? others.map((p) => `
@@ -663,7 +691,8 @@ function demo(parts) {
       if (parts[7] === 'jam') onMessage({ type: 'room', data: { locked: false, viewers: [], presenters: [
         { id: 1, name: 'Este PC', os: 'windows', host: true, sharing: true, sessions: 0 },
         { id: 2, name: 'Bia', os: 'linux', host: false, sharing: true, sessions: 2 },
-        { id: 3, name: 'Carlos', os: 'windows', host: false, sharing: false, sessions: 0 } ] } });
+        { id: 3, name: 'Carlos', os: 'windows', host: false, sharing: false, sessions: 0 } ],
+        approve: true, requests: [{ id: 9, name: 'Duda', os: 'linux', ip: '177.22.8.140' }] } });
     }
   }, 600);
   if (parts[0] === 'send' && /^share (on|off)$/.test(parts[1])) onMessage({ type: 'share', state: parts[1].slice(6) });

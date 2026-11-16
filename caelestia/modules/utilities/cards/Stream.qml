@@ -72,15 +72,19 @@ StyledRect {
                     text: {
                         if (Telinha.selecting)
                             return Tr.tr("Choose a screen...");
-                        if (!root.live)
+                        if (!root.live) {
+                            if (Telinha.waitingApproval)
+                                return Tr.tr("Waiting for the host to accept...");
                             return Telinha.running && Telinha.mode === "join" ? Tr.tr("Joining the jam...") : Tr.tr("Ready");
+                        }
                         if (Telinha.inJam) {
                             const paused = Telinha.sharePaused ? " · " + Tr.tr("your screen is paused") : "";
                             if (!Telinha.jamHost)
                                 return Tr.tr("In the jam · sharing your screen") + paused;
                             const others = Telinha.jamScreens.length;
                             const watching = Telinha.room ? Telinha.room.viewers.length : 0;
-                            return Tr.tr("Live · %1 other screens · %2 watching").arg(others).arg(watching) + paused;
+                            const asking = Telinha.jamRequests.length ? " · " + Tr.tr("%1 asking to share").arg(Telinha.jamRequests.length) : "";
+                            return Tr.tr("Live · %1 other screens · %2 watching").arg(others).arg(watching) + asking + paused;
                         }
                         const n = Telinha.viewers.length;
                         if (Telinha.switchingScreen)

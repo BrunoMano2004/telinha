@@ -113,6 +113,11 @@ struct Args {
     #[arg(long, value_name = "URL")]
     open_url: Option<String>,
 
+    /// Jam: cada pessoa que for compartilhar espera você aceitar (comandos
+    /// `accept <id>` / `deny <id>`; `approve on|off` muda ao vivo).
+    #[arg(long)]
+    jam_approve: bool,
+
     /// Jam: máximo de telas compartilhadas ao mesmo tempo (contando a sua).
     #[arg(long, default_value_t = 5)]
     max_presenters: usize,
@@ -324,6 +329,7 @@ async fn main() -> Result<()> {
     // Quem transmite sempre tem a sala: a jam pode ser ligada a qualquer momento.
     let room = joining.is_none().then(|| Arc::new(room::Room::new(args.max_presenters, max_members)));
     if let Some(room) = &room {
+        room.set_approve(args.jam_approve);
         room.set_active(args.jam);
     }
     let watch_link = jam::with_param(&link, "local", &client);
@@ -633,7 +639,7 @@ fn spawn_console(app: Arc<App>, rt: tokio::runtime::Handle) {
     if app.uplink.is_some() {
         println!("Comandos: quality · share on|off · screen · s · q (sair)");
     } else {
-        println!("Comandos: quality <kbps> <fps> · kick/block <id> · jam on|off · stop-share <id> · lock on|off · screen · s · q (sair)");
+        println!("Comandos: quality <kbps> <fps> · kick/block <id> · jam on|off · approve on|off · accept/deny <id> · stop-share <id> · lock on|off · screen · s · q (sair)");
     }
     std::thread::spawn(move || {
         // Fechar sessões da jam agenda tarefas no tokio.
@@ -729,12 +735,27 @@ fn spawn_console(app: Arc<App>, rt: tokio::runtime::Handle) {
                     _ => println!("uso (anfitrião da jam): stop-share <id>"),
                 },
                 "jam" if app.room.is_some() && (rest == "on" || rest == "off") => app.set_jam(rest == "on"),
+                "approve" if app.room.is_some() && (rest == "on" || rest == "off") => {
+                    app.room.as_ref().unwrap().set_approve(rest == "on");
+                    println!("jam: {}", if rest == "on" { "cada tela nova espera você aceitar" } else { "quem entrar compartilha na hora" });
+                }
+                "accept" | "deny" => match (&app.room, num(rest)) {
+                    (Some(room), Some(id)) => {
+                        let name = room.request_name(id).unwrap_or_default();
+                        if room.decide(id, cmd == "accept") {
+                            println!("{} #{id} {name}", if cmd == "accept" { "tela aceita:" } else { "tela recusada:" });
+                        } else {
+                            println!("pedido #{id} não encontrado");
+                        }
+                    }
+                    _ => println!("uso (anfitrião da jam): {cmd} <id>"),
+                },
                 "lock" if app.room.is_some() && (rest == "on" || rest == "off") => {
                     app.room.as_ref().unwrap().set_locked(rest == "on");
                     println!("jam {}", if rest == "on" { "trancada: ninguém novo entra" } else { "aberta" });
                 }
                 "" => {}
-                _ => println!("comandos: b · quality · kick · block · unblock · screen · app · jam · share · stop-share · lock · s · q"),
+                _ => println!("comandos: b · quality · kick · block · unblock · screen · app · jam · approve · accept · deny · share · stop-share · lock · s · q"),
             }
         }
     });

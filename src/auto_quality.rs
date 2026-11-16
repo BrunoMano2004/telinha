@@ -73,13 +73,12 @@ impl Controller {
         }
         let (old_kbps, old_fps) = (self.kbps, self.fps);
         let congested = s.loss > 0.03 || s.jitter > 0.040;
-        let reason;
-        if congested {
+        let reason = if congested {
             // Cai rápido: 25% a cada intervalo ruim.
             self.kbps = ((self.kbps as f64 * 0.75) as u32).max(MIN_KBPS);
             self.clean = 0;
             self.hold = 3;
-            reason = if s.loss > 0.03 { "perda de pacotes na rede" } else { "rede ficando lenta (atraso subindo)" };
+            if s.loss > 0.03 { "perda de pacotes na rede" } else { "rede ficando lenta (atraso subindo)" }
         } else if s.loss < 0.01 && s.jitter < 0.020 {
             // Depois de uma queda, espera 6 s antes de começar a contar.
             if self.hold > 0 {
@@ -92,16 +91,16 @@ impl Controller {
                 self.kbps = ((self.kbps as f64 * 1.10) as u32).min(self.limits.max_kbps);
                 self.clean = 0;
             }
-            reason = "rede com folga";
+            "rede com folga"
         } else {
             self.clean = 0;
-            reason = "rede estável";
-        }
+            "rede estável"
+        };
         // Com pouco bitrate, menos quadros mantêm cada quadro nítido; com a CPU
         // apertada (encoder por software), menos quadros aliviam o PC.
         self.fps = if s.cpu > 0.75 || self.kbps < 4000 { 30.min(self.limits.max_fps) } else { self.limits.max_fps };
         let reason = if s.cpu > 0.75 && self.fps < old_fps { "CPU sobrecarregada" } else { reason };
-        (self.kbps != old_kbps || self.fps != old_fps).then(|| Decision { kbps: self.kbps, fps: self.fps, reason })
+        (self.kbps != old_kbps || self.fps != old_fps).then_some(Decision { kbps: self.kbps, fps: self.fps, reason })
     }
 }
 

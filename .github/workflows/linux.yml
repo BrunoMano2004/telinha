@@ -1,0 +1,53 @@
+name: Linux
+# Testes, clippy e os scripts de instalação no Linux (o build do Windows tem o
+# workflow próprio).
+on:
+  workflow_dispatch:
+  push:
+    branches: ['**']
+    paths:
+      - 'src/**'
+      - 'web/**'
+      - 'caelestia/**'
+      - 'assets/**'
+      - 'install.sh'
+      - 'Cargo.*'
+      - '.github/workflows/linux.yml'
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'web/**'
+      - 'caelestia/**'
+      - 'assets/**'
+      - 'install.sh'
+      - 'Cargo.*'
+      - '.github/workflows/linux.yml'
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - name: Instalar GStreamer
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev \
+            gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
+            gstreamer1.0-plugins-ugly gstreamer1.0-nice desktop-file-utils
+      - name: Instalar Rust estável
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+          rustup component add clippy
+      - name: Testes
+        run: cargo test --locked
+      - name: Clippy (avisos são erros)
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Scripts e atalho
+        run: |
+          bash -n install.sh
+          bash -n caelestia/install.sh
+          desktop-file-validate assets/telinha-url.desktop

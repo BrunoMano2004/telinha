@@ -332,6 +332,7 @@ mod tests {
         crate::audio_rules::set("TelinhaTestApp", true);
         let back = wait(true);
         let _ = app.kill();
+        let _ = app.wait();
         assert!(on && off && back, "entrou: {on}, saiu ao desligar: {off}, voltou: {back}");
     }
 }

@@ -211,7 +211,6 @@ async fn main() -> Result<()> {
     audio_rules::init(&args.audio_exclude, &args.audio_include);
     anyhow::ensure!(!(args.jam && args.join.is_some()), "use --jam (criar uma jam) ou --join <link> (entrar), não os dois");
     let joining = args.join.clone();
-    let jam = args.jam || joining.is_some();
     anyhow::ensure!(args.viewer_id.is_none() || joining.is_some(), "--viewer-id só vale com --join");
 
     let settings = capture::Settings {
@@ -222,7 +221,10 @@ async fn main() -> Result<()> {
         monitor: args.monitor,
         monitor_handle: args.monitor_handle,
         capture_api: args.capture_api.clone(),
-        thumbnail: jam,
+        // A miniatura da grade da jam existe sempre, com o portão fechado: assim
+        // ligar a jam no meio da transmissão já tem grade leve. Fechado, o
+        // encoder dela nem inicia (nenhuma sessão de NVENC, por exemplo).
+        thumbnail: true,
     };
     let encoder = capture::pick_encoder(settings.encoder.as_deref())?;
     // Na jam cada navegador é um participante; o padrão de 4 seria apertado.
@@ -321,6 +323,9 @@ async fn main() -> Result<()> {
     let publisher = Arc::new(publisher::Publisher::new(streamer.clone()));
     // Quem transmite sempre tem a sala: a jam pode ser ligada a qualquer momento.
     let room = joining.is_none().then(|| Arc::new(room::Room::new(args.max_presenters, max_members)));
+    if let Some(room) = &room {
+        room.set_active(args.jam);
+    }
     let watch_link = jam::with_param(&link, "local", &client);
     let app = Arc::new(App {
         streamer,
@@ -553,6 +558,9 @@ impl App {
     pub(crate) fn set_jam(&self, on: bool) {
         if self.jam_on.send_replace(on) == on {
             return;
+        }
+        if let Some(room) = &self.room {
+            room.set_active(on);
         }
         if on {
             println!("Jam liberada: quem assiste pode compartilhar a tela também (`telinha --join {}`)", self.link);

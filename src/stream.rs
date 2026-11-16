@@ -99,6 +99,9 @@ pub struct Streamer {
     key_requests: Arc<KeyThrottle>,
 }
 
+/// Tempo máximo de espera pelas estatísticas de um espectador.
+const STATS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Intervalo mínimo entre pedidos de quadro-chave vindos de quem assiste.
 const KEY_REQUEST_GAP_MS: u64 = 1000;
 
@@ -660,15 +663,17 @@ impl Streamer {
             .filter(|v| layer.is_none_or(|l| v.layer == l))
             .filter_map(|v| v.webrtc.clone())
             .collect();
+        // Um ramo sendo desmontado pode nunca responder: espera no máximo
+        // STATS_TIMEOUT por cada um, em vez de prender a thread para sempre.
         webrtcs
             .iter()
             .filter_map(|webrtc| {
-                let promise = gst::Promise::new();
+                let (tx, rx) = std::sync::mpsc::sync_channel(1);
+                let promise = gst::Promise::with_change_func(move |reply| {
+                    let _ = tx.try_send(reply.ok().flatten().map(|r| r.to_owned()));
+                });
                 webrtc.emit_by_name::<()>("get-stats", &[&None::<gst::Pad>, &promise]);
-                match promise.wait() {
-                    gst::PromiseResult::Replied => promise.get_reply().map(|r| r.to_owned()),
-                    _ => None,
-                }
+                rx.recv_timeout(STATS_TIMEOUT).ok().flatten()
             })
             .collect()
     }
@@ -889,6 +894,7 @@ mod tests {
         let pattern = streamer.pipeline.by_name("screen").unwrap().property_value("pattern");
         streamer.pipeline.set_state(gst::State::Null).unwrap();
         assert!(after >= 20, "depois da troca passaram só {after} quadros");
-        assert_eq!(format!("{pattern:?}").contains("ball") || format!("{pattern:?}").contains("Ball"), true);
+        let pattern = format!("{pattern:?}");
+        assert!(pattern.contains("ball") || pattern.contains("Ball"), "padrão: {pattern}");
     }
 }

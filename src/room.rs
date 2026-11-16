@@ -107,6 +107,9 @@ pub struct Room {
     max_presenters: usize,
     max_members: usize,
     locked: AtomicBool,
+    /// Jam ligada? Desligada, a sala existe (a tela do anfitrião está nela),
+    /// mas as interfaces não recebem `@room`.
+    active: AtomicBool,
     /// Gera o apelido (`tag`) de cada tela a partir do id dela, com chaves
     /// aleatórias deste processo: estável enquanto a jam dura e sem revelar o id.
     tags: std::hash::RandomState,
@@ -124,6 +127,7 @@ impl Room {
             max_presenters: max_presenters.max(1),
             max_members,
             locked: AtomicBool::new(false),
+            active: AtomicBool::new(true),
             tags: std::hash::RandomState::new(),
         }
     }
@@ -136,6 +140,14 @@ impl Room {
     pub fn set_locked(&self, locked: bool) {
         self.locked.store(locked, Ordering::Relaxed);
         self.broadcast();
+    }
+
+    /// Liga ou desliga o `@room` (a jam do anfitrião ligou ou desligou).
+    pub fn set_active(&self, active: bool) {
+        self.active.store(active, Ordering::Relaxed);
+        if active {
+            self.emit();
+        }
     }
 
     pub fn is_locked(&self) -> bool {
@@ -467,7 +479,9 @@ impl Room {
             let msg = json!({ "type": "room", "you": id, "locked": locked, "presenters": presenters });
             let _ = m.tx.send(msg.to_string());
         }
-        println!("@room {}", json!({ "locked": locked, "presenters": presenters, "viewers": viewers }));
+        if self.active.load(Ordering::Relaxed) {
+            println!("@room {}", json!({ "locked": locked, "presenters": presenters, "viewers": viewers }));
+        }
     }
 }
 

@@ -56,7 +56,8 @@ pub fn with_param(link: &str, key: &str, value: &str) -> String {
 
 /// Link da jam (`http(s)://host[:porta]/?k=…`) → endereço do `/pub` (`ws(s)://…/pub?k=…`).
 pub fn uplink_url(link: &str) -> anyhow::Result<String> {
-    let link = link.trim();
+    // Aspas e espaços de copiar o link de dentro de um comando.
+    let link = link.trim().trim_matches(|c| c == '"' || c == '\'');
     let (scheme, rest) = if let Some(rest) = link.strip_prefix("https://") {
         ("wss", rest)
     } else if let Some(rest) = link.strip_prefix("http://") {
@@ -68,8 +69,15 @@ pub fn uplink_url(link: &str) -> anyhow::Result<String> {
     anyhow::ensure!(!host.is_empty(), "link inválido: falta o endereço");
     let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
     // Só a chave interessa; `local=` e outros parâmetros da página ficam de fora.
-    let key: Vec<&str> = query.split('&').filter(|p| p.starts_with("k=")).collect();
-    Ok(if key.is_empty() { format!("{scheme}://{host}/pub") } else { format!("{scheme}://{host}/pub?{}", key.join("&")) })
+    let key = query.split('&').find_map(|p| p.strip_prefix("k="));
+    Ok(match key {
+        // A chave só tem letras e números; o resto é sujeira de copiar e colar.
+        Some(key) => {
+            let key = percent_decode(key).unwrap_or_default();
+            format!("{scheme}://{host}/pub?k={}", key.chars().filter(char::is_ascii_alphanumeric).collect::<String>())
+        }
+        None => format!("{scheme}://{host}/pub"),
+    })
 }
 
 /// Endereço (host[:porta]) de um link http(s), só com caracteres seguros para
@@ -81,7 +89,6 @@ pub fn link_host(link: &str) -> String {
     host.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']')).take(100).collect()
 }
 
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn percent_decode(text: &str) -> anyhow::Result<String> {
     let bytes = text.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -685,6 +692,8 @@ mod tests {
         assert_eq!(uplink_url("http://desktop.tail.ts.net:8080").unwrap(), "ws://desktop.tail.ts.net:8080/pub");
         assert_eq!(uplink_url(" http://100.1.2.3:8080/ ").unwrap(), "ws://100.1.2.3:8080/pub");
         assert!(uplink_url("desktop:8080").is_err());
+        assert_eq!(uplink_url("\"https://a.trycloudflare.com/?k=XYZ\"").unwrap(), "wss://a.trycloudflare.com/pub?k=XYZ");
+        assert_eq!(uplink_url("https://a.trycloudflare.com/?k=XYZ%22").unwrap(), "wss://a.trycloudflare.com/pub?k=XYZ");
     }
 
     #[test]

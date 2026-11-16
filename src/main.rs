@@ -520,7 +520,14 @@ async fn shutdown_signal() {
 }
 
 fn authorized(app: &App, query: &HashMap<String, String>) -> bool {
-    app.key.as_ref().is_none_or(|key| query.get("k") == Some(key))
+    app.key.as_ref().is_none_or(|key| query.get("k").is_some_and(|k| key_matches(key, k)))
+}
+
+/// A chave só tem letras e números: o que vier a mais é sujeira de copiar e
+/// colar (a aspa do comando `telinha --join "…"`, um ponto final, um `>`),
+/// e não deve virar "página não encontrada".
+fn key_matches(key: &str, given: &str) -> bool {
+    given.chars().filter(char::is_ascii_alphanumeric).eq(key.chars())
 }
 
 async fn page(Query(query): Query<HashMap<String, String>>, State(app): State<Arc<App>>) -> Response {
@@ -987,4 +994,19 @@ async fn handle_viewer(socket: WebSocket, ip: String, app: Arc<App>) {
         sender.abort();
     }
     println!("- espectador #{id} saiu · total {}", app.streamer.viewer_count());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::key_matches;
+
+    #[test]
+    fn key_survives_copy_and_paste_junk() {
+        assert!(key_matches("WYsXv6597ADzL4WWJZT3", "WYsXv6597ADzL4WWJZT3"));
+        assert!(key_matches("WYsXv6597ADzL4WWJZT3", "WYsXv6597ADzL4WWJZT3\""));
+        assert!(key_matches("WYsXv6597ADzL4WWJZT3", "WYsXv6597ADzL4WWJZT3>."));
+        assert!(!key_matches("WYsXv6597ADzL4WWJZT3", "WYsXv6597ADzL4WWJZT"));
+        assert!(!key_matches("WYsXv6597ADzL4WWJZT3", "WYsXv6597ADzL4WWJZT3x"));
+        assert!(!key_matches("WYsXv6597ADzL4WWJZT3", ""));
+    }
 }

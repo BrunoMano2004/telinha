@@ -26,6 +26,8 @@ use tokio::sync::mpsc;
 /// Fila de quadros do relé por navegador (~2 s de vídeo).
 const MEDIA_QUEUE: usize = 300;
 
+const JAM_OFF: &str = "o anfitrião não liberou a jam nesta transmissão (só ele pode compartilhar agora)";
+
 pub fn os_name() -> &'static str {
     if cfg!(target_os = "windows") { "windows" } else { "linux" }
 }
@@ -39,6 +41,11 @@ pub fn default_name() -> String {
         .unwrap_or_default();
     let name = name.trim();
     if name.is_empty() { "Telinha".into() } else { name.chars().take(40).collect() }
+}
+
+/// Id de navegador aceitável (o mesmo filtro do `hello`).
+pub fn valid_client(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 64 && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
 }
 
 /// Acrescenta `key=value` à query do link.
@@ -63,6 +70,61 @@ pub fn uplink_url(link: &str) -> anyhow::Result<String> {
     // Só a chave interessa; `local=` e outros parâmetros da página ficam de fora.
     let key: Vec<&str> = query.split('&').filter(|p| p.starts_with("k=")).collect();
     Ok(if key.is_empty() { format!("{scheme}://{host}/pub") } else { format!("{scheme}://{host}/pub?{}", key.join("&")) })
+}
+
+/// Endereço (host[:porta]) de um link http(s), só com caracteres seguros para
+/// mostrar numa confirmação.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn link_host(link: &str) -> String {
+    let rest = link.trim().split_once("://").map(|(_, r)| r).unwrap_or(link);
+    let host = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    host.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']')).take(100).collect()
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn percent_decode(text: &str) -> anyhow::Result<String> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = text.get(i + 1..i + 3).ok_or_else(|| anyhow::anyhow!("link telinha:// malformado"))?;
+            out.push(u8::from_str_radix(hex, 16).map_err(|_| anyhow::anyhow!("link telinha:// malformado"))?);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    Ok(String::from_utf8(out)?)
+}
+
+/// `telinha://join?link=<link da jam>&viewer=<id do navegador>` (botão
+/// "Compartilhar minha tela" da página) → (link, id do navegador).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn parse_join_url(url: &str) -> anyhow::Result<(String, Option<String>)> {
+    let url = url.trim();
+    let rest = url
+        .strip_prefix("telinha:")
+        .ok_or_else(|| anyhow::anyhow!("não é um link telinha://"))?
+        .trim_start_matches('/');
+    let (action, query) = rest.split_once('?').unwrap_or((rest, ""));
+    anyhow::ensure!(action.trim_end_matches('/') == "join", "ação desconhecida no link telinha://");
+    let (mut link, mut viewer) = (None, None);
+    for pair in query.split('&') {
+        match pair.split_once('=') {
+            Some(("link", v)) => link = Some(percent_decode(v)?),
+            Some(("viewer", v)) => viewer = Some(percent_decode(v)?),
+            _ => {}
+        }
+    }
+    let link = link.ok_or_else(|| anyhow::anyhow!("o link telinha:// não diz em qual jam entrar"))?;
+    anyhow::ensure!(
+        link.len() <= 2048 && !link.chars().any(|c| c.is_whitespace() || c.is_control() || c == '"'),
+        "link da jam inválido"
+    );
+    uplink_url(&link)?;
+    Ok((link, viewer.filter(|v| valid_client(v))))
 }
 
 // --- Anfitrião: navegadores -------------------------------------------------------
@@ -97,7 +159,7 @@ enum FromMember {
 
 /// Um navegador na jam: entra na sala e pede as telas que quer ver.
 pub async fn handle_member(socket: WebSocket, ip: String, app: Arc<App>) {
-    let room = app.room.clone().expect("modo jam");
+    let room = app.room.clone().expect("anfitrião");
     let (mut sink, mut incoming) = socket.split();
     let reply = |kind: &str| Message::Text(format!(r#"{{"type":"{kind}"}}"#).into());
 
@@ -112,6 +174,11 @@ pub async fn handle_member(socket: WebSocket, ip: String, app: Arc<App>) {
             _ => return,
         }
     };
+    // Página da transmissão normal aberta de antes da jam: recarrega.
+    if hello.page == "solo" {
+        let _ = sink.send(reply("reload")).await;
+        return;
+    }
     if app.viewers.is_blocked(&hello.client, &ip) {
         let _ = sink.send(reply("blocked")).await;
         return;
@@ -151,11 +218,17 @@ pub async fn handle_member(socket: WebSocket, ip: String, app: Arc<App>) {
     });
 
     let mut shutdown = app.shutdown.subscribe();
+    let mut jam_on = app.jam_on.subscribe();
     loop {
         let msg = tokio::select! {
             _ = shutdown.wait_for(|stopping| *stopping) => {
                 // O anfitrião está saindo: avisa antes de fechar (sem tentar reconectar).
                 let _ = tx.send(r#"{"type":"ended"}"#.into());
+                break;
+            }
+            // Jam desligada: a página recarrega como transmissão normal.
+            _ = jam_on.wait_for(|on| !*on) => {
+                let _ = tx.send(r#"{"type":"reload"}"#.into());
                 break;
             }
             why = &mut removal => {
@@ -229,9 +302,14 @@ fn clean(v: &Value, key: &str, max: usize) -> String {
 
 /// Um telinha que entrou com `--join`: a tela dele vira uma tela da jam.
 pub async fn handle_presenter(socket: WebSocket, ip: String, app: Arc<App>) {
-    let room = app.room.clone().expect("modo jam");
+    let room = app.room.clone().expect("anfitrião");
     let (mut sink, mut incoming) = socket.split();
     let send_now = |value: Value| Message::Text(value.to_string().into());
+    if !*app.jam_on.borrow() {
+        let _ = sink.send(send_now(json!({ "type": "error", "text": JAM_OFF }))).await;
+        let _ = sink.close().await;
+        return;
+    }
 
     let (text, hello) = loop {
         match tokio::time::timeout(HELLO_TIMEOUT, incoming.next()).await {
@@ -303,11 +381,16 @@ pub async fn handle_presenter(socket: WebSocket, ip: String, app: Arc<App>) {
     });
 
     let mut shutdown = app.shutdown.subscribe();
+    let mut jam_on = app.jam_on.subscribe();
     loop {
         let msg = tokio::select! {
             _ = shutdown.wait_for(|stopping| *stopping) => {
                 // O anfitrião está saindo: avisa antes de fechar (sem tentar reconectar).
                 let _ = tx.send(r#"{"type":"ended"}"#.into());
+                break;
+            }
+            _ = jam_on.wait_for(|on| !*on) => {
+                let _ = tx.send(json!({ "type": "error", "text": "o anfitrião desligou a jam" }).to_string());
                 break;
             }
             why = &mut removal => {
@@ -420,12 +503,21 @@ enum FromRoom {
 
 /// Mantém a conexão com o anfitrião enquanto o telinha roda; reconecta se
 /// ela cair. Retorna quando a participação acaba de vez.
-pub async fn run_uplink(app: Arc<App>, link: String, name: String, client: String, audio: bool) -> anyhow::Result<()> {
+/// `own_page`: abrir a página da jam (`watch` no `@jam`). Falso quando quem
+/// pediu para entrar foi a própria página, pelo link telinha://.
+pub async fn run_uplink(
+    app: Arc<App>,
+    link: String,
+    name: String,
+    client: String,
+    audio: bool,
+    own_page: bool,
+) -> anyhow::Result<()> {
     use tokio_tungstenite::tungstenite::Message as WsMessage;
 
     let uplink = app.uplink.clone().expect("modo --join");
     let url = uplink_url(&link)?;
-    let watch = with_param(&link, "local", &client);
+    let watch = if own_page { with_param(&link, "local", &client) } else { String::new() };
     let mut connected_once = false;
     let mut backoff = std::time::Duration::from_secs(1);
     let mut shutdown = app.shutdown.subscribe();
@@ -506,7 +598,9 @@ pub async fn run_uplink(app: Arc<App>, link: String, name: String, client: Strin
                     connected_once = true;
                     backoff = std::time::Duration::from_secs(1);
                     println!("Na jam como tela #{id} ({name})");
-                    println!("Assista às outras telas em: {watch}");
+                    if !watch.is_empty() {
+                        println!("Assista às outras telas em: {watch}");
+                    }
                     println!("@jam {}", json!({ "role": "guest", "id": id, "link": link, "watch": watch }));
                 }
                 FromRoom::Open { session, layer, mode } => {
@@ -591,6 +685,26 @@ mod tests {
         assert_eq!(uplink_url("http://desktop.tail.ts.net:8080").unwrap(), "ws://desktop.tail.ts.net:8080/pub");
         assert_eq!(uplink_url(" http://100.1.2.3:8080/ ").unwrap(), "ws://100.1.2.3:8080/pub");
         assert!(uplink_url("desktop:8080").is_err());
+    }
+
+    #[test]
+    fn join_url_from_the_page() {
+        let (link, viewer) =
+            parse_join_url("telinha://join?link=https%3A%2F%2Fa-b.trycloudflare.com%2F%3Fk%3DXYZ&viewer=abc-123").unwrap();
+        assert_eq!(link, "https://a-b.trycloudflare.com/?k=XYZ");
+        assert_eq!(viewer.as_deref(), Some("abc-123"));
+        let (link, viewer) = parse_join_url("telinha:join/?link=http%3A%2F%2Fdesk.ts.net%3A8080").unwrap();
+        assert_eq!(link, "http://desk.ts.net:8080");
+        assert_eq!(viewer, None);
+        // Id estranho é ignorado; link que não é da jam, recusado.
+        assert_eq!(parse_join_url("telinha://join?link=http%3A%2F%2Fh&viewer=a%22b").unwrap().1, None);
+        assert!(parse_join_url("telinha://join?link=file%3A%2F%2F%2Fetc").is_err());
+        assert!(parse_join_url("telinha://join?link=https%3A%2F%2Fh%2F%20--x").is_err());
+        assert!(parse_join_url("telinha://run?link=http%3A%2F%2Fh").is_err());
+        assert!(parse_join_url("https://h").is_err());
+        assert_eq!(link_host("https://a-b.trycloudflare.com/?k=1"), "a-b.trycloudflare.com");
+        assert_eq!(link_host("http://100.1.2.3:8080"), "100.1.2.3:8080");
+        assert_eq!(link_host("http://<b>x</b>/"), "bx");
     }
 
     #[test]

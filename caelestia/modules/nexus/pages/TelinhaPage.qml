@@ -151,18 +151,21 @@ PageBase {
             onClicked: Telinha.joinJam()
         }
 
-        InfoRow {
-            visible: Telinha.running && !Telinha.inJam
+        // A transmissão vira jam (e volta) sem parar: quem assiste ganha o
+        // botão "Compartilhar minha tela" na página.
+        ToggleRow {
+            visible: Telinha.running && Telinha.mode !== "join"
             first: true
-            last: true
-            icon: "groups"
-            label: Tr.tr("Not in a jam")
-            subtext: Tr.tr("Stop this share to create or join a jam")
+            last: !Telinha.jamHost
+            text: Tr.tr("Let viewers share their screens")
+            subtext: Telinha.jamHost ? Tr.tr("Anyone watching who has telinha can share too; turning off removes their screens") : Tr.tr("Turns this share into a jam: the page gets a \"Share my screen\" button")
+            checked: Telinha.jamHost
+            onToggled: Telinha.setJam(checked)
         }
 
         RowButton {
-            first: true
-            visible: Telinha.inJam
+            first: Telinha.mode === "join"
+            visible: Telinha.inJam && !!Telinha.jam?.watch
             disabled: !Telinha.jam
             icon: "open_in_new"
             text: Tr.tr("Open the jam")
@@ -171,6 +174,7 @@ PageBase {
         }
 
         RowButton {
+            first: Telinha.mode === "join" && !Telinha.jam?.watch
             last: !Telinha.jamHost
             visible: Telinha.inJam
             disabled: !Telinha.jam

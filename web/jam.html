@@ -61,7 +61,7 @@
 
   #bar { position: fixed; top: 12px; right: 12px; display: flex; align-items: center; gap: 6px; opacity: 0;
     transition: opacity .2s; z-index: 2; }
-  body:hover #bar, body.grid #bar { opacity: 1; }
+  body:hover #bar, body.grid #bar, body.intro #bar { opacity: 1; }
   #volume { width: 110px; accent-color: var(--accent); cursor: pointer; }
   #hint { position: fixed; left: 50%; bottom: 14px; transform: translateX(-50%); padding: 6px 12px; border-radius: 8px;
     background: rgba(20,20,20,.9); border: 1px solid var(--line); color: #bbb; font-size: 12px; z-index: 2;
@@ -80,6 +80,15 @@
   .card input:focus { outline: 2px solid var(--accent); border-color: transparent; }
   .card button { padding: 10px; font-size: 15px; background: var(--accent); border: 0; color: #fff; }
   .card button:hover { background: #5a4ae6; }
+  .card button.secondary { background: transparent; border: 1px solid #3a3a3a; color: #ddd; }
+  .card button.secondary:hover { background: #222; }
+  .card a { color: #b3a9ff; }
+  .card .small { font-size: 12.5px; line-height: 1.5; }
+  .card code { display: block; margin-top: 6px; padding: 6px 8px; border-radius: 6px; background: #0d0d0d;
+    border: 1px solid var(--line); color: #ddd; font-size: 11.5px; user-select: all; word-break: break-all; text-align: left; }
+  #btn-share { background: var(--accent); border-color: transparent; color: #fff; }
+  #btn-share:hover { background: #5a4ae6; }
+  #empty button { margin-top: 14px; }
 </style>
 </head>
 <body class="grid">
@@ -89,9 +98,11 @@
     <p>Ninguém está compartilhando a tela ainda.</p>
     <p>Quem tiver o telinha entra na jam com:</p>
     <code id="join-cmd"></code>
+    <div><button id="empty-share" class="share" hidden>Compartilhar minha tela</button></div>
   </div>
 </div>
 <div id="bar">
+  <button id="btn-share" class="share" title="Entrar na jam com o telinha deste computador e mostrar a sua tela" hidden>Compartilhar minha tela</button>
   <button id="btn-grid" title="Voltar para a grade (G ou Esc)" hidden>Grade</button>
   <button id="btn-solo" title="Mostrar só esta tela e parar de receber as outras (V)" hidden>Ver só esta</button>
   <button id="btn-sound" title="Som da tela selecionada (M)" hidden>Ativar som</button>
@@ -109,6 +120,19 @@
     <button type="submit">Entrar</button>
   </div>
 </form>
+<div id="share-help" class="overlay" hidden>
+  <div class="card">
+    <img src="/favicon.svg" alt="">
+    <h1>Compartilhar sua tela</h1>
+    <p>Abrimos o telinha deste computador: confirme lá para a sua tela entrar na jam.</p>
+    <p class="small">Nada aconteceu? O telinha precisa estar instalado:
+      <a href="https://github.com/BrunoMano2004/telinha/releases/latest" target="_blank" rel="noopener">instalador para Windows</a>;
+      no Linux, o pacote <b>telinha-git</b> (AUR) ou o <b>install.sh</b>. Ou rode no terminal:
+      <code id="share-cmd"></code></p>
+    <button id="share-retry" type="button">Abrir o telinha de novo</button>
+    <button id="share-close" type="button" class="secondary">Fechar</button>
+  </div>
+</div>
 <div id="ended" class="overlay" hidden>
   <div class="card">
     <img src="/favicon.svg" alt="">
@@ -132,13 +156,18 @@ const localClient = params.get('local') || '';
 const forceRelay = params.has('relay');
 const remote = location.protocol === 'https:';
 const CONNECT_TIMEOUT_MS = 20000;
+// Celular não roda o telinha: lá a página só assiste.
+const canShare = !localClient && !/Android|iPhone|iPad/.test(navigator.userAgent);
 
 let ws = null, me = null, viewerName = '', audioCtx = null, stopped = false, nextSid = 1;
 let presenters = [];
 const tiles = new Map();     // id da tela → tile
 const sessions = new Map();  // sid → conexão
 // Seleção pelo `client` de quem compartilha: continua valendo se a pessoa reconectar.
-let view = { mode: 'grid', client: null };
+// `auto`: escolhido pela página (uma tela só aparece inteira, com som), não pela pessoa.
+let view = { mode: 'grid', client: null, auto: true };
+// A tela deste computador está na jam (entrou pelo botão "Compartilhar minha tela").
+let sharingHere = false, shareTimer = null;
 let userMuted = localClient !== '';
 let volume = Math.min(1, Number(stored('telinha-volume', '1')) || 1);
 
@@ -158,7 +187,7 @@ function hint(text, ms = 3500) {
 function connectRoom() {
   ws = new WebSocket(`${remote ? 'wss' : 'ws'}://${location.host}/ws${location.search}`);
   ws.binaryType = 'arraybuffer';
-  ws.onopen = () => send({ type: 'hello', name: viewerName, device: deviceName(), client: clientId });
+  ws.onopen = () => send({ type: 'hello', name: viewerName, device: deviceName(), client: clientId, page: 'jam' });
   ws.onmessage = (e) => {
     if (typeof e.data !== 'string') return onMedia(e.data);
     const msg = JSON.parse(e.data);
@@ -166,6 +195,7 @@ function connectRoom() {
       case 'room': return onRoom(msg);
       case 'signal': return sessions.get(msg.sid)?.onSignal(msg.payload);
       case 'closed': return sessions.get(msg.sid)?.onClosed(msg.reason || '');
+      case 'reload': return reloadPage();
       case 'ended': return end('A jam terminou.', false);
       case 'kicked': return end('Você foi removido da jam.', true);
       case 'blocked': return end('O anfitrião bloqueou você.', false);
@@ -198,9 +228,23 @@ function end(text, canRejoin) {
   document.getElementById('ended').hidden = false;
 }
 
+// A sua própria tela não aparece: nem na página aberta pelo telinha
+// (`?local=`), nem nesta, quando ela entrou pelo botão de compartilhar.
+const isOwn = (p) => (localClient && p.client === localClient) || p.client === clientId;
+
 function onRoom(msg) {
   me = msg.you;
-  presenters = msg.presenters.filter((p) => p.sharing && !(localClient && p.client === localClient));
+  const own = msg.presenters.find((p) => p.client === clientId);
+  if (own && !sharingHere) {
+    clearTimeout(shareTimer);
+    document.getElementById('share-help').hidden = true;
+    // O som desta página voltaria para a jam junto com o seu.
+    if (own.audio && !userMuted) userMuted = true;
+    hint(own.audio ? 'Sua tela está na jam. O som desta página foi desligado para não voltar para a jam (M liga).'
+      : 'Sua tela está na jam.', 6000);
+  } else if (!own && sharingHere) hint('Sua tela saiu da jam.');
+  sharingHere = !!own;
+  presenters = msg.presenters.filter((p) => p.sharing && !isOwn(p));
   const ids = new Set(presenters.map((p) => p.id));
   for (const [id, tile] of tiles) {
     if (!ids.has(id)) { tile.remove(); tiles.delete(id); }
@@ -212,8 +256,17 @@ function onRoom(msg) {
   }
   // A tela selecionada saiu: volta para a grade.
   if (view.client && !presenters.some((p) => p.client === view.client)) {
-    if (view.mode !== 'grid') hint('A tela que você estava vendo saiu da jam.');
-    view = { mode: 'grid', client: null };
+    if (view.mode !== 'grid' && !view.auto) hint('A tela que você estava vendo saiu da jam.');
+    view = { mode: 'grid', client: null, auto: view.auto };
+  }
+  // Uma tela só: inteira e com som, como numa transmissão normal. Chegou
+  // mais alguém: as outras aparecem ao lado.
+  const only = tiles.size === 1 ? [...tiles.values()][0] : null;
+  if (only && view.mode === 'grid') view = { mode: 'solo', client: only.p.client, auto: true };
+  else if (tiles.size > 1 && view.auto && view.mode === 'solo') {
+    view = { mode: 'focus', client: view.client, auto: true };
+    const added = presenters.find((p) => p.client !== view.client);
+    if (added) hint(`${added.name} entrou na jam. Clique numa tela para vê-la grande.`, 5000);
   }
   render();
 }
@@ -426,8 +479,10 @@ class Conn {
 // --- Seleção, layout e som -------------------------------------------------------
 
 function select(client, mode) {
+  // Com uma tela só não há grade nem faixa lateral: ela fica inteira.
+  if (tiles.size === 1) { client = [...tiles.values()][0].p.client; mode = 'solo'; }
   if (view.mode === mode && view.client === client) return;
-  view = { mode, client };
+  view = { mode, client, auto: false };
   // O clique conta como gesto: a partir daqui o navegador deixa tocar som.
   audioCtx?.resume();
   render();
@@ -448,9 +503,10 @@ function render() {
     tile.el.querySelector('.key').textContent = ++i <= 9 ? String(i) : '';
     tile.sync();
   }
-  document.getElementById('btn-grid').hidden = mode === 'grid';
+  document.getElementById('btn-grid').hidden = mode === 'grid' || n < 2;
+  for (const b of document.querySelectorAll('.share')) b.hidden = !canShare || sharingHere;
   const solo = document.getElementById('btn-solo');
-  solo.hidden = mode === 'grid';
+  solo.hidden = mode === 'grid' || n < 2;
   solo.textContent = mode === 'solo' ? 'Mostrar todas' : 'Ver só esta';
   applySound();
 }
@@ -465,7 +521,15 @@ function applySound() {
     tile.video.volume = volume;
     tile.conn?.player?.setVolume(on ? volume : 0);
     tile.el.querySelector('.sound').hidden = !(tile === selected && hasAudio && !userMuted);
-    if (on && !tile.video.hidden) tile.video.play().catch(() => {});
+    if (tile.video.hidden) continue;
+    // Sem um clique antes (página recarregada sozinha), o navegador não deixa
+    // tocar com som: segue sem som, e o botão "Ativar som" resolve.
+    tile.video.play().catch(() => {
+      if (!on || userMuted) return;
+      userMuted = true;
+      applySound();
+      hint('Clique em "Ativar som" para ouvir esta tela.', 5000);
+    });
   }
   soundBtn.hidden = !hasAudio;
   volumeEl.hidden = !hasAudio;
@@ -561,12 +625,40 @@ document.onkeydown = (e) => {
   }
 };
 
-// Comando para entrar compartilhando: o link sem os parâmetros desta página.
-(() => {
+// Link da jam para quem vai compartilhar: sem os parâmetros desta página.
+function jamLink() {
   const link = new URL(location.href);
   for (const key of ['local', 'relay', 'codec']) link.searchParams.delete(key);
-  document.getElementById('join-cmd').textContent = `telinha --join "${link.toString()}"`;
-})();
+  return link.toString();
+}
+document.getElementById('join-cmd').textContent = document.getElementById('share-cmd').textContent =
+  `telinha --join "${jamLink()}"`;
+
+// "Compartilhar minha tela": abre o telinha instalado neste computador pelo
+// link telinha:// (ele pede confirmação antes de mostrar qualquer coisa). O
+// id deste navegador vai junto: a sua tela não aparece aqui, e esta aba já é
+// a sua página da jam.
+function shareScreen() {
+  const url = `telinha://join?link=${encodeURIComponent(jamLink())}&viewer=${encodeURIComponent(clientId)}`;
+  if (/Firefox\//.test(navigator.userAgent)) {
+    // Sem o telinha instalado, o Firefox trocaria esta página por uma de erro.
+    const frame = document.createElement('iframe');
+    frame.style.display = 'none';
+    frame.src = url;
+    document.body.appendChild(frame);
+    setTimeout(() => frame.remove(), 10000);
+  } else {
+    location.href = url;
+  }
+  hint('Abrindo o telinha… confirme lá para a sua tela entrar na jam.', 8000);
+  clearTimeout(shareTimer);
+  shareTimer = setTimeout(() => { if (!sharingHere) document.getElementById('share-help').hidden = false; }, 9000);
+}
+for (const b of document.querySelectorAll('.share')) b.onclick = shareScreen;
+document.getElementById('share-retry').onclick = () => { document.getElementById('share-help').hidden = true; shareScreen(); };
+document.getElementById('share-close').onclick = () => { clearTimeout(shareTimer); document.getElementById('share-help').hidden = true; };
+// O navegador libera o som depois de qualquer clique (relé, página recarregada).
+document.addEventListener('pointerdown', () => audioCtx?.resume());
 
 const nameInput = document.getElementById('name');
 nameInput.value = stored('telinha-name', '');
@@ -578,7 +670,11 @@ document.getElementById('join').onsubmit = (e) => {
   // Criado no clique: o navegador só deixa tocar som depois de um gesto (relé).
   try { audioCtx = new AudioContext({ latencyHint: 'interactive' }); } catch {}
   if (localClient) hint('Esta é a sua página da jam: a sua tela fica de fora e o som começa desligado.', 6000);
+  else if (canShare) hint('Tem o telinha neste computador? "Compartilhar minha tela" (no canto) mostra a sua também.', 7000);
   else hint('Clique numa tela para vê-la grande e ouvir o som dela.', 5000);
+  // Os botões aparecem por alguns segundos, para o de compartilhar ser visto.
+  document.body.classList.add('intro');
+  setTimeout(() => document.body.classList.remove('intro'), 8000);
   connectRoom();
 };
 document.getElementById('rejoin').onclick = () => {
@@ -587,6 +683,12 @@ document.getElementById('rejoin').onclick = () => {
   audioCtx?.resume();
   connectRoom();
 };
+// Vindo da transmissão normal (o anfitrião liberou a jam): entra direto.
+if (takeAutoJoin()) {
+  document.getElementById('join').requestSubmit();
+  hint(canShare ? 'O anfitrião liberou a jam: quem tem o telinha pode compartilhar a tela também.'
+    : 'O anfitrião liberou a jam: mais gente pode mostrar a tela.', 7000);
+}
 </script>
 </body>
 </html>

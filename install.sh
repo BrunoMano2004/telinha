@@ -51,6 +51,15 @@ cargo build --release --manifest-path "$here/Cargo.toml"
 install -Dm755 "$here/target/release/telinha" "$HOME/.local/bin/telinha"
 say "Binário instalado em ~/.local/bin/telinha"
 
+# Link telinha:// (botão "Compartilhar minha tela" da página da jam). Caminho
+# completo: a sessão gráfica nem sempre tem ~/.local/bin no PATH.
+apps=${XDG_DATA_HOME:-$HOME/.local/share}/applications
+sed "s|^Exec=telinha |Exec=$HOME/.local/bin/telinha |" "$here/assets/telinha-url.desktop" \
+    | install -Dm644 /dev/stdin "$apps/telinha-url.desktop"
+command -v update-desktop-database >/dev/null && update-desktop-database -q "$apps" || true
+command -v xdg-mime >/dev/null && xdg-mime default telinha-url.desktop x-scheme-handler/telinha || true
+say "Link telinha:// registrado (o navegador abre o telinha pela página da jam)"
+
 # --- Card no Caelestia ----------------------------------------------------
 if ((with_shell)) && [[ -d /etc/xdg/quickshell/caelestia ]]; then
     say "Instalando o card 'Screen share' no Caelestia"

@@ -137,8 +137,17 @@ StyledRect {
             }
 
             IconButton {
+                // Libera ou desliga a jam nesta transmissão: quem assiste
+                // pode compartilhar a tela também.
+                visible: Telinha.running && Telinha.mode !== "join"
+                icon: Telinha.jamHost ? "group_off" : "group_add"
+                type: IconButton.Text
+                onClicked: Telinha.setJam(!Telinha.jamHost)
+            }
+
+            IconButton {
                 // Jam: a sua página, com as telas dos outros.
-                visible: Telinha.inJam
+                visible: Telinha.inJam && !!Telinha.jam?.watch
                 icon: "open_in_new"
                 type: IconButton.Text
                 onClicked: Telinha.openJam()

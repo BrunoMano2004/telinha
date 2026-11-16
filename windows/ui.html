@@ -180,6 +180,16 @@
   details { color: var(--muted); }
   summary { cursor: pointer; font-size: 13px; font-weight: 600; width: max-content; padding: 4px 6px; margin-left: -6px; border-radius: 6px; }
   summary:hover { background: var(--hover); color: var(--text); }
+  .ask { position: fixed; inset: 0; z-index: 20; display: grid; place-items: center; padding: 20px;
+    background: rgba(0,0,0,.45); }
+  .ask[hidden] { display: none; }
+  .ask .box { width: min(440px, 100%); background: var(--surface); border: 1px solid var(--border); border-radius: 14px;
+    padding: 22px; box-shadow: 0 18px 50px rgba(0,0,0,.35); }
+  .ask h3 { margin: 0 0 8px; font-size: 17px; }
+  .ask p { margin: 0 0 10px; color: var(--muted); line-height: 1.45; }
+  .ask .where { display: block; padding: 8px 10px; border-radius: 8px; background: var(--surface-2); color: var(--text);
+    border: 1px solid var(--border); font: 12.5px ui-monospace, monospace; word-break: break-all; margin-bottom: 14px; }
+  .ask .buttons { display: flex; justify-content: flex-end; gap: 8px; }
   pre { margin: 10px 0 0; max-height: 180px; overflow: auto; padding: 12px; border-radius: 10px; background: var(--surface);
     border: 1px solid var(--border); font: 12px/1.55 "Cascadia Mono", Consolas, monospace; white-space: pre-wrap;
     -webkit-user-select: text; user-select: text; color: var(--text); }
@@ -289,6 +299,11 @@
             <div class="note">Sua tela vai para a jam e a página com as telas dos outros abre sozinha.</div>
           </div>
         </div>
+        <div class="row first" id="jam-allow-row" hidden>
+          <div class="text"><div class="name">Deixar quem assiste compartilhar a tela</div>
+            <div class="meta" id="jam-allow-meta"></div></div>
+          <label class="switch"><input type="checkbox" id="jam-allow" aria-label="Liberar a jam"><span></span></label>
+        </div>
         <div id="jam-live" hidden>
           <div class="row first">
             <div class="text"><div class="name" id="jam-title"></div><div class="meta" id="jam-meta"></div></div>
@@ -330,6 +345,19 @@
     <div class="note"><span id="version"></span>Fechar a janela mantém o Telinha perto do relógio.</div>
   </footer>
 </div>
+<!-- Pedido da página da jam (botão "Compartilhar minha tela", link telinha://). -->
+<div class="ask" id="ask" hidden role="dialog" aria-modal="true" aria-labelledby="ask-title">
+  <div class="box">
+    <h3 id="ask-title">Compartilhar sua tela na jam?</h3>
+    <p id="ask-text">Uma página pediu para o Telinha entrar nesta jam. Quem estiver nela vai ver a sua tela<span id="ask-audio"> e ouvir o som dos apps</span>.</p>
+    <span class="where" id="ask-where"></span>
+    <p id="ask-busy" hidden>A transmissão atual vai parar para você entrar na jam.</p>
+    <div class="buttons">
+      <button class="btn" id="ask-no">Cancelar</button>
+      <button class="btn primary" id="ask-yes">Compartilhar minha tela</button>
+    </div>
+  </div>
+</div>
 <div class="toast" id="toast"><svg><use href="#i-check"/></svg><span id="toast-text"></span></div>
 
 <script>
@@ -353,6 +381,7 @@ const state = {
   // Jam: mode '' (transmissão), 'jam' (você criou) ou 'join' (entrou); jam = {role, id, link, watch};
   // room = estado da sala (só no anfitrião); paused = sua tela pausada.
   mode: '', jam: null, room: null, paused: false,
+  ask: null, // pedido da página da jam: {link, host}
 };
 
 // --- Ponte com o app (telinha.cpp). Fora dele, modo demonstração.
@@ -373,7 +402,16 @@ function onMessage(msg) {
         state.jam = null; state.room = null; state.paused = false;
       }
       break;
-    case 'jam': state.jam = msg.data; toast(msg.data.role === 'host' ? 'Jam criada · link copiado' : 'Você entrou na jam'); break;
+    case 'jam':
+      state.jam = msg.data;
+      if (msg.data.role === 'host') state.mode = 'jam';
+      toast(msg.data.toggled ? 'Jam liberada: quem assiste pode compartilhar a tela'
+        : msg.data.role === 'host' ? 'Jam criada · link copiado'
+        : msg.data.watch ? 'Você entrou na jam' : 'Você entrou na jam: sua tela já aparece na página');
+      break;
+    case 'jam-off': state.mode = ''; state.jam = null; state.room = null; state.paused = false; toast('Jam desligada: só a sua tela no link'); break;
+    case 'join-request': state.ask = { link: msg.link, host: msg.host }; break;
+    case 'join-cancelled': state.ask = null; break;
     case 'room': state.room = msg.data; break;
     case 'share': state.paused = msg.state === 'off'; break;
     case 'jam-ended': toast(msg.data.reason || 'A jam terminou'); return;
@@ -412,6 +450,14 @@ $('jam-link').onkeydown = (e) => { if (e.key === 'Enter') $('jam-join').click();
 $('jam-open').onclick = () => send('jam-open');
 $('jam-pause').onclick = () => send('send', `share ${state.paused ? 'on' : 'off'}`);
 $('jam-lock').onchange = (e) => send('send', `lock ${e.target.checked ? 'on' : 'off'}`);
+$('jam-allow').onchange = (e) => send('send', `jam ${e.target.checked ? 'on' : 'off'}`);
+$('ask-yes').onclick = () => {
+  state.ask = null; state.mode = 'join'; state.starting = true; render();
+  // O app usa o monitor, o som e a qualidade escolhidos aqui.
+  const q = QUALITIES[state.quality];
+  send('join-accept', state.monitor, q.kbps, q.fps, state.audio ? 1 : 0, state.auto ? 1 : 0);
+};
+$('ask-no').onclick = () => { state.ask = null; render(); send('join-cancel'); };
 $('copy-btn').onclick = () => send('copy');
 $('release-btn').onclick = () => send('release');
 $('update-btn').onclick = () => {
@@ -528,19 +574,34 @@ function render() {
   $('public-meta').textContent = state.running ? 'Pare a transmissão para mudar.'
     : state.public ? 'Qualquer pessoa com o link assiste.' : 'Só quem está no seu Tailscale.';
 
+  // Pedido da página: confirmar antes de qualquer coisa ir para a jam.
+  $('ask').hidden = !state.ask;
+  if (state.ask) {
+    $('ask-where').textContent = state.ask.host || state.ask.link;
+    $('ask-audio').hidden = !state.audio;
+    $('ask-busy').hidden = !state.running;
+  }
+
   // Jam
+  $('jam-allow-row').hidden = !live || state.mode === 'join';
+  $('jam-allow').checked = state.mode === 'jam';
+  $('jam-allow-meta').textContent = state.mode === 'jam'
+    ? 'Liberado: a página tem o botão "Compartilhar minha tela". Desligar tira as telas dos outros.'
+    : 'Vira uma jam sem parar: quem tiver o Telinha mostra a tela também.';
   $('jam-idle').hidden = state.running;
   $('jam-live').hidden = !inJam;
   $('jam-create').disabled = $('jam-join').disabled = state.running;
   if (inJam) {
-    $('jam-title').textContent = state.mode === 'jam' ? 'Você criou esta jam' : 'Você está numa jam';
-    $('jam-meta').textContent = state.jam ? 'A página mostra as telas dos outros; a sua fica de fora.' : 'Conectando…';
-    $('jam-open').disabled = !state.jam;
+    $('jam-title').textContent = state.mode === 'jam' ? 'Jam ao vivo' : 'Você está numa jam';
+    $('jam-meta').textContent = !state.jam ? 'Conectando…' : state.jam.watch ? 'A página mostra as telas dos outros; a sua fica de fora.'
+      : 'Sua tela está na jam; a página que você abriu mostra as telas dos outros.';
+    $('jam-open').disabled = !state.jam?.watch;
     $('jam-pause').disabled = !state.jam;
     $('jam-pause').textContent = state.paused ? 'Retomar' : 'Pausar';
     $('share-meta').textContent = state.paused ? 'Pausada: sumiu da jam.' : 'Na jam. Pausar esconde sem sair.';
     $('lock-row').hidden = state.mode !== 'jam';
     $('jam-lock').checked = !!state.room?.locked;
+    $('jam-live').querySelector('.row').classList.toggle('first', state.mode !== 'jam');
     $('jam-screens').innerHTML = state.mode !== 'jam' ? '' : others.length ? others.map((p) => `
       <div class="person">${avatar(p.name)}
         <div class="text"><div class="name">${esc(p.name)}</div>
@@ -606,6 +667,9 @@ function demo(parts) {
     }
   }, 600);
   if (parts[0] === 'send' && /^share (on|off)$/.test(parts[1])) onMessage({ type: 'share', state: parts[1].slice(6) });
+  if (parts[0] === 'send' && parts[1] === 'jam on') onMessage({ type: 'jam', data: { role: 'host', id: 1, link: state.link, watch: `${state.link}&local=demo`, toggled: true } });
+  if (parts[0] === 'send' && parts[1] === 'jam off') onMessage({ type: 'jam-off' });
+  if (parts[0] === 'join-accept') demo(['start', '', '', '', '', '', '', 'join']);
   if (parts[0] === 'stop') onMessage({ type: 'state', running: false });
   if (parts[0] === 'copy') onMessage({ type: 'copied' });
   if (parts[0] === 'update') {
@@ -616,7 +680,9 @@ function demo(parts) {
 if (!host) {
   onMessage({ type: 'init', version: '0.2.0', monitors: [{ label: 'Monitor 1 (2560 × 1440)', primary: true }, { label: 'Monitor 2 (1920 × 1080)' }],
     monitor: 0, quality: 2, audio: true, public: true, auto: true, apps: { spotify: false } });
-  if (new URLSearchParams(location.search).get('demo') === 'live') {
+  if (new URLSearchParams(location.search).get('demo') === 'ask') {
+    onMessage({ type: 'join-request', link: 'https://bright-river-sample.trycloudflare.com/?k=Ab12Cd34Ef56', host: 'bright-river-sample.trycloudflare.com' });
+  } else if (new URLSearchParams(location.search).get('demo') === 'live') {
     const now = Date.now() / 1000;
     onMessage({ type: 'state', running: true, link: 'https://bright-river-sample.trycloudflare.com/?k=Ab12Cd34Ef56' });
     onMessage({ type: 'viewers', data: [

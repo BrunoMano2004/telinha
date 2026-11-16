@@ -126,7 +126,7 @@ function connect() {
   const kinds = { local: {}, remote: {} };
   const count = (side, line) => { const k = candidateKind(line); kinds[side][k] = (kinds[side][k] || 0) + 1; };
   const summary = (side) => Object.entries(kinds[side]).map(([k, n]) => `${k}×${n}`).join(' ') || 'nenhum';
-  ws.onopen = () => ws.send(JSON.stringify({ type: 'hello', name: viewerName, device: deviceName(), client: clientId }));
+  ws.onopen = () => ws.send(JSON.stringify({ type: 'hello', name: viewerName, device: deviceName(), client: clientId, page: 'solo' }));
   // Fim definitivo (sem nova tentativa).
   const stop = (text, canRejoin) => {
     done = true;
@@ -240,6 +240,8 @@ function connect() {
     } else if (msg.type === 'ice') {
       if (msg.candidate) count('remote', msg.candidate);
       try { await pc.addIceCandidate({ candidate: msg.candidate, sdpMLineIndex: msg.sdpMLineIndex }); } catch {}
+    } else if (msg.type === 'reload') {
+      reloadPage();
     } else if (msg.type === 'full') {
       retry('A transmissão está cheia. Tentando de novo em instantes…', 5000);
     } else if (msg.type === 'kicked') {
@@ -370,7 +372,7 @@ function connectTunnel() {
     if (state.audio.state === 'configured') state.audio.decode(new EncodedAudioChunk({ type: 'key', timestamp: ts, data }));
   };
 
-  ws.onopen = () => ws.send(JSON.stringify({ type: 'hello', name: viewerName, device: deviceName(), client: clientId, mode: 'tunnel' }));
+  ws.onopen = () => ws.send(JSON.stringify({ type: 'hello', name: viewerName, device: deviceName(), client: clientId, mode: 'tunnel', page: 'solo' }));
   ws.onmessage = async (e) => {
     if (typeof e.data === 'string') {
       const msg = JSON.parse(e.data);
@@ -378,6 +380,8 @@ function connectTunnel() {
         state.codec = await pickVideoCodec();
         log(`modo túnel · ${navigator.userAgent} · codec ${state.codec || 'nenhum H.264 suportado'}`);
         if (!state.codec) setStatus('Este navegador não decodifica H.264 pelo WebCodecs. Tente o Chrome, o Edge ou o Firefox atualizado.');
+      } else if (msg.type === 'reload') {
+        reloadPage();
       } else if (msg.type === 'full') {
         setStatus('A transmissão está cheia. Tentando de novo em instantes…');
       } else if (msg.type === 'kicked') {
@@ -523,6 +527,8 @@ document.getElementById('rejoin').onclick = () => {
   audioCtx?.resume();
   connect();
 };
+// Vindo da página da jam (o anfitrião a desligou): entra direto.
+if (takeAutoJoin()) document.getElementById('join').requestSubmit();
 </script>
 </body>
 </html>

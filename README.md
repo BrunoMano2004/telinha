@@ -154,10 +154,11 @@ tela cheia, e **S** mostra as estatísticas (fps, bitrate, RTT, buffer e decodif
 | `--capture-api <api>` | `auto` | Windows: `auto` usa a Windows Graphics Capture com HDR ligado, `dxgi`/`wgc` forçam |
 | `-a, --audio` | | Transmite também o som dos apps (veja abaixo) |
 | `--audio-include` / `--audio-exclude` | | Apps a incluir/excluir do som, por nome |
-| `--jam` | | Cria uma jam (veja abaixo) |
+| `--jam` | | Começa já com a jam liberada (veja abaixo; também dá para ligar depois) |
 | `--join <link>` | | Entra na jam do link e compartilha a sua tela nela |
 | `--name <nome>` | nome do PC | Seu nome na jam |
 | `--max-presenters <n>` | 5 | Jam: máximo de telas ao mesmo tempo |
+| `--open-url <url>` | | Linux: abre um link `telinha://join?…` (o botão da página da jam) |
 
 Comandos pelo stdin enquanto roda (é assim que o Caelestia e o app do Windows
 controlam o telinha):
@@ -168,14 +169,16 @@ controlam o telinha):
 | `kick <id>` · `block <id>` · `unblock <chave>` | Expulsa, bloqueia ou desbloqueia |
 | `screen` | Linux: abre o seletor e troca a tela; Windows: `screen <monitor-handle>` |
 | `app on\|off <nome>` | Liga ou desliga o som de um app |
+| `jam on\|off` | Libera ou desliga a jam na transmissão em andamento |
 | `share on\|off` | Jam: retoma ou pausa a sua tela (sem sair) |
 | `stop-share <id>` · `lock on\|off` | Jam (anfitrião): para a tela de alguém · tranca a jam |
 | `k` · `s` · `q` | Keyframe, status, sair |
 
 Eventos na saída, uma linha JSON cada: `@viewers [...]`, `@blocked [...]`,
 `@apps [...]`, `@quality {...}` e `@screen switched|cancelled`. Na jam também:
-`@jam {...}` (link e página), `@room {...}` (telas e quem vê o quê),
-`@share on|off` e `@jam-ended {...}`.
+`@jam {...}` (link e página; `toggled` quando liberada com `jam on`),
+`@jam-off {}`, `@room {...}` (telas e quem vê o quê), `@share on|off` e
+`@jam-ended {...}`.
 
 ### Jam: várias telas num link só
 
@@ -188,9 +191,26 @@ telinha --jam --tunnel                 # cria a jam (link público)
 telinha --join "https://….trycloudflare.com/?k=…"   # entra compartilhando a sua tela
 ```
 
-No Caelestia: **Create jam** e **Join copied jam** no card. Para entrar, copie
-antes o link que receberam. No Windows, use o cartão **Jam** do app. A página da
-jam abre sozinha, sem a sua própria tela.
+**Qualquer transmissão vira jam sem parar.** Quem transmite liga a jam quando
+quiser: comando `jam on`, o ícone de grupo no card do Caelestia, ou **Deixar quem
+assiste compartilhar a tela** no app do Windows. As páginas abertas recarregam
+sozinhas e passam a ter o botão **Compartilhar minha tela**. Com `jam off`, o
+link volta a mostrar só a tela de quem transmite, e quem entrou sai.
+
+**Entrar pela página.** Quem assiste e tem o telinha instalado clica em
+**Compartilhar minha tela**. O navegador abre o telinha pelo link
+`telinha://join?link=…`, que o instalador do Windows, o `install.sh` e o pacote do
+AUR registram. **O telinha sempre pergunta antes** e mostra o endereço da jam:
+qualquer página pode abrir esse link, e nada é compartilhado sem confirmação. No
+Windows a pergunta aparece na janela do app. No Linux ela vem numa notificação
+com botões, ou pelo zenity, e depois o card do Caelestia assume (sem o
+Caelestia, a notificação fica com o botão **Parar**). A sua tela some da página
+de onde você clicou, e o som dela é desligado para não voltar para a jam.
+
+Também dá para entrar sem a página. No Caelestia, use **Create jam** e **Join
+copied jam** no card (copie antes o link que você recebeu). No Windows, use o
+cartão **Jam** do app. Por esse caminho, a página da jam abre sozinha, sem a sua
+própria tela.
 
 - **Quem coordena é quem criou a jam**, mas ele não processa o vídeo dos outros: só
   repassa a sinalização. O vídeo vai direto (WebRTC) de quem compartilha para

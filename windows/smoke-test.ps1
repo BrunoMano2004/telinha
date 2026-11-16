@@ -144,6 +144,58 @@ try {
             }
         }
     }
+
+    # Jam ligada durante a transmissão (`jam on`), com um convidado que entrou
+    # pelo botão da página (--viewer-id). Ao desligar (`jam off`), o convidado
+    # sai sozinho e a página recebe "reload" (volta a ser a transmissão normal).
+    $soloHost = Start-Telinha '--test --encoder x264enc --bind 127.0.0.1 --port 18082 --name Anfitriao'
+    $guest = $null
+    $socket = New-Object Net.WebSockets.ClientWebSocket
+    $cancel = New-Object Threading.CancellationTokenSource
+    $cancel.CancelAfter(30000)
+    try {
+        $ready = $false
+        for ($i = 0; $i -lt 40; $i++) {
+            if ($soloHost.HasExited) { throw "Transmissao encerrou antes de iniciar ($($soloHost.ExitCode))." }
+            try {
+                $response = Invoke-WebRequest -UseBasicParsing 'http://127.0.0.1:18082' -TimeoutSec 1
+                if ($response.StatusCode -eq 200) { $ready = $true; break }
+            } catch { Start-Sleep -Milliseconds 250 }
+        }
+        if (!$ready) { throw 'A transmissao nao respondeu.' }
+        if ($response.Content -match 'Compartilhar minha tela') { throw 'Sem jam, o link deveria servir a pagina normal.' }
+        $soloHost.StandardInput.WriteLine('jam on')
+        Start-Sleep -Milliseconds 500
+        $response = Invoke-WebRequest -UseBasicParsing 'http://127.0.0.1:18082' -TimeoutSec 5
+        if ($response.Content -notmatch 'Compartilhar minha tela') { throw 'Com a jam ligada, o link deveria servir a pagina da jam.' }
+        $guest = Start-Telinha '--join http://127.0.0.1:18082 --test --encoder x264enc --name Convidado --viewer-id smoke-page'
+        $socket.ConnectAsync([uri]'ws://127.0.0.1:18082/ws', $cancel.Token).GetAwaiter().GetResult()
+        Send-Json $socket $cancel.Token '{"type":"hello","name":"Smoke test","device":"CI","client":"smoke-toggle","page":"jam"}'
+        while ($true) {
+            $msg = Receive-Json $socket $cancel.Token
+            if ($msg -and $msg.type -eq 'room' -and @($msg.presenters).Count -ge 2) { break }
+        }
+        if (-not (@($msg.presenters) | Where-Object { $_.client -eq 'smoke-page' })) { throw 'O convidado deveria usar o id da pagina que o chamou.' }
+        $soloHost.StandardInput.WriteLine('jam off')
+        while ($true) {
+            $msg = Receive-Json $socket $cancel.Token
+            if ($msg -and $msg.type -eq 'reload') { break }
+        }
+        if (!$guest.WaitForExit(8000)) { throw 'O convidado nao saiu quando a jam foi desligada.' }
+        if ($guest.ExitCode -ne 0) { throw "Convidado falhou ao sair da jam desligada ($($guest.ExitCode))." }
+        $soloHost.StandardInput.WriteLine('q')
+        if (!$soloHost.WaitForExit(5000)) { throw 'A transmissao nao encerrou pelo comando q.' }
+        if ($soloHost.ExitCode -ne 0) { throw "A transmissao falhou ($($soloHost.ExitCode))." }
+    } finally {
+        $socket.Dispose()
+        $cancel.Dispose()
+        foreach ($p in @($soloHost, $guest)) {
+            if ($p) {
+                if (!$p.HasExited) { $p.Kill(); $p.WaitForExit() }
+                $p.Dispose()
+            }
+        }
+    }
 } finally {
     Remove-Item $env:GST_REGISTRY_1_0 -Force -ErrorAction SilentlyContinue
 }

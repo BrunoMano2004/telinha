@@ -59,6 +59,9 @@ package() {
     install -dm755 "$pkgdir/usr/bin"
     ln -s /usr/share/telinha/caelestia/install.sh "$pkgdir/usr/bin/telinha-caelestia"
 
+    # Link telinha:// (botão "Compartilhar minha tela" da página da jam).
+    install -Dm644 assets/telinha-url.desktop "$pkgdir/usr/share/applications/telinha-url.desktop"
+
     install -Dm644 README.md "$pkgdir/usr/share/doc/telinha/README.md"
     install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }

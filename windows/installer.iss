@@ -45,6 +45,14 @@ Name: "{group}\Telinha"; Filename: "{app}\Telinha Desktop.exe"; WorkingDir: "{ap
 Name: "{autodesktop}\Telinha"; Filename: "{app}\Telinha Desktop.exe"; WorkingDir: "{app}"; Tasks: desktopicon
 Name: "{userstartup}\Telinha"; Filename: "{app}\Telinha Desktop.exe"; Parameters: "--tray"; WorkingDir: "{app}"; Tasks: startup
 
+; Link telinha:// (botão "Compartilhar minha tela" da página da jam): abre o
+; app, que pede confirmação antes de mostrar a tela a alguém.
+[Registry]
+Root: HKCU; Subkey: "Software\Classes\telinha"; ValueType: string; ValueName: ""; ValueData: "URL:Telinha"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\telinha"; ValueType: string; ValueName: "URL Protocol"; ValueData: ""
+Root: HKCU; Subkey: "Software\Classes\telinha\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: """{app}\Telinha Desktop.exe"",0"
+Root: HKCU; Subkey: "Software\Classes\telinha\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\Telinha Desktop.exe"" ""%1"""
+
 [Run]
 Filename: "{app}\Telinha Desktop.exe"; Description: "Abrir Telinha"; Flags: nowait postinstall skipifsilent
 ; Atualização pelo próprio app: o instalador roda em /SILENT e reabre o Telinha.

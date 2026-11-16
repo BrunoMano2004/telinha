@@ -14,6 +14,7 @@
 #include <bcrypt.h>
 #include <wrl.h>
 #include <WebView2.h>
+#include <cwchar>
 #include <cwctype>
 #include <functional>
 #include <map>
@@ -38,6 +39,11 @@ static std::thread reader;
 static std::wstring folder, link, iniPath;
 // Jam: a página com as telas dos outros (sem a sua), vinda do evento @jam.
 static std::wstring jamWatch;
+// Pedido do botão "Compartilhar minha tela" da página (link telinha://),
+// esperando a pessoa confirmar na janela: link da jam e id daquele navegador.
+static std::wstring pendingJoinLink, pendingJoinViewer;
+// Identifica o WM_COPYDATA que repassa um link telinha:// à janela já aberta.
+static const ULONG_PTR copyJoinUrl = 0x544C4E48;
 static std::vector<HMONITOR> monitors;
 static int primaryMonitor = 0;
 static NOTIFYICONDATAW tray = {};
@@ -129,6 +135,58 @@ static std::wstring Quote(const std::wstring& value) {
     return result + L"\"";
 }
 
+// --- Link telinha://join?link=<link da jam>&viewer=<id do navegador>
+static std::wstring PercentDecode(const std::wstring& text, bool& ok) {
+    std::string bytes;
+    for (size_t i = 0; i < text.size(); ++i) {
+        wchar_t ch = text[i];
+        if (ch == L'%') {
+            if (i + 2 >= text.size() || !iswxdigit(text[i + 1]) || !iswxdigit(text[i + 2])) { ok = false; return L""; }
+            bytes += (char)wcstol(text.substr(i + 1, 2).c_str(), NULL, 16);
+            i += 2;
+        } else if (ch < 0x80) bytes += (char)ch;
+        else { ok = false; return L""; }
+    }
+    return Utf8(bytes);
+}
+// Endereço (host[:porta]) do link, para mostrar na confirmação.
+static std::wstring LinkHost(const std::wstring& link) {
+    size_t start = link.find(L"://");
+    start = start == std::wstring::npos ? 0 : start + 3;
+    size_t end = link.find_first_of(L"/?#", start);
+    return link.substr(start, end == std::wstring::npos ? std::wstring::npos : end - start);
+}
+static bool ParseJoinUrl(std::wstring url, std::wstring& link, std::wstring& viewer) {
+    while (!url.empty() && (url.back() == L'"' || iswspace(url.back()))) url.pop_back();
+    while (!url.empty() && (url.front() == L'"' || iswspace(url.front()))) url.erase(0, 1);
+    if (Lower(url.substr(0, 8)) != L"telinha:") return false;
+    std::wstring rest = url.substr(8);
+    while (!rest.empty() && rest.front() == L'/') rest.erase(0, 1);
+    size_t question = rest.find(L'?');
+    std::wstring action = rest.substr(0, question);
+    while (!action.empty() && action.back() == L'/') action.pop_back();
+    if (Lower(action) != L"join" || question == std::wstring::npos) return false;
+    link.clear(); viewer.clear();
+    bool ok = true;
+    for (const auto& pair : Split(rest.substr(question + 1), L'&')) {
+        size_t eq = pair.find(L'=');
+        if (eq == std::wstring::npos) continue;
+        std::wstring key = pair.substr(0, eq), value = PercentDecode(pair.substr(eq + 1), ok);
+        if (!ok) return false;
+        if (key == L"link") link = value;
+        else if (key == L"viewer") viewer = value;
+    }
+    // Só links http(s) da jam, sem espaços nem aspas (vão como argumento do telinha.exe).
+    std::wstring lower = Lower(link);
+    if ((lower.rfind(L"http://", 0) != 0 && lower.rfind(L"https://", 0) != 0) || link.size() > 2048 || LinkHost(link).empty())
+        return false;
+    for (wchar_t ch : link) if (iswspace(ch) || iswcntrl(ch) || ch == L'"') return false;
+    bool validViewer = !viewer.empty() && viewer.size() <= 64;
+    for (wchar_t ch : viewer) if (!(iswalnum(ch) && ch < 0x80) && ch != L'-') validViewer = false;
+    if (!validViewer) viewer.clear();
+    return true;
+}
+
 // --- Preferências em %APPDATA%\Telinha\telinha.ini
 static int IniInt(const wchar_t* key, int fallback) {
     return GetPrivateProfileIntW(L"geral", key, fallback, iniPath.c_str());
@@ -166,6 +224,10 @@ static void PostState() {
     Post(std::wstring(L"{\"type\":\"state\",\"running\":") + (child ? L"true" : L"false") +
         L",\"link\":" + JsonText(link) + L"}");
 }
+static void PostJoinRequest() {
+    if (pendingJoinLink.empty()) return;
+    Post(L"{\"type\":\"join-request\",\"link\":" + JsonText(pendingJoinLink) + L",\"host\":" + JsonText(LinkHost(pendingJoinLink)) + L"}");
+}
 static void PostInit() {
     std::wstring list = L"[";
     for (size_t i = 0; i < monitors.size(); ++i) {
@@ -197,6 +259,7 @@ static void PostInit() {
     Post(L"{\"type\":\"blocked\",\"data\":" + lastBlocked + L"}");
     Post(L"{\"type\":\"apps\",\"data\":" + lastApps + L"}");
     for (const auto& line : logLines) Post(L"{\"type\":\"log\",\"text\":" + JsonText(line) + L"}");
+    PostJoinRequest();
     std::lock_guard<std::mutex> lock(updateMutex);
     if (!available.version.empty())
         Post(L"{\"type\":\"update\",\"version\":" + JsonText(available.version) + L",\"page\":" + JsonText(available.page) + L"}");
@@ -273,8 +336,10 @@ static std::wstring ChoiceList(bool on) {
 }
 // Jam: mode L"jam" cria uma (o link mostra todas as telas); L"join" entra na
 // jam de joinLink compartilhando esta tela (sem túnel nem porta aberta).
+// viewer: id do navegador que pediu para entrar (link telinha://); a página
+// dele esconde esta tela, e nenhuma página nova abre.
 static void Start(int monitor, int kbps, int fps, bool audio, bool isPublic, bool autoQuality,
-                  const std::wstring& mode = L"", const std::wstring& joinLink = L"") {
+                  const std::wstring& mode = L"", const std::wstring& joinLink = L"", const std::wstring& viewer = L"") {
     if (child || monitors.empty()) return;
     if (monitor < 0 || monitor >= (int)monitors.size()) monitor = primaryMonitor;
     lastKbps = kbps; lastFps = fps;
@@ -288,7 +353,10 @@ static void Start(int monitor, int kbps, int fps, bool audio, bool isPublic, boo
         if (!include.empty()) args += L" --audio-include " + Quote(include);
         if (!exclude.empty()) args += L" --audio-exclude " + Quote(exclude);
     }
-    if (mode == L"join") args += L" --join " + Quote(joinLink);
+    if (mode == L"join") {
+        args += L" --join " + Quote(joinLink);
+        if (!viewer.empty()) args += L" --viewer-id " + Quote(viewer);
+    }
     else if (isPublic) args += L" --tunnel";
     else args += L" --require-tailscale";
     if (mode == L"jam") args += L" --jam";
@@ -376,11 +444,23 @@ static void HandleLine(const std::wstring& line) {
     if (event(L"room", data)) { Post(L"{\"type\":\"room\",\"data\":" + data + L"}"); return; }
     if (event(L"share", data)) { Post(L"{\"type\":\"share\",\"state\":" + JsonText(data) + L"}"); return; }
     if (event(L"jam-ended", data)) { Post(L"{\"type\":\"jam-ended\",\"data\":" + data + L"}"); return; }
+    if (event(L"jam-off", data)) {
+        jamWatch.clear();
+        Post(L"{\"type\":\"jam-off\"}");
+        Status(L"Telinha - ao vivo");
+        return;
+    }
     if (event(L"jam", data)) {
         // Jam no ar: o link (para os outros) é copiado e a página com as telas
         // dos outros abre (sem a sua tela, e começando sem som para não dar eco).
         Post(L"{\"type\":\"jam\",\"data\":" + data + L"}");
         std::wstring jamLink = JsonField(data, L"link"), watch = JsonField(data, L"watch");
+        // Liberada durante a transmissão: o link é o mesmo, nada a copiar nem abrir.
+        if (data.find(L"\"toggled\":true") != std::wstring::npos) {
+            jamWatch = watch;
+            Status(L"Telinha - jam liberada");
+            return;
+        }
         if (child && !jamLink.empty()) {
             link = jamLink;
             PostState();
@@ -421,6 +501,16 @@ static void HandleUi(const std::wstring& message) {
         Start(_wtoi(arg(1).c_str()), _wtoi(arg(2).c_str()), _wtoi(arg(3).c_str()), arg(4) == L"1", arg(5) == L"1", arg(6) == L"1",
               mode, arg(8));
     }
+    else if (cmd == L"join-accept" && !pendingJoinLink.empty()) {
+        // Confirmado na janela: entra na jam pedida pela página (parando o que estiver no ar).
+        std::wstring joinLink = pendingJoinLink, viewer = pendingJoinViewer;
+        pendingJoinLink.clear(); pendingJoinViewer.clear();
+        IniSet(L"geral", L"monitor", arg(1));
+        if (child) Stop();
+        Start(_wtoi(arg(1).c_str()), _wtoi(arg(2).c_str()), _wtoi(arg(3).c_str()), arg(4) == L"1", false, arg(5) == L"1",
+              L"join", joinLink, viewer);
+    }
+    else if (cmd == L"join-cancel") { pendingJoinLink.clear(); pendingJoinViewer.clear(); }
     else if (cmd == L"stop") Stop();
     else if (cmd == L"copy") CopyLink();
     else if (cmd == L"open" && !link.empty()) ShellExecuteW(window, L"open", link.c_str(), NULL, NULL, SW_SHOWNORMAL);
@@ -749,6 +839,16 @@ static void CreateWebView() {
             }).Get());
     if (FAILED(started)) WebViewFailed(started);
 }
+// Link telinha:// (da linha de comando ou repassado por outra instância):
+// nada é compartilhado antes de a pessoa confirmar na janela.
+static void HandleJoinUrl(const std::wstring& url) {
+    std::wstring joinLink, viewer;
+    if (!ParseJoinUrl(url, joinLink, viewer)) return;
+    pendingJoinLink = joinLink;
+    pendingJoinViewer = viewer;
+    Show();
+    PostJoinRequest();
+}
 static BOOL CALLBACK AddMonitor(HMONITOR handle, HDC, LPRECT, LPARAM) {
     MONITORINFO info = {}; info.cbSize = sizeof(info);
     if (!GetMonitorInfoW(handle, &info)) return TRUE;
@@ -813,6 +913,12 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp
         DestroyWindow(window);
         return 0;
     }
+    case WM_COPYDATA: {
+        const COPYDATASTRUCT* copy = (const COPYDATASTRUCT*)lp;
+        if (copy && copy->dwData == copyJoinUrl && copy->lpData && copy->cbData < 16384)
+            HandleJoinUrl(std::wstring((const wchar_t*)copy->lpData, wcsnlen((const wchar_t*)copy->lpData, copy->cbData / sizeof(wchar_t))));
+        return TRUE;
+    }
     case WM_TIMER:
         if (WaitForSingleObject(wakeEvent, 0) == WAIT_OBJECT_0) Show();
         if (child && WaitForSingleObject(child, 0) == WAIT_OBJECT_0) {
@@ -862,7 +968,22 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command, int) {
     HANDLE singleton = CreateMutexW(NULL, FALSE, L"Local\\TelinhaDesktop");
     bool alreadyOpen = GetLastError() == ERROR_ALREADY_EXISTS;
     wakeEvent = CreateEventW(NULL, FALSE, FALSE, L"Local\\TelinhaShow");
-    if (alreadyOpen) { SetEvent(wakeEvent); CloseHandle(wakeEvent); CloseHandle(singleton); return 0; }
+    // Aberto pelo link telinha:// (installer.iss registra o protocolo).
+    std::wstring joinUrl, commandLine = command ? command : L"";
+    size_t at = Lower(commandLine).find(L"telinha:");
+    if (at != std::wstring::npos) joinUrl = commandLine.substr(at);
+    if (alreadyOpen) {
+        HWND other = joinUrl.empty() ? NULL : FindWindowW(L"TelinhaDesktop", NULL);
+        if (other) {
+            // A janela aberta mostra o pedido; ela pode vir para a frente.
+            DWORD pid = 0;
+            GetWindowThreadProcessId(other, &pid);
+            AllowSetForegroundWindow(pid);
+            COPYDATASTRUCT copy = { copyJoinUrl, (DWORD)((joinUrl.size() + 1) * sizeof(wchar_t)), (PVOID)joinUrl.c_str() };
+            SendMessageTimeoutW(other, WM_COPYDATA, 0, (LPARAM)&copy, SMTO_ABORTIFHUNG, 5000, NULL);
+        } else SetEvent(wakeEvent);
+        CloseHandle(wakeEvent); CloseHandle(singleton); return 0;
+    }
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
     wchar_t path[32768]; GetModuleFileNameW(NULL, path, 32768);
     folder = path; folder.resize(folder.find_last_of(L"\\/"));
@@ -900,7 +1021,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command, int) {
     Shell_NotifyIconW(NIM_ADD, &tray);
     SetTimer(window, 1, 250, NULL);
     StartUpdateChecks();
-    if (std::wstring(command).find(L"--tray") == std::wstring::npos) Show();
+    if (!joinUrl.empty()) HandleJoinUrl(joinUrl);
+    // Com um pedido válido a janela já abriu; sem ele, abre (fora do --tray).
+    if (pendingJoinLink.empty() && std::wstring(command).find(L"--tray") == std::wstring::npos) Show();
     MSG msg;
     while (GetMessageW(&msg, NULL, 0, 0) > 0) { TranslateMessage(&msg); DispatchMessageW(&msg); }
     Stop();

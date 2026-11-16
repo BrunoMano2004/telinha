@@ -43,6 +43,7 @@ patched=(
     modules/utilities/Content.qml
     modules/nexus/PageRegistry.qml
     modules/nexus/PageCompRegistry.qml
+    modules/ServiceLoader.qml
 )
 
 backup=${XDG_STATE_HOME:-$HOME/.local/state}/telinha/backups/caelestia-$(date +%Y%m%d-%H%M%S)
@@ -138,7 +139,18 @@ Component {
     }
 },"""), "PageCompRegistry.qml")
 
+# O serviço carrega com o shell (e não só ao abrir o card): o link telinha://
+# da página da jam chama o IPC dele. Sem esse ponto, o IPC passa a existir
+# depois que o card for aberto uma vez.
+def services(s):
+    anchor = "        Weather.reload();\n"
+    if anchor not in s:
+        print("ServiceLoader.qml mudou: o link telinha:// só funciona depois de abrir o card uma vez.")
+        return s
+    return insert_before(s, anchor, block("        ", "Telinha;"), "ServiceLoader.qml")
+
 update("modules/utilities/Content.qml", content)
+update("modules/ServiceLoader.qml", services)
 update("modules/nexus/PageRegistry.qml", registry)
 update("modules/nexus/PageCompRegistry.qml", components)
 EOF

@@ -5,6 +5,7 @@ mod audio_policy;
 mod audio_rules;
 mod auto_quality;
 mod jam;
+mod open_url;
 mod publisher;
 mod room;
 mod viewers;
@@ -28,7 +29,7 @@ use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use stream::{Layer, Streamer};
 
 const VIEWER_PAGE: &str = include_str!("../web/index.html");
@@ -85,7 +86,8 @@ struct Args {
     max_viewers: Option<usize>,
 
     /// Cria uma jam: todo mundo que entrar com o telinha (`--join`) compartilha
-    /// a própria tela, e o link mostra todas as telas.
+    /// a própria tela, e o link mostra todas as telas. Também dá para ligar
+    /// e desligar durante a transmissão (comando `jam on|off`).
     #[arg(long)]
     jam: bool,
 
@@ -96,6 +98,16 @@ struct Args {
     /// Seu nome na jam (padrão: o nome do computador).
     #[arg(long)]
     name: Option<String>,
+
+    /// Com --join: id do navegador que pediu para entrar (link telinha://).
+    /// A página dele esconde a sua tela e já está aberta.
+    #[arg(long, hide = true, value_name = "ID")]
+    viewer_id: Option<String>,
+
+    /// Abre um link telinha://join?link=… (o botão "Compartilhar minha tela"
+    /// da página da jam): pede confirmação e entra na jam.
+    #[arg(long, value_name = "URL")]
+    open_url: Option<String>,
 
     /// Jam: máximo de telas compartilhadas ao mesmo tempo (contando a sua).
     #[arg(long, default_value_t = 5)]
@@ -147,7 +159,6 @@ struct Args {
 pub(crate) struct App {
     streamer: Arc<Streamer>,
     max_viewers: usize,
-    next_id: AtomicU64,
     /// Chave exigida em `?k=` no modo túnel (o link *.trycloudflare.com é público).
     key: Option<String>,
     /// Pelo túnel todo mundo chega de 127.0.0.1; o IP real vem do cabeçalho
@@ -160,8 +171,14 @@ pub(crate) struct App {
     /// Limites do automático para o encoder em uso.
     limits: auto_quality::Limits,
     pub(crate) shutdown: tokio::sync::watch::Sender<bool>,
-    /// Jam, no anfitrião: a sala e o id da tela dele nela.
+    /// No anfitrião: a sala da jam (sempre existe) e o id da tela dele nela.
     pub(crate) room: Option<Arc<room::Room>>,
+    /// Jam liberada? Desligada, o link é uma transmissão normal e ninguém
+    /// entra para compartilhar (comando `jam on|off`).
+    pub(crate) jam_on: tokio::sync::watch::Sender<bool>,
+    /// Link da transmissão e o da página do próprio anfitrião (`?local=`).
+    link: String,
+    watch_link: String,
     local_presenter: Option<u64>,
     /// Jam, em quem entrou com `--join`.
     pub(crate) uplink: Option<Arc<jam::Uplink>>,
@@ -175,6 +192,9 @@ pub(crate) struct App {
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    if let Some(url) = &args.open_url {
+        return open_url::run(url);
+    }
     // Poucas arenas de malloc: com dezenas de threads do GStreamer, o padrão
     // do glibc (8 × núcleos) infla a RAM sem ganho real.
     #[cfg(target_os = "linux")]
@@ -188,6 +208,7 @@ async fn main() -> Result<()> {
     anyhow::ensure!(!(args.jam && args.join.is_some()), "use --jam (criar uma jam) ou --join <link> (entrar), não os dois");
     let joining = args.join.clone();
     let jam = args.jam || joining.is_some();
+    anyhow::ensure!(args.viewer_id.is_none() || joining.is_some(), "--viewer-id só vale com --join");
 
     let settings = capture::Settings {
         bitrate_kbps: args.bitrate,
@@ -201,7 +222,8 @@ async fn main() -> Result<()> {
     };
     let encoder = capture::pick_encoder(settings.encoder.as_deref())?;
     // Na jam cada navegador é um participante; o padrão de 4 seria apertado.
-    let max_viewers = args.max_viewers.unwrap_or(if jam { 12 } else { 4 });
+    let max_viewers = args.max_viewers.unwrap_or(4);
+    let max_members = args.max_viewers.unwrap_or(12);
 
     // Quem entra numa jam não escuta nada: só abre uma conexão de saída.
     // Os outros abrem a porta antes de pedir a tela, para falhar cedo se ela
@@ -282,15 +304,20 @@ async fn main() -> Result<()> {
 
     // Liga uma vez para validar captura e encoder; sem espectadores, desliga sozinho.
     let generation = streamer.start()?;
-    // Id deste telinha na jam: a página aberta por ele (`?local=`) esconde a própria tela.
-    let client: String = rand::rng().sample_iter(rand::distr::Alphanumeric).take(16).map(char::from).collect();
+    // Id deste telinha na jam: a página aberta por ele (`?local=`) esconde a
+    // própria tela. Vindo do botão da página, é o id daquele navegador.
+    let client: String = match args.viewer_id.as_deref().filter(|id| jam::valid_client(id)) {
+        Some(id) => id.to_string(),
+        None => rand::rng().sample_iter(rand::distr::Alphanumeric).take(16).map(char::from).collect(),
+    };
     let name = args.name.clone().unwrap_or_else(jam::default_name);
     let publisher = Arc::new(publisher::Publisher::new(streamer.clone()));
-    let room = args.jam.then(|| Arc::new(room::Room::new(args.max_presenters, max_viewers)));
+    // Quem transmite sempre tem a sala: a jam pode ser ligada a qualquer momento.
+    let room = joining.is_none().then(|| Arc::new(room::Room::new(args.max_presenters, max_members)));
+    let watch_link = jam::with_param(&link, "local", &client);
     let app = Arc::new(App {
         streamer,
         max_viewers,
-        next_id: AtomicU64::new(1),
         key,
         tunnel: args.tunnel,
         viewers: viewers::Registry::default(),
@@ -299,6 +326,9 @@ async fn main() -> Result<()> {
         limits: auto_quality::limits_for(&encoder),
         shutdown: tokio::sync::watch::channel(false).0,
         room: room.clone(),
+        jam_on: tokio::sync::watch::channel(args.jam).0,
+        link: link.clone(),
+        watch_link: watch_link.clone(),
         local_presenter: room.as_ref().map(|r| r.next_id()),
         uplink: joining.is_some().then(|| Arc::new(jam::Uplink::new(publisher.clone()))),
         #[cfg(target_os = "linux")]
@@ -326,13 +356,14 @@ async fn main() -> Result<()> {
             version: env!("CARGO_PKG_VERSION").into(),
         };
         room.add_presenter(id, info, room::Link::Local(publisher.clone()), true).map_err(anyhow::Error::msg)?;
-        let watch = jam::with_param(&link, "local", &client);
-        println!("Jam criada: quem tiver o telinha entra com `telinha --join {link}`");
-        println!("Link da jam (para assistir e para entrar): {link}");
-        println!("Sua página (sem a sua tela): {watch}");
-        println!("@jam {}", serde_json::json!({ "role": "host", "id": id, "link": link, "watch": watch }));
-    } else if joining.is_none() {
-        println!("Assista em: {link}");
+        if args.jam {
+            println!("Jam criada: quem tiver o telinha entra com `telinha --join {link}`");
+            println!("Link da jam (para assistir e para entrar): {link}");
+            println!("Sua página (sem a sua tela): {watch_link}");
+            println!("@jam {}", serde_json::json!({ "role": "host", "id": id, "link": link, "watch": watch_link }));
+        } else {
+            println!("Assista em: {link}");
+        }
     }
     app.viewers.emit_viewers();
     app.viewers.emit_blocked();
@@ -342,7 +373,7 @@ async fn main() -> Result<()> {
     if let Some(join) = joining {
         println!("Entrando na jam…");
         let result = tokio::select! {
-            r = jam::run_uplink(app.clone(), join, name, client, args.audio) => r,
+            r = jam::run_uplink(app.clone(), join, name, client, args.audio, args.viewer_id.is_none()) => r,
             _ = shutdown_signal() => Ok(()),
         };
         app.shutdown.send_replace(true);
@@ -360,16 +391,11 @@ async fn main() -> Result<()> {
         std::process::exit(code);
     }
 
-    let mut router = axum::Router::new();
-    router = if app.room.is_some() {
-        router
-            .route("/", get(jam_page))
-            .route("/ws", get(jam_member_ws))
-            .route("/pub", get(jam_presenter_ws))
-    } else {
-        router.route("/", get(viewer_page)).route("/ws", get(ws_handler))
-    };
-    let router = router
+    // A mesma rota serve a transmissão normal ou a jam, conforme `jam_on`.
+    let router = axum::Router::new()
+        .route("/", get(page))
+        .route("/ws", get(ws_handler))
+        .route("/pub", get(jam_presenter_ws))
         .route("/common.js", get(|| async { ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8")], COMMON_JS) }))
         .route("/favicon.svg", get(|| async { ([(header::CONTENT_TYPE, "image/svg+xml")], FAVICON_SVG) }))
         .route("/favicon.ico", get(|| async { ([(header::CONTENT_TYPE, "image/x-icon")], FAVICON_ICO) }))
@@ -497,18 +523,34 @@ fn authorized(app: &App, query: &HashMap<String, String>) -> bool {
     app.key.as_ref().is_none_or(|key| query.get("k") == Some(key))
 }
 
-async fn viewer_page(Query(query): Query<HashMap<String, String>>, State(app): State<Arc<App>>) -> Response {
+async fn page(Query(query): Query<HashMap<String, String>>, State(app): State<Arc<App>>) -> Response {
     if !authorized(&app, &query) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    Html(VIEWER_PAGE).into_response()
+    // Sem cache: a mesma URL vira a outra página quando a jam liga ou desliga.
+    let page = if *app.jam_on.borrow() { JAM_PAGE } else { VIEWER_PAGE };
+    ([(header::CACHE_CONTROL, "no-store")], Html(page)).into_response()
 }
 
-async fn jam_page(Query(query): Query<HashMap<String, String>>, State(app): State<Arc<App>>) -> Response {
-    if !authorized(&app, &query) {
-        return StatusCode::NOT_FOUND.into_response();
+impl App {
+    /// `jam on|off`: com a jam desligada, o link volta a ser uma transmissão
+    /// normal; quem entrou para compartilhar sai, e as páginas abertas
+    /// recarregam na outra versão.
+    pub(crate) fn set_jam(&self, on: bool) {
+        if self.jam_on.send_replace(on) == on {
+            return;
+        }
+        if on {
+            println!("Jam liberada: quem assiste pode compartilhar a tela também (`telinha --join {}`)", self.link);
+            println!(
+                "@jam {}",
+                serde_json::json!({ "role": "host", "id": self.local_presenter, "link": self.link, "watch": self.watch_link, "toggled": true })
+            );
+        } else {
+            println!("Jam desligada: o link voltou a ser só a sua tela");
+            println!("@jam-off {{}}");
+        }
     }
-    Html(JAM_PAGE).into_response()
 }
 
 /// IP de quem conecta: pelo túnel todo mundo chega de 127.0.0.1, e o real vem
@@ -520,20 +562,6 @@ fn client_ip(app: &App, peer: SocketAddr, headers: &HeaderMap) -> String {
         peer.ip().to_string()
     };
     viewers::useful_ip(&ip)
-}
-
-async fn jam_member_ws(
-    ws: WebSocketUpgrade,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    Query(query): Query<HashMap<String, String>>,
-    State(app): State<Arc<App>>,
-) -> Response {
-    if !authorized(&app, &query) {
-        return StatusCode::NOT_FOUND.into_response();
-    }
-    let ip = client_ip(&app, peer, &headers);
-    ws.on_upgrade(move |socket| jam::handle_member(socket, ip, app)).into_response()
 }
 
 async fn jam_presenter_ws(
@@ -574,14 +602,12 @@ fn watch_bus(pipeline: &gst::Pipeline) {
 /// Comandos pelo stdin (terminal, card do Caelestia ou app do Windows):
 ///   q · k · s · b <kbps> · quality <kbps> <fps> · kick <id> · block <id>
 ///   unblock <chave> · screen [monitor] · app on|off <nome>
-///   jam: share on|off · stop-share <id> · lock on|off
+///   jam on|off · share on|off · stop-share <id> · lock on|off
 fn spawn_console(app: Arc<App>, rt: tokio::runtime::Handle) {
-    if app.room.is_some() {
-        println!("Comandos: quality · kick/block <id> · stop-share <id> · lock on|off · share on|off · screen · s · q (sair)");
-    } else if app.uplink.is_some() {
+    if app.uplink.is_some() {
         println!("Comandos: quality · share on|off · screen · s · q (sair)");
     } else {
-        println!("Comandos: b <kbps> · quality <kbps> <fps> · kick/block <id> · screen · s · q (sair)");
+        println!("Comandos: quality <kbps> <fps> · kick/block <id> · jam on|off · stop-share <id> · lock on|off · screen · s · q (sair)");
     }
     std::thread::spawn(move || {
         // Fechar sessões da jam agenda tarefas no tokio.
@@ -676,12 +702,13 @@ fn spawn_console(app: Arc<App>, rt: tokio::runtime::Handle) {
                     }
                     _ => println!("uso (anfitrião da jam): stop-share <id>"),
                 },
+                "jam" if app.room.is_some() && (rest == "on" || rest == "off") => app.set_jam(rest == "on"),
                 "lock" if app.room.is_some() && (rest == "on" || rest == "off") => {
                     app.room.as_ref().unwrap().set_locked(rest == "on");
                     println!("jam {}", if rest == "on" { "trancada: ninguém novo entra" } else { "aberta" });
                 }
                 "" => {}
-                _ => println!("comandos: b · quality · kick · block · unblock · screen · app · share · stop-share · lock · s · q"),
+                _ => println!("comandos: b · quality · kick · block · unblock · screen · app · jam · share · stop-share · lock · s · q"),
             }
         }
     });
@@ -824,7 +851,11 @@ async fn ws_handler(
         return StatusCode::NOT_FOUND.into_response();
     }
     let ip = client_ip(&app, peer, &headers);
-    ws.on_upgrade(move |socket| handle_viewer(socket, ip, app)).into_response()
+    if *app.jam_on.borrow() {
+        ws.on_upgrade(move |socket| jam::handle_member(socket, ip, app)).into_response()
+    } else {
+        ws.on_upgrade(move |socket| handle_viewer(socket, ip, app)).into_response()
+    }
 }
 
 async fn handle_viewer(socket: WebSocket, ip: String, app: Arc<App>) {
@@ -844,6 +875,11 @@ async fn handle_viewer(socket: WebSocket, ip: String, app: Arc<App>) {
             _ => return,
         }
     };
+    // Página da jam aberta de antes, e a jam foi desligada: recarrega.
+    if hello.page == "jam" {
+        let _ = sink.send(reply("reload")).await;
+        return;
+    }
     if app.viewers.is_blocked(&hello.client, &ip) {
         let _ = sink.send(reply("blocked")).await;
         return;
@@ -853,7 +889,8 @@ async fn handle_viewer(socket: WebSocket, ip: String, app: Arc<App>) {
         return;
     }
 
-    let id = app.next_id.fetch_add(1, Ordering::Relaxed);
+    // Os ids vêm da sala: as telas da jam também são espectadores do Streamer.
+    let id = app.room.as_ref().expect("anfitrião").next_id();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let notify = tx.clone();
     // Modo túnel: quadros binários com fila limitada (~2 s de vídeo); fila cheia
@@ -907,9 +944,15 @@ async fn handle_viewer(socket: WebSocket, ip: String, app: Arc<App>) {
 
     // Sem nada (nem pong) por tempo demais = conexão morta pela metade; libera a vaga.
     let mut shutdown = app.shutdown.subscribe();
+    let mut jam_on = app.jam_on.subscribe();
     loop {
         let msg = tokio::select! {
             _ = shutdown.wait_for(|stopping| *stopping) => break,
+            // A jam foi liberada: a página recarrega já como página da jam.
+            _ = jam_on.wait_for(|on| *on) => {
+                let _ = notify.send(r#"{"type":"reload"}"#.into());
+                break;
+            }
             why = &mut removal => {
                 // Avisa a página (ela não tenta reconectar) e encerra.
                 if let Ok(why) = why {

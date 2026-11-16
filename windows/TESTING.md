@@ -29,6 +29,16 @@ Cloudflared no PATH. Os testes de hardware precisam de uma sessão gráfica real
   sem transmissão. Desinstale e confirme a remoção dos atalhos e dependências privadas.
 - Teste modo Tailscale conectado e desconectado. Sem Tailscale, o modo privado
   deve recusar iniciar. Verifique o comportamento do Firewall em uma rede privada.
+- Jam pela página: com uma transmissão no ar em outro PC, ligue **Deixar quem
+  assiste compartilhar a tela**. A página aberta deve recarregar com o botão
+  **Compartilhar minha tela**. Neste PC (app instalado), clique nele no Edge e no
+  Chrome. O navegador pergunta se pode abrir o Telinha. A janela do app mostra
+  **Compartilhar sua tela na jam?** com o endereço do link, e nada vai para a jam
+  antes de confirmar. Teste com o app fechado, só perto do relógio e com uma
+  transmissão já no ar (ela deve parar). Cancelar não pode compartilhar nada.
+  Depois de confirmar, a sua tela não aparece na aba de onde você clicou, e o som
+  dela é desligado. Desligar a jam no outro PC tira esta tela, e o app volta a
+  ficar parado.
 
 Limitações compartilhadas com Linux: chamadas dentro do navegador não podem ser
 separadas de outros sons do mesmo app; o túnel não fornece TURN para redes em que

@@ -24,6 +24,9 @@ Singleton {
     // Jam: "" (transmissão normal), "jam" (você criou) ou "join" (entrou numa jam).
     property string mode: ""
     property string joinLink: ""
+    // Entrada pelo botão "Compartilhar minha tela" da página (link telinha://):
+    // o id daquele navegador, que esconde a sua tela e já é a sua página.
+    property string joinViewer: ""
     property var jam: null     // {role, id, link, watch}
     property var room: null    // {locked, presenters: [...], viewers: [...]} (só o anfitrião recebe)
     property bool sharePaused: false
@@ -108,6 +111,28 @@ Singleton {
 
     function setLocked(on: bool): void {
         send(`lock ${on ? "on" : "off"}`);
+    }
+
+    // Liga ou desliga a jam na transmissão em andamento.
+    function setJam(on: bool): void {
+        send(`jam ${on ? "on" : "off"}`);
+    }
+
+    // `telinha --open-url` (o link telinha:// da página) já pediu confirmação
+    // e chama isto: qs -c caelestia ipc call telinha join <link> <id>.
+    IpcHandler {
+        target: "telinha"
+
+        function join(link: string, viewer: string): string {
+            if (proc.running)
+                return "busy";
+            if (!/^https?:\/\/\S+$/.test(link))
+                return "invalid";
+            root.joinLink = link;
+            root.joinViewer = /^[A-Za-z0-9-]{1,64}$/.test(viewer) ? viewer : "";
+            root.startMode("join");
+            return "ok";
+        }
     }
 
     function startMode(newMode: string): void {
@@ -217,6 +242,7 @@ Singleton {
                     return;
                 }
                 root.joinLink = link;
+                root.joinViewer = "";
                 root.startMode("join");
             }
         }
@@ -232,9 +258,11 @@ Singleton {
         command: {
             const args = ["sh", "-c", 'exec "$(command -v telinha || echo "$HOME/.local/bin/telinha")" "$@"', "telinha"];
             // Quem entra numa jam só abre uma conexão de saída: não precisa de túnel.
-            if (root.mode === "join")
+            if (root.mode === "join") {
                 args.push("--join", root.joinLink);
-            else
+                if (root.joinViewer)
+                    args.push("--viewer-id", root.joinViewer);
+            } else
                 args.push("--tunnel");
             if (root.mode === "jam")
                 args.push("--jam");
@@ -286,16 +314,35 @@ Singleton {
                     else if (event[1] === "room")
                         root.room = data;
                     else if (event[1] === "jam") {
-                        // Jam no ar: o link (para os outros) vai para a área de
-                        // transferência e a sua página (sem a sua tela) abre.
                         root.jam = data;
                         root.url = data.link;
+                        if (data.role === "host")
+                            root.mode = "jam";
+                        if (data.toggled) {
+                            // Liberada durante a transmissão: o link é o mesmo, e as
+                            // páginas abertas viram a página da jam sozinhas.
+                            Toaster.toast(Tr.tr("Jam on"), Tr.tr("Anyone watching who has telinha can now share their screen"), "groups", Toast.Success);
+                            return;
+                        }
+                        if (!data.watch) {
+                            // Entrou pelo botão da página, que já está aberta.
+                            Toaster.toast(Tr.tr("You joined the jam"), Tr.tr("Your screen is shared in the page you have open"), "groups", Toast.Success);
+                            return;
+                        }
+                        // Jam no ar: o link (para os outros) vai para a área de
+                        // transferência e a sua página (sem a sua tela) abre.
                         Quickshell.clipboardText = data.link;
                         if (data.role === "host")
                             Toaster.toast(Tr.tr("Jam started"), Tr.tr("Link copied: %1").arg(data.link), "groups", Toast.Success);
                         else
                             Toaster.toast(Tr.tr("You joined the jam"), Tr.tr("Your screen is shared; opening the other screens"), "groups", Toast.Success);
                         Qt.openUrlExternally(data.watch);
+                    } else if (event[1] === "jam-off") {
+                        root.mode = "";
+                        root.jam = null;
+                        root.room = null;
+                        root.sharePaused = false;
+                        Toaster.toast(Tr.tr("Jam off"), Tr.tr("Only your screen is on the link again"), "groups", Toast.Info);
                     } else if (event[1] === "jam-ended")
                         Toaster.toast(Tr.tr("Jam ended"), data.reason, "groups", Toast.Info);
                     return;

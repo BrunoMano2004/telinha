@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Telinha
+Comment=Entrar numa jam do telinha pelo botão "Compartilhar minha tela" da página
+Exec=telinha --open-url %u
+Icon=video-display
+Terminal=false
+NoDisplay=true
+MimeType=x-scheme-handler/telinha;
